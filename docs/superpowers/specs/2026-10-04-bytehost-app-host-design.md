@@ -260,7 +260,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 |---|---|---|---|
 | **A0** | 新建 `bytehost-apps` crate(仅类型与纯逻辑;摘要计算在 `digest` feature 下):manifest 解析与校验(`deny_unknown_fields`、`min_host_version`)、摘要、权限/授权/`InstallPlan`/`ApprovedInstallPlan`、`AppState`(desired/observed)与对账纯函数、`AppEvent`、registry/storage 的文件读写;全部有单测;门禁 `cargo tree -p bytehost-apps` 不含 `dozer*` | 新 crate | 无 **已完成(A0,`bytehost-a0`):`6ebec5fe`**——manifest 用 TOML(用户 2026-10-04 裁决,`toml` 0.8,在 `manifest-toml` feature 下);默认 feature 为空、依赖仅 serde/serde_json;门禁 `scripts/check-bytehost-apps-deps.sh` |
 | **A1** | `server` feature:`AppManager`、`static_web` runtime、gateway(Host 校验、静态文件、固定端口);runtime adapter trait + 各 runtime 的 `probe`(docker/colima、node、uv 的分层探测) | 新 crate | A0、V1 |
-| **A2** | 接入 dozerd:`dozer-core::protocol` 加 `Request::App`/`Response::App`/事件,`dozerd/server.rs` 转给 `AppManager`;`dozer-client` 加 `app_*` 方法;dozerd 启动对账、优雅退出停应用、孤儿清理 | dozer-core、dozerd、dozer-client | A1 | gateway 方案 | **已定(2026-10-04,用户):`<app-id>.localhost` + 单一固定端口 + Host 头路由 + 每应用 `data_store_identifier`;自定义协议不作应用 gateway**(§5.2) |
+| **A2** | 接入 dozerd:`dozer-core::protocol` 加 `Request::App`/`Response::App`/事件,`dozerd/server.rs` 转给 `AppManager`;`dozer-client` 加 `app_*` 方法;dozerd 启动对账、优雅退出停应用、孤儿清理 | dozer-core、dozerd、dozer-client | A1 |
 | **A3** | rail 动态条目最小版(H7b-min):条目 id 能表达 `app:<id>`、布局序列化向后兼容、按应用 id 存独立 WebView 状态 | dozer-app | 无(可与 A0–A2 并行) |
 | **A4** | GUI:应用面板(wry,加载 `http://<app-id>.localhost:端口/`,每应用 `data_store_identifier`)、安装计划/审批的最小界面、不可用时的提示页(§6.3,由 host 提供)、Settings 里的运行时探测展示 | dozer-app | A2、A3 |
 | **A5** | Excalidraw 端到端验收(下面的验收 1–8) | 全部 | A4、V2 |
@@ -284,7 +284,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 
 | # | 问题 | 本文倾向 |
 |---|---|---|
-| A1 | gateway 方案 | §5.2:`<app-id>.localhost` + 固定单端口 + Host 路由 + 每应用数据存储标识;自定义协议不作应用 gateway |
+| A1 | gateway 方案 | **已定(2026-10-04,用户):`<app-id>.localhost` + 单一固定端口 + Host 头路由 + 每应用 `data_store_identifier`;自定义协议不作应用 gateway**(§5.2) |
 | A2 | 进程所有权 | **已定(2026-10-04,用户):跟随 dozerd,dozerd 停止则应用停止**(§6.1) |
 | A3 | 一期切片是否需要 rail 动态条目最小版(H7b-min) | **需要**(A6 选 (a) 已定);作为本规格的前置小计划,要点:rail/布局的条目 id 能表达 `app:<id>`、按应用 id 存独立 WebView 状态、落盘兼容 |
 | A4 | 规格存放位置 | 暂放 dozer 的 `docs/superpowers/specs/`(与其他 bytehost 文档同处);`bytehost-apps` 建在 dozer 仓库的 `crates/` 下,将来随 bytehost 一起拆出时再迁移 |
