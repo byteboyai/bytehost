@@ -50,7 +50,7 @@ app/registry + app/storage + app/model(manifest、授权、状态、事件)
 
 ### 3.1 与现有"面板宿主"的接口:Rail 条目必须能容纳非枚举项
 
-应用要在 rail 上出现,rail 条目就不能只是封闭枚举 `PanelKind` 的 12 个成员,而需要一个"面板 id"能表达 `app:<app-id>`;同时每个应用对应一个浏览器面板实例,而现在 `Workspace.browser` 只有一个实例。这对应面板宿主设计里的 **H7b 的最小版**(只让 rail/布局认识动态条目,不做 H8 的全量动态化),见 `docs/dozer-v2/bytehost-H8-evaluation.md`。落盘兼容:现有 rail 布局序列化为枚举名字符串(如 `"Files"`),动态条目用带前缀的字符串(如 `"app:excalidraw"`),旧文件原样可读(已有黄金测试保护)。【本文建议】
+应用要在 rail 上出现,rail 条目就不能只是封闭枚举 `PanelKind` 的 12 个成员,而需要一个"面板 id"能表达 `app:<app-id>`;同时**每个应用有自己独立的入口和独立的 WebView 状态,不复用 Web(浏览器)面板**(用户 2026-10-04 确认:应用走 wry 显示,但不在浏览器面板里打开),而现在 `Workspace.browser` 只有一个实例。这对应面板宿主设计里的 **H7b 的最小版**(只让 rail/布局认识动态条目,不做 H8 的全量动态化),见 `docs/dozer-v2/bytehost-H8-evaluation.md`。落盘兼容:现有 rail 布局序列化为枚举名字符串(如 `"Files"`),动态条目用带前缀的字符串(如 `"app:excalidraw"`),旧文件原样可读(已有黄金测试保护)。【本文建议】
 
 ## 4. 应用模型
 
@@ -170,6 +170,12 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 4. **Host 校验是硬要求。** gateway 只接受 `Host` 为已注册的 `<app-id>.localhost:<端口>` 的请求,其余一律拒绝;这是防御 DNS rebinding 的主要手段。另加每会话 token(放在 Cookie 或首次导航的一次性参数里,由宿主注入),防止本机其他网页直接探测应用。**本 spike 没有做攻击实验,这条是设计约束,不是实测结论。**
 5. `AppEndpoint` 对产品暴露 `{ url, origin_id(跨重启稳定), capabilities }`,不暴露 gateway 的实现(以便日后换成别的承载)。
 
+### 5.2.1 显示与运行的分工【用户已确认走 wry】
+
+- **显示:** 每个应用一个 wry WebView,加载 `http://<app-id>.localhost:<固定端口>/`(不是自定义协议),带该应用自己的 `data_store_identifier`。应用有**独立入口**,不在 Web 面板里打开,也不复用它的地址栏/收藏夹/标签状态。
+- **运行:** 应用进程(Node/Python)、容器(Docker)**不是 wry**,由宿主或 supervisor 启动的子进程/`docker run` 承载;gateway 是 Rust 进程里的本机 HTTP 服务(按 Host 路由、反向代理、转发 WebSocket 升级)。
+- **入口形态【待裁决 A6】:** "独立入口"有两种做法,代价不同(见 §9)。
+
 ### 5.3 仍需验证(在落地前的 spike 清单)
 
 - **V1** 单一端口 + Host 路由 + 多应用同时打开时的实际表现(spike 只测了单应用);
@@ -212,4 +218,5 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 | A2 | 进程所有权 | 接口按 S1 设计,一期进程内,首个进程型 runtime 前再裁决 |
 | A3 | 一期切片是否需要 rail 动态条目最小版(H7b-min) | 需要;作为本规格的前置小计划 |
 | A4 | 规格存放位置 | 暂放 dozer 的 `docs/superpowers/specs/`(与其他 bytehost 文档同处,bytehost 还没有独立仓库);拆出后迁移 |
+| A6 | 应用的"独立入口"是什么形态 | 两种:**(a) rail 图标 → 该应用自己的面板**(在 left/right 栏里,与其他面板同级;需要 H7b 最小版,并受"webview 恒在 iced 之上"约束:上方 iced 浮层要显式下推/隐藏 webview);**(b) rail 图标 → 该应用自己的独立原生窗口**(复用 `platform/overlay_window.rs` 的子窗口机制;webview 在独立 OS 窗口里,天然不存在遮挡问题,也不需要 H7b 动面板枚举,但脱离了栏位布局)。本文倾向 (a) 作为默认入口、把 (b) 作为"弹出为独立窗口"的可选能力,**待用户裁决** |
 | A5 | UML 面板的形态 | Preview 的 `.puml` 类型,而非独立面板/应用 |
