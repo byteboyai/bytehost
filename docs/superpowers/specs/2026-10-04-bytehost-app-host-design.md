@@ -174,7 +174,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 
 - **显示:** 每个应用一个 wry WebView,加载 `http://<app-id>.localhost:<固定端口>/`(不是自定义协议),带该应用自己的 `data_store_identifier`。应用有**独立入口**,不在 Web 面板里打开,也不复用它的地址栏/收藏夹/标签状态。
 - **运行:** 应用进程(Node/Python)、容器(Docker)**不是 wry**,由宿主或 supervisor 启动的子进程/`docker run` 承载;gateway 是 Rust 进程里的本机 HTTP 服务(按 Host 路由、反向代理、转发 WebSocket 升级)。
-- **入口形态【待裁决 A6】:** "独立入口"有两种做法,代价不同(见 §9)。
+- **入口形态【用户已定 A6,2026-10-04】:** 选 (a)——rail 图标打开**该应用自己的面板**(在 left/right 栏里,与其他面板同级)。因此一期前置需要 H7b 最小版(§3.1,A3);且受"webview 恒在 iced 之上"约束:应用面板上方的 iced 浮层必须显式下推/隐藏 webview 矩形。"弹出为独立窗口"((b),复用 `platform/overlay_window.rs`)作为以后的可选能力,本规格不做。
 
 ### 5.3 仍需验证(在落地前的 spike 清单)
 
@@ -216,7 +216,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 |---|---|---|
 | A1 | gateway 方案 | §5.2:`<app-id>.localhost` + 固定单端口 + Host 路由 + 每应用数据存储标识;自定义协议不作应用 gateway |
 | A2 | 进程所有权 | 接口按 S1 设计,一期进程内,首个进程型 runtime 前再裁决 |
-| A3 | 一期切片是否需要 rail 动态条目最小版(H7b-min) | 需要;作为本规格的前置小计划 |
+| A3 | 一期切片是否需要 rail 动态条目最小版(H7b-min) | **需要**(A6 选 (a) 已定);作为本规格的前置小计划,要点:rail/布局的条目 id 能表达 `app:<id>`、按应用 id 存独立 WebView 状态、落盘兼容 |
 | A4 | 规格存放位置 | 暂放 dozer 的 `docs/superpowers/specs/`(与其他 bytehost 文档同处,bytehost 还没有独立仓库);拆出后迁移 |
-| A6 | 应用的"独立入口"是什么形态 | 两种:**(a) rail 图标 → 该应用自己的面板**(在 left/right 栏里,与其他面板同级;需要 H7b 最小版,并受"webview 恒在 iced 之上"约束:上方 iced 浮层要显式下推/隐藏 webview);**(b) rail 图标 → 该应用自己的独立原生窗口**(复用 `platform/overlay_window.rs` 的子窗口机制;webview 在独立 OS 窗口里,天然不存在遮挡问题,也不需要 H7b 动面板枚举,但脱离了栏位布局)。本文倾向 (a) 作为默认入口、把 (b) 作为"弹出为独立窗口"的可选能力,**待用户裁决** |
+| A6 | 应用的"独立入口"是什么形态 | **已定(2026-10-04,用户):(a) rail 图标 → 该应用自己的面板**;(b) 独立窗口留作以后的可选能力 |
 | A5 | UML 面板的形态 | Preview 的 `.puml` 类型,而非独立面板/应用 |
