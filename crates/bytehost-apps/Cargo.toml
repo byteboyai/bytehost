@@ -1,0 +1,24 @@
+[package]
+name = "bytehost-apps"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "bytehost 应用宿主的无界面部分:应用模型、安装计划、生命周期状态、注册表。不依赖任何 dozer crate。"
+
+[features]
+# 默认 feature 为空:只有类型与纯逻辑,依赖仅 serde/serde_json——`dozer-core` 依赖本 crate 时,
+# `dozer-hook`/`dozer-mcp` 的依赖闭包不会因此增加新 crate。
+# 从 TOML 文本解析 manifest(dozerd 与安装流程用)。
+manifest-toml = ["dep:toml"]
+# 摘要计算(manifest 摘要、源码目录摘要、每应用数据存储标识)。
+digest = ["dep:sha2"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml = { version = "0.8", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

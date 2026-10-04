@@ -90,6 +90,8 @@ dozerd (supervisor)  ── 依赖 bytehost-apps(features = ["server"]),在 serv
 
 ### 4.1 Manifest v1(最小)
 
+> **格式已定(2026-10-04,用户):TOML。** 下面的示例保留 YAML 写法只是为了与群聊原文对照;实际的 `manifest.toml` 见 `crates/bytehost-apps/src/manifest.rs` 里的测试样例(`[presentation]`、`[entrypoints.main]`、`[runtime]`、`[permissions.network]`…)。
+
 ```yaml
 schema_version: 1
 min_host_version: "0.1.0"
@@ -255,7 +257,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 
 | 片 | 内容 | 落在 | 依赖 |
 |---|---|---|---|
-| **A0** | 新建 `bytehost-apps` crate(仅类型与纯逻辑;摘要计算在 `digest` feature 下):manifest 解析与校验(`deny_unknown_fields`、`min_host_version`)、摘要、权限/授权/`InstallPlan`/`ApprovedInstallPlan`、`AppState`(desired/observed)与对账纯函数、`AppEvent`、registry/storage 的文件读写;全部有单测;门禁 `cargo tree -p bytehost-apps` 不含 `dozer*` | 新 crate | 无 |
+| **A0** | 新建 `bytehost-apps` crate(仅类型与纯逻辑;摘要计算在 `digest` feature 下):manifest 解析与校验(`deny_unknown_fields`、`min_host_version`)、摘要、权限/授权/`InstallPlan`/`ApprovedInstallPlan`、`AppState`(desired/observed)与对账纯函数、`AppEvent`、registry/storage 的文件读写;全部有单测;门禁 `cargo tree -p bytehost-apps` 不含 `dozer*` | 新 crate | 无 **已完成(A0,`bytehost-a0`):`6ebec5fe`**——manifest 用 TOML(用户 2026-10-04 裁决,`toml` 0.8,在 `manifest-toml` feature 下);默认 feature 为空、依赖仅 serde/serde_json;门禁 `scripts/check-bytehost-apps-deps.sh` |
 | **A1** | `server` feature:`AppManager`、`static_web` runtime、gateway(Host 校验、静态文件、固定端口);runtime adapter trait + 各 runtime 的 `probe`(docker/colima、node、uv 的分层探测) | 新 crate | A0、V1 |
 | **A2** | 接入 dozerd:`dozer-core::protocol` 加 `Request::App`/`Response::App`/事件,`dozerd/server.rs` 转给 `AppManager`;`dozer-client` 加 `app_*` 方法;dozerd 启动对账、优雅退出停应用、孤儿清理 | dozer-core、dozerd、dozer-client | A1 |
 | **A3** | rail 动态条目最小版(H7b-min):条目 id 能表达 `app:<id>`、布局序列化向后兼容、按应用 id 存独立 WebView 状态 | dozer-app | 无(可与 A0–A2 并行) |
