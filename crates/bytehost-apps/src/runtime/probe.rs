@@ -4,6 +4,8 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +54,9 @@ impl Default for SystemRunner {
 }
 
 impl CommandRunner for SystemRunner {
+    /// 输出从启动起就由读线程持续读走(否则子进程写满 64KB 的管道缓冲区会一直阻塞、永远不退出,被误报成超时)。
+    /// 命令退出之后,如果后台孙进程还攥着管道,只再等一小段宽限期,用已经读到的输出返回,**不会**一直等到
+    /// 孙进程结束。超时则杀掉子进程(孙进程不杀;读线程在它们关掉管道时自然结束)。
     fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, CommandError> {
         let mut child = Command::new(program)
             .args(args)
@@ -66,23 +71,25 @@ impl CommandRunner for SystemRunner {
                     CommandError::Failed(e.to_string())
                 }
             })?;
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let stdout = spawn_reader(child.stdout.take(), done_tx.clone());
+        let stderr = spawn_reader(child.stderr.take(), done_tx);
         let deadline = Instant::now() + self.timeout;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let read = |pipe: Option<&mut dyn Read>| {
-                        let mut s = String::new();
-                        if let Some(p) = pipe {
-                            let _ = p.read_to_string(&mut s);
+                    // 宽限期:读线程通常在命令退出的同时就读到 EOF
+                    let grace_end = (Instant::now() + Duration::from_millis(500)).min(deadline);
+                    for _ in 0..2 {
+                        let left = grace_end.saturating_duration_since(Instant::now());
+                        if done_rx.recv_timeout(left).is_err() {
+                            break;
                         }
-                        s
-                    };
-                    let stdout = read(child.stdout.as_mut().map(|p| p as &mut dyn Read));
-                    let stderr = read(child.stderr.as_mut().map(|p| p as &mut dyn Read));
+                    }
                     return Ok(CommandOutput {
                         success: status.success(),
-                        stdout,
-                        stderr,
+                        stdout: take_text(&stdout),
+                        stderr: take_text(&stderr),
                     });
                 }
                 Ok(None) if Instant::now() >= deadline => {
@@ -95,6 +102,39 @@ impl CommandRunner for SystemRunner {
             }
         }
     }
+}
+
+type SharedBuf = Arc<Mutex<Vec<u8>>>;
+
+/// 起一个线程把 `pipe` 读到底(EOF 时通过 `done` 通知)。
+fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>, done: mpsc::Sender<()>) -> SharedBuf {
+    let buf: SharedBuf = Arc::new(Mutex::new(Vec::new()));
+    let shared = buf.clone();
+    match pipe {
+        Some(mut pipe) => {
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => shared
+                            .lock()
+                            .expect("缓冲锁")
+                            .extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = done.send(());
+            });
+        }
+        None => {
+            let _ = done.send(());
+        }
+    }
+    buf
+}
+
+fn take_text(buf: &SharedBuf) -> String {
+    String::from_utf8_lossy(&buf.lock().expect("缓冲锁")).into_owned()
 }
 
 fn first_line(s: &str) -> String {
@@ -415,5 +455,42 @@ mod tests {
         let started = Instant::now();
         assert_eq!(r.run("sleep", &["5"]), Err(CommandError::Timeout));
         assert!(started.elapsed() < Duration::from_secs(3), "超时后立即返回");
+    }
+
+    /// 子进程写满管道缓冲区(64KB)会一直阻塞、永远不退出——必须从启动起就持续读走输出。
+    #[test]
+    fn the_system_runner_drains_large_output_instead_of_deadlocking() {
+        let r = SystemRunner {
+            timeout: Duration::from_secs(5),
+        };
+        let started = Instant::now();
+        let out = r
+            .run(
+                "sh",
+                &["-c", "head -c 300000 /dev/zero | tr '\\0' x >&2; exit 1"],
+            )
+            .expect("不是超时");
+        assert!(!out.success);
+        assert!(out.stderr.len() >= 300_000, "{}", out.stderr.len());
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    /// 命令自己退出了,但后台孙进程还攥着管道:不能一直等到孙进程结束,超时之后用已读到的输出返回。
+    #[test]
+    fn the_system_runner_does_not_wait_for_a_background_process_that_holds_the_pipe() {
+        let r = SystemRunner {
+            timeout: Duration::from_secs(2),
+        };
+        let started = Instant::now();
+        let out = r
+            .run("sh", &["-c", "sleep 6 & echo hi"])
+            .expect("命令本身成功退出");
+        assert!(out.success);
+        assert_eq!(out.stdout.trim(), "hi");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

@@ -114,7 +114,6 @@ pub struct AppManager {
 /// 一个已读入并校验过的应用包。
 struct Package {
     manifest: Manifest,
-    manifest_text: String,
     manifest_digest: String,
     source_digest: String,
 }
@@ -126,7 +125,6 @@ fn read_package(dir: &Path, host_version: &Version) -> Result<Package, ManagerEr
         manifest_digest: sha256_hex(manifest_text.as_bytes()),
         source_digest: digest_tree(dir)?,
         manifest,
-        manifest_text,
     })
 }
 
@@ -263,9 +261,7 @@ impl AppManager {
 
         let existing = self.registry.load(&id)?;
         if let Some(r) = &existing {
-            if r.versions.iter().any(|v| v.version == version)
-                || self.registry.paths().package_dir(&id, &version).exists()
-            {
+            if r.versions.iter().any(|v| v.version == version) {
                 return Err(ManagerError::AlreadyInstalled(version));
             }
             if !matches!(
@@ -278,34 +274,43 @@ impl AppManager {
 
         let final_dir = self.registry.paths().package_dir(&id, &version);
         fs::create_dir_all(final_dir.parent().expect("package_dir 有父目录"))?;
-        fs::rename(staging, &final_dir)?;
-        // 写下去的是 staging 副本里(已被 verify 的)那份 manifest,而不是源目录里此刻的内容
-        self.registry.save_manifest(&id, &package.manifest_text)?;
-
-        let upgrading = existing.is_some();
-        let mut record = existing.unwrap_or_else(|| AppRecord {
-            format_version: RECORD_FORMAT_VERSION,
-            id: id.clone(),
-            desired: DesiredState::Stopped,
-            observed: ObservedState::Installed,
-            current_version: version,
-            grants: verified.requested,
-            versions: Vec::new(),
-            data_store_id: data_store_id_hex(&id),
-        });
-        record.grants = verified.requested;
-        record.versions.push(VersionRecord {
-            version,
-            manifest_digest: verified.manifest_digest.clone(),
-            source_digest: verified.source_digest.clone(),
-            installed_ms: now_ms,
-        });
-        if upgrading && matches!(record.observed, ObservedState::Failed { .. }) {
-            record.observed = ObservedState::Installed;
+        // 没有版本记录却已经存在的版本目录,是上一次崩溃留下的残骸:清掉,不能让它挡住重试
+        if final_dir.exists() {
+            fs::remove_dir_all(&final_dir)?;
         }
-        // current_version 最后才写:任何一步中途失败,旧版本仍然完整
-        record.current_version = version;
-        self.registry.save(&record)?;
+        fs::rename(staging, &final_dir)?;
+        // 落位之后的任何一步失败都要把包撤回,否则会留下"有包目录、没有记录"的状态
+        let upgrading = existing.is_some();
+        let recorded = (|| -> Result<(), ManagerError> {
+            let mut record = existing.unwrap_or_else(|| AppRecord {
+                format_version: RECORD_FORMAT_VERSION,
+                id: id.clone(),
+                desired: DesiredState::Stopped,
+                observed: ObservedState::Installed,
+                current_version: version,
+                grants: verified.requested,
+                versions: Vec::new(),
+                data_store_id: data_store_id_hex(&id),
+            });
+            record.grants = verified.requested;
+            record.versions.push(VersionRecord {
+                version,
+                manifest_digest: verified.manifest_digest.clone(),
+                source_digest: verified.source_digest.clone(),
+                installed_ms: now_ms,
+            });
+            if upgrading && matches!(record.observed, ObservedState::Failed { .. }) {
+                record.observed = ObservedState::Installed;
+            }
+            // current_version 最后才写;它之前的任何一步失败,调用方会撤回刚落位的包,旧版本不受影响
+            record.current_version = version;
+            self.registry.save(&record)?;
+            Ok(())
+        })();
+        if let Err(e) = recorded {
+            let _ = fs::remove_dir_all(&final_dir);
+            return Err(e);
+        }
 
         self.emit(AppEvent::Installed { app: id.clone() });
         if upgrading && !verified.permission_diff.is_empty() {
@@ -358,7 +363,12 @@ impl AppManager {
                 });
             }
         }
-        let text = fs::read_to_string(self.registry.paths().manifest_path(id))?;
+        let text = fs::read_to_string(
+            self.registry
+                .paths()
+                .package_dir(id, &record.current_version)
+                .join("manifest.toml"),
+        )?;
         let manifest = Manifest::from_toml(&text, &self.host_version)?;
         let source = static_source(&manifest)?.to_string();
         let root = self
@@ -435,11 +445,16 @@ impl AppManager {
             .apps
             .into_iter()
             .map(|r| {
-                let name = fs::read_to_string(self.registry.paths().manifest_path(&r.id))
-                    .ok()
-                    .and_then(|t| Manifest::from_toml(&t, &self.host_version).ok())
-                    .map(|m| m.name)
-                    .unwrap_or_else(|| r.id.to_string());
+                let name = fs::read_to_string(
+                    self.registry
+                        .paths()
+                        .package_dir(&r.id, &r.current_version)
+                        .join("manifest.toml"),
+                )
+                .ok()
+                .and_then(|t| Manifest::from_toml(&t, &self.host_version).ok())
+                .map(|m| m.name)
+                .unwrap_or_else(|| r.id.to_string());
                 let url = matches!(r.observed, ObservedState::Running)
                     .then(|| self.gateway.site_url(&r.id));
                 AppSummary {
@@ -630,7 +645,7 @@ source = "web/"
             .iter()
             .find(|e| e.key == PermissionKey::NetworkOutbound)
             .unwrap();
-        assert_eq!(net.enforcement, Enforcement::Enforced);
+        assert_eq!(net.enforcement, Enforcement::Advisory);
         assert!(plan.will_run[0].contains("不执行任何命令"));
         assert_eq!(plan.manifest_digest.len(), 64);
         assert_eq!(plan.source_digest.len(), 64);
@@ -1063,8 +1078,13 @@ source = "web/"
             "hi",
         ))
         .unwrap();
+        // 清单从**当前版本的包**里读(包里本来就拷着 manifest.toml),不再依赖一份共享的应用级文件
         fs::write(
-            rig.manager.registry.paths().manifest_path(&app),
+            rig.manager
+                .registry
+                .paths()
+                .package_dir(&app, &Version::new(1, 0, 0))
+                .join("manifest.toml"),
             "not toml {{{",
         )
         .unwrap();
@@ -1079,13 +1099,22 @@ source = "web/"
         let dir = rig.src_dir("a");
         let src = write_app(&dir, "excalidraw", "1.0.0", "", "one");
         rig.install(&src).unwrap();
+        // 清单就在落位的包里(staging 副本被 verify 过的那份);不再另存一份应用级的 manifest.toml
         let saved = fs::read_to_string(
             rig.manager
                 .registry
                 .paths()
-                .manifest_path(&id("excalidraw")),
+                .package_dir(&id("excalidraw"), &Version::new(1, 0, 0))
+                .join("manifest.toml"),
         )
         .unwrap();
+        assert!(
+            !rig.manager
+                .registry
+                .paths()
+                .manifest_path(&id("excalidraw"))
+                .exists()
+        );
         assert_eq!(
             saved,
             fs::read_to_string(dir.join("manifest.toml")).unwrap()
@@ -1119,5 +1148,74 @@ source = "web/"
                 .is_err()
         );
         assert_no_leftovers(&rig);
+    }
+
+    /// 落位(rename)之后的任何一步失败,都要把刚落位的包目录撤回——否则重试永远撞上"目录已存在"。
+    /// 这里用"`data` 被一个同名文件占着"让 `registry.save` 在 rename 之后失败。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failure_after_the_rename_rolls_the_package_back_so_a_retry_works() {
+        let rig = rig().await;
+        let app = id("excalidraw");
+        let src = write_app(&rig.src_dir("a"), "excalidraw", "1.0.0", "", "hi");
+        let blocker = rig.manager.registry.paths().data_dir(&app);
+        fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        fs::write(&blocker, "i am a file, not a directory").unwrap();
+
+        assert!(matches!(rig.install(&src), Err(ManagerError::Io(_))));
+        let pkg = rig
+            .manager
+            .registry
+            .paths()
+            .package_dir(&app, &Version::new(1, 0, 0));
+        assert!(!pkg.exists(), "失败后包目录必须撤回");
+        assert!(!rig.manager.registry.paths().state_path(&app).exists());
+        assert_no_leftovers(&rig);
+
+        fs::remove_file(&blocker).unwrap();
+        rig.install(&src).expect("障碍移走后重试必须成功");
+        assert_eq!(rig.manager.list().unwrap().len(), 1);
+    }
+
+    /// 上一次崩溃留下的"包目录存在但没有版本记录"的残骸,不能挡住重装。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn debris_from_a_crashed_install_never_blocks_a_retry_or_an_upgrade() {
+        let rig = rig().await;
+        let app = id("excalidraw");
+        // 全新安装:残骸目录已经在了
+        let debris = rig
+            .manager
+            .registry
+            .paths()
+            .package_dir(&app, &Version::new(1, 0, 0));
+        write_files(&debris, &[("junk.txt", "left over")]);
+        rig.install(&write_app(
+            &rig.src_dir("v1"),
+            "excalidraw",
+            "1.0.0",
+            "",
+            "one",
+        ))
+        .unwrap();
+        assert!(!debris.join("junk.txt").exists(), "残骸被清掉,落位的是新包");
+        assert!(debris.join("web/index.html").is_file());
+
+        // 升级:新版本目录的残骸
+        let debris2 = rig
+            .manager
+            .registry
+            .paths()
+            .package_dir(&app, &Version::new(1, 1, 0));
+        write_files(&debris2, &[("junk.txt", "left over")]);
+        rig.install(&write_app(
+            &rig.src_dir("v2"),
+            "excalidraw",
+            "1.1.0",
+            "",
+            "two",
+        ))
+        .unwrap();
+        assert!(!debris2.join("junk.txt").exists());
+        rig.manager.start(&app).unwrap();
+        assert!(rig.fetch(&app, "/").text().contains("two"));
     }
 }

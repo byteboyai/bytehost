@@ -26,7 +26,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::id::AppId;
 use crate::permissions::{Outbound, Permissions};
@@ -56,6 +56,25 @@ impl std::fmt::Display for GatewayError {
 }
 
 impl std::error::Error for GatewayError {}
+
+/// 连接层限制。gateway 跑在 dozerd 里,和 PTY 池共用文件描述符:网页可以让浏览器对 `rN.localhost:端口` 开大量连接,
+/// 所以半截请求头、空闲的 keep-alive 连接都不能永远占着 fd。
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// 读完整个请求头的最长时间,超时断开。
+    pub header_read_timeout: std::time::Duration,
+    /// 同时处理的连接数上限;超出的连接被立即丢弃。
+    pub max_connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            header_read_timeout: std::time::Duration::from_secs(10),
+            max_connections: 128,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct GatewayConfig {
@@ -91,7 +110,8 @@ pub fn csp_for(grants: &Permissions) -> Option<String> {
         Outbound::None => Some(
             "default-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval'; \
              style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; \
-             connect-src 'self'; base-uri 'self'; form-action 'self'"
+             connect-src 'self'; object-src 'none'; frame-ancestors 'self'; \
+             base-uri 'self'; form-action 'self'"
                 .to_string(),
         ),
     }
@@ -99,6 +119,13 @@ pub fn csp_for(grants: &Permissions) -> Option<String> {
 
 impl Gateway {
     pub async fn start(config: GatewayConfig) -> Result<Self, GatewayError> {
+        Self::start_with_limits(config, Limits::default()).await
+    }
+
+    pub async fn start_with_limits(
+        config: GatewayConfig,
+        limits: Limits,
+    ) -> Result<Self, GatewayError> {
         let listener = TcpListener::bind(("127.0.0.1", config.port))
             .await
             .map_err(|e| {
@@ -119,7 +146,12 @@ impl Gateway {
             sites: RwLock::new(HashMap::new()),
         });
         let shutdown = Arc::new(Notify::new());
-        let task = tokio::spawn(accept_loop(listener, state.clone(), shutdown.clone()));
+        let task = tokio::spawn(accept_loop(
+            listener,
+            state.clone(),
+            shutdown.clone(),
+            limits,
+        ));
         Ok(Self {
             state,
             shutdown,
@@ -175,14 +207,23 @@ impl Gateway {
     }
 }
 
-async fn accept_loop(listener: TcpListener, state: Arc<State>, shutdown: Arc<Notify>) {
+async fn accept_loop(
+    listener: TcpListener,
+    state: Arc<State>,
+    shutdown: Arc<Notify>,
+    limits: Limits,
+) {
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
             accepted = listener.accept() => {
                 let Ok((stream, _addr)) = accepted else { continue };
+                // 超出上限的连接立即丢弃(客户端看到连接被关闭),不排队
+                let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
                 let state = state.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let service = service_fn(move |req: Request<Incoming>| {
                         let state = state.clone();
                         async move {
@@ -202,9 +243,12 @@ async fn accept_loop(listener: TcpListener, state: Arc<State>, shutdown: Arc<Not
                             Ok::<_, Infallible>(reply)
                         }
                     });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await;
+                    // 每个应答之后就关连接(本机静态站点不需要 keep-alive),并给读请求头设超时
+                    let mut http = hyper::server::conn::http1::Builder::new();
+                    http.timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(limits.header_read_timeout)
+                        .keep_alive(false);
+                    let _ = http.serve_connection(TokioIo::new(stream), service).await;
                 });
             }
         }
@@ -626,6 +670,8 @@ mod tests {
             "default-src 'self'",
             "connect-src 'self'",
             "script-src 'self'",
+            "object-src 'none'",
+            "frame-ancestors 'self'",
         ] {
             assert!(csp.contains(needed), "{csp}");
         }
@@ -794,5 +840,83 @@ mod tests {
                 .await
                 .expect("shutdown 必须返回");
         }
+    }
+
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    fn raw(port: u16) -> TcpStream {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    }
+
+    /// 读到对端关闭(EOF 或连接被重置)为止;返回读到的字节数。读超时算测试失败。
+    fn read_until_closed(s: &mut TcpStream) -> usize {
+        let mut buf = Vec::new();
+        match s.read_to_end(&mut buf) {
+            Ok(_) => buf.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => buf.len(),
+            Err(e) => panic!("连接没有被服务端关闭: {e}"),
+        }
+    }
+
+    /// 网页可以让浏览器对 `rN.localhost:端口` 开大量连接;半截请求头、空闲的 keep-alive 连接都不能永远占着 fd。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_that_never_finishes_its_headers_is_cut_off() {
+        let limits = Limits {
+            header_read_timeout: Duration::from_millis(300),
+            max_connections: 64,
+        };
+        let gw = Gateway::start_with_limits(GatewayConfig { port: 0 }, limits)
+            .await
+            .unwrap();
+        let mut s = raw(gw.port());
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x").unwrap();
+        let started = Instant::now();
+        read_until_closed(&mut s);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "半截请求头必须被超时切断"
+        );
+        gw.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keep_alive_is_off_so_idle_connections_do_not_pile_up() {
+        let gw = Gateway::start(GatewayConfig { port: 0 }).await.unwrap();
+        let mut s = raw(gw.port());
+        // 不带 `Connection: close`:服务端回完应答后必须自己关闭连接
+        let id = AppId::new("ghost").unwrap();
+        let host = format!("{id}.localhost:{}", gw.port());
+        s.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .unwrap();
+        let n = read_until_closed(&mut s);
+        assert!(n > 0, "先收到了应答(403),然后连接被关闭");
+        gw.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connections_beyond_the_cap_are_dropped_immediately() {
+        let limits = Limits {
+            header_read_timeout: Duration::from_secs(10),
+            max_connections: 2,
+        };
+        let gw = Gateway::start_with_limits(GatewayConfig { port: 0 }, limits)
+            .await
+            .unwrap();
+        let (_hold1, _hold2) = (raw(gw.port()), raw(gw.port()));
+        std::thread::sleep(Duration::from_millis(200)); // 让两个空闲连接先占住名额
+        let mut third = raw(gw.port());
+        let _ = third.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        let started = Instant::now();
+        assert_eq!(
+            read_until_closed(&mut third),
+            0,
+            "超出上限的连接什么都收不到"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        gw.shutdown().await;
     }
 }

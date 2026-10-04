@@ -8,9 +8,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// 随机选取的范围(IANA 动态/私有端口段,避开 3000/8080 之类的常用开发端口)。
-pub const PORT_MIN: u16 = 49152;
-pub const PORT_MAX: u16 = 65000;
+/// 随机选取的范围:**低于 macOS(49152–65535)与 Linux(32768–60999)的临时端口段**——任何监听端口 0 的程序都从
+/// 那里拿端口,dozerd 停着的时候可能占走固定端口;同时避开 3000/8080 之类的常用开发端口。
+pub const PORT_MIN: u16 = 20000;
+pub const PORT_MAX: u16 = 32767;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,5 +125,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("gateway.json"), r#"{"port": 51234}"#).unwrap();
         assert_eq!(load_or_choose_port(tmp.path()).unwrap(), 51234);
+    }
+
+    /// macOS 的临时端口段是 49152–65535,Linux 是 32768–60999:任何监听端口 0 的程序都从那里拿端口。
+    /// 固定端口要避开它们,否则 dozerd 停着的时候别的程序可能占走它。
+    #[test]
+    fn the_range_stays_below_both_ephemeral_port_ranges() {
+        const {
+            assert!(PORT_MIN >= 1024);
+            assert!(PORT_MAX < 32768);
+            assert!(PORT_MIN < PORT_MAX);
+        }
     }
 }

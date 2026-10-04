@@ -205,7 +205,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 3. **自定义协议不作为应用 gateway。** 它没有同源 WebSocket、没有真流式、没有 Cookie、没有 Service Worker,Excalidraw 这类应用会在细节上坏掉。它仍可用于 host 自己的静态页(如现有 `dozer://html/`)。
 4. **Host 校验是硬要求。** gateway 只接受 `Host` 为已注册的 `<app-id>.localhost:<端口>` 的请求,其余一律拒绝;这是防御 DNS rebinding 的主要手段。另加每会话 token(放在 Cookie 或首次导航的一次性参数里,由宿主注入),防止本机其他网页直接探测应用。**本 spike 没有做攻击实验,这条是设计约束,不是实测结论。**
 5. `AppEndpoint` 对产品暴露 `{ url, origin_id(跨重启稳定), capabilities }`,不暴露 gateway 的实现(以便日后换成别的承载)。
-6. **端口策略【用户已定,2026-10-04】:** 首次启动从高端口段随机选一个并持久化到注册表,跨重启不变(避开 3000/8080 等常用开发端口);选定后若被占用,**显式报错**并在 Settings 给出修改入口,**不静默换端口**——改端口会让所有应用丢失本地存储(origin 含端口),所以修改前必须明确确认。两个产品(Dozer/Digger)同机运行时各自持久化各自的端口,互不冲突。
+6. **端口策略【用户已定,2026-10-04】:** 首次启动从 **20000–32767**(低于 macOS 与 Linux 的临时端口段,避免被监听端口 0 的程序占走)随机选一个并持久化,跨重启不变(避开 3000/8080 等常用开发端口);选定后若被占用,**显式报错**并在 Settings 给出修改入口,**不静默换端口**——改端口会让所有应用丢失本地存储(origin 含端口),所以修改前必须明确确认。两个产品(Dozer/Digger)同机运行时各自持久化各自的端口,互不冲突。
 
 ### 5.2.1 显示与运行的分工【用户已确认走 wry】
 
@@ -262,7 +262,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 | **A1** | `server` feature:`AppManager`、`static_web` runtime、gateway(Host 校验、静态文件、固定端口);runtime adapter trait + 各 runtime 的 `probe`(docker/colima、node、uv 的分层探测) | 新 crate | A0、V1 **已完成(A1,`bytehost-a1`):`283ff056`**——`server` feature:`AppManager`、`static_web`、gateway(Host 校验 + 会话令牌 + 路径解析 + CSP)、端口持久化、docker/node/python 分层探测;V1 已实测通过 |
 | **A2** | 接入 dozerd:`dozer-core::protocol` 加 `Request::App`/`Response::App`/事件,`dozerd/server.rs` 转给 `AppManager`;`dozer-client` 加 `app_*` 方法;dozerd 启动对账、优雅退出停应用、孤儿清理 | dozer-core、dozerd、dozer-client | A1 |
 | **A3** | rail 动态条目最小版(H7b-min):条目 id 能表达 `app:<id>`、布局序列化向后兼容、按应用 id 存独立 WebView 状态 | dozer-app | 无(可与 A0–A2 并行) |
-| **A4** | GUI:应用面板(wry,加载 `http://<app-id>.localhost:端口/`,每应用 `data_store_identifier`)、安装计划/审批的最小界面、不可用时的提示页(§6.3,由 host 提供)、Settings 里的运行时探测展示 | dozer-app | A2、A3 |
+| **A4** | GUI:应用面板(wry,加载 `http://<app-id>.localhost:端口/`,每应用 `data_store_identifier`)、安装计划/审批的最小界面、不可用时的提示页(§6.3,由 host 提供)、Settings 里的运行时探测展示 | dozer-app | A2、A3 **必须同时实现"禁止离开本 origin 的顶层导航/`window.open`"的 WebView 策略**——这是静态应用出站网络的强制等级能从 `Advisory` 升为 `Enforced` 的前提(CSP 挡不住导航与 WebRTC,见 A1 评审) |
 | **A5** | Excalidraw 端到端验收(下面的验收 1–8) | 全部 | A4、V2 |
 
 **验收:**
