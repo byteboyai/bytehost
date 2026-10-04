@@ -184,14 +184,32 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 - **V4** 不带 `data_store_identifier` 与 macOS 14 以下的行为;
 - **V5** 非 macOS(WebView2/WebKitGTK)上 `*.localhost` 解析与数据目录隔离。
 
-## 6. 进程所有权【待裁决】
+## 6. 运行时:进程所有权、来源与不可用时的呈现
 
-静态 Web 应用**没有进程**(gateway 直接提供文件),所以进程所有权**不阻塞一期**。它只在 Node/Python/容器 adapter 出现时才需要回答:
+### 6.1 进程所有权【用户已定 A2,2026-10-04】:跟随 dozerd
 
-- **S1 单一 supervisor**(独立守护进程,产品作为客户端):GUI 退出后应用继续跑;多个产品共享同一个 `apps/` 目录不会冲突;需要 desired/observed 对账与 IPC。群聊 claude 与本文都倾向它。
-- **S2 嵌入库 + 目录锁**:应用随宿主生命周期;实现简单,但两个产品同时管理同一 `apps/` 会冲突(要靠锁),GUI 崩溃会杀掉应用。
+**应用的进程/容器由 dozerd 监督,dozerd 停止则应用停止。** 这等价于 S1(独立于 GUI 的 supervisor),supervisor 就是 Dozer 已有的会话守护进程:
 
-本文建议:接口按 S1 的形状设计(`AppService` 本来就是 client-style、状态是 desired/observed、任务是句柄),一期用进程内实现;第一个进程型 runtime 落地前再裁决 S1/S2。**请用户确认这一推迟是否可接受。**
+- GUI 退出不影响应用(dozerd 本来就让会话在 GUI 退出后存活);dozerd 停止(用户在设置里停止、或崩溃)则应用随之停止。
+- `app/manager`(§3)作为库链接进 dozerd;GUI 通过 dozerd 的 UDS 协议做客户端。生命周期状态 desired/observed(§4.4)由 dozerd 持久化与对账。
+- **进程型应用:** dozerd 退出时杀整个进程组;dozerd **崩溃**时(macOS 没有 `PR_SET_PDEATHSIG`)会留下孤儿进程,所以启动时必须按 pidfile/进程组对账并回收孤儿。
+- **容器:** 容器本来独立于 dozerd,所以"dozerd 停则停"要靠 dozerd 优雅退出时 `docker stop`;崩溃留下的孤儿容器靠 `bytehost.app=<id>` 标签在下次启动时找回并清理。
+- **gateway 同样放进 dozerd**【本文建议,见 A7】:它与应用同生命周期,`<app-id>.localhost:<端口>` 的 origin 在 GUI 重启时保持不变,静态 Web 应用也由它提供文件。GUI 里的 wry 只是客户端。
+- **Digger 没有 dozerd。** 所以 supervisor 必须是 bytehost 定义的**接口/协议**,dozerd 是 Dozer 的实现;Digger 需要自己的实现(自带守护进程或进程内嵌入,见 A8)。接口按"client-style、desired/observed、任务句柄"设计,不假定背后是 dozerd。
+
+### 6.2 运行时来源【用户倾向:Settings 提供运行时安装,待细化 A9】
+
+- **先探测系统已有的**(`node`/`npm`/`pnpm`、`uv`/`python3`、`docker` 及当前 context),探测结果分层:没装 / 装了但不可用(如 Colima 没启动)/ 可用。
+- **Settings 面板提供"运行时安装/管理"**:这是产品 UI;机制归 bytehost 的 `RuntimeManager`(探测、安装、列出版本、卸载),产品的 Settings 调它。
+- **能装什么要区分:** uv(及其管理的 Python)、Node 可由 bytehost 下载到自己的目录(固定版本 + 校验和,不动系统环境);**Docker/Colima 不能由 bytehost 安装**(需要系统权限与虚拟机),只做探测、状态说明与指引。
+- **下载是安全敏感操作:** 版本固定、校验和强制、来源可审、下载在安装计划/设置界面里明示;不静默下载。
+- 本机现状(用户机器实测):docker 29.6(context=colima)、node 24.14、python 3.13、uv 均已可用。
+
+### 6.3 运行时/容器不可用时的呈现【用户已定,2026-10-04】:在该应用的 wry 窗口里提示
+
+应用无法启动(运行时缺失、Colima 没启动、容器不可用……)时,**应用自己的面板(wry 窗口)里显示一张提示页**,而不是弹别处的通知:说明原因并给出可用的动作(启动 Colima、去 Settings 安装运行时、重试;对未知来源应用还可以"明确确认后以普通进程运行")。要点:
+- **不得静默降级。** 未知来源应用在没有容器时不会悄悄变成裸跑进程;"以普通进程运行"必须是用户在提示页上的显式选择,并写入授权记录。
+- **提示页由 host 提供,不由应用 origin 提供。** 否则它与应用共享 origin/存储,会被应用(或应用的残留状态)伪造;应放在 host 自己的页面承载上(与现有 `preview_fallback_page` 同一思路),动作经 host 的消息回到 `AppService`。
 
 ## 7. 一期范围与验收
 
@@ -215,8 +233,11 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 | # | 问题 | 本文倾向 |
 |---|---|---|
 | A1 | gateway 方案 | §5.2:`<app-id>.localhost` + 固定单端口 + Host 路由 + 每应用数据存储标识;自定义协议不作应用 gateway |
-| A2 | 进程所有权 | 接口按 S1 设计,一期进程内,首个进程型 runtime 前再裁决 |
+| A2 | 进程所有权 | **已定(2026-10-04,用户):跟随 dozerd,dozerd 停止则应用停止**(§6.1) |
 | A3 | 一期切片是否需要 rail 动态条目最小版(H7b-min) | **需要**(A6 选 (a) 已定);作为本规格的前置小计划,要点:rail/布局的条目 id 能表达 `app:<id>`、按应用 id 存独立 WebView 状态、落盘兼容 |
 | A4 | 规格存放位置 | 暂放 dozer 的 `docs/superpowers/specs/`(与其他 bytehost 文档同处,bytehost 还没有独立仓库);拆出后迁移 |
 | A6 | 应用的"独立入口"是什么形态 | **已定(2026-10-04,用户):(a) rail 图标 → 该应用自己的面板**;(b) 独立窗口留作以后的可选能力 |
+| A7 | gateway 放在哪个进程 | 放进 dozerd(与应用同生命周期,origin 随 GUI 重启保持稳定);GUI 里的 wry 只是客户端。**待用户确认** |
+| A8 | Digger 的 supervisor 怎么实现 | bytehost 只定义接口/协议;Digger 自带守护进程或进程内嵌入。**待 Digger 启动时裁决** |
+| A9 | Settings 里运行时安装的范围 | 可装 uv/Python、Node(固定版本+校验和,装到 bytehost 自己的目录);Docker/Colima 只探测与指引;下载必须显式确认。**待用户确认** |
 | A5 | UML 面板的形态 | Preview 的 `.puml` 类型,而非独立面板/应用 |
