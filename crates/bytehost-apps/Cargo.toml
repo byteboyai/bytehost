@@ -13,12 +13,32 @@ description = "bytehost 应用宿主的无界面部分:应用模型、安装计�
 manifest-toml = ["dep:toml"]
 # 摘要计算(manifest 摘要、源码目录摘要、每应用数据存储标识)。
 digest = ["dep:sha2"]
+# 服务端部分:`AppManager`、runtime adapter、gateway(本机 HTTP 服务)。只有 dozerd 打开;
+# 隐含 `digest` 与 `manifest-toml`。
+server = [
+    "digest",
+    "manifest-toml",
+    "dep:tokio",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:uuid",
+]
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 toml = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }
+tokio = { workspace = true, optional = true }
+hyper = { version = "1", optional = true, features = ["server", "http1"] }
+hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# 测试里用 tokio 的 `#[tokio::test]`;`tokio` 本身在 `server` feature 下才是依赖
+tokio = { workspace = true }
