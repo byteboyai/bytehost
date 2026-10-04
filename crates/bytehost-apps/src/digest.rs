@@ -1,5 +1,9 @@
 //! 摘要(feature `digest`):manifest 摘要、源码目录摘要、每应用数据存储标识。
 //! 审批绑定摘要——审批之后源码或 manifest 被替换,安装时摘要对不上就拒绝(防 TOCTOU)。
+//!
+//! **摘要覆盖整个应用包根目录**(含图标、lockfile、manifest 引用到的一切),不只是 `runtime.source`。
+//! **防 TOCTOU 的前提是安装顺序:** 先把包拷到 staging,对 **staging 里的副本**算摘要并 `verify`,再改名/落位;
+//! 对源目录先算摘要再拷贝仍有窗口。文件权限位(可执行位)不在摘要里(见 A0 计划 Review Focus 2)。
 
 use std::fs;
 use std::io;
@@ -36,6 +40,24 @@ pub fn digest_tree(root: &Path) -> io::Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
+/// 相对路径 → 以 `/` 分隔的字符串。**非 UTF-8 名字直接拒绝**:`to_string_lossy` 会把 `a\xff` 和真正叫
+/// `a\u{FFFD}` 的文件变成同一个字符串,而后面是按这个字符串回读内容的——载荷文件的字节就可能根本没进摘要。
+fn rel_string(rel: &Path) -> io::Result<String> {
+    let mut parts = Vec::new();
+    for c in rel.components() {
+        match c.as_os_str().to_str() {
+            Some(s) => parts.push(s),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("应用包里的文件名必须是 UTF-8: {}", rel.display()),
+                ));
+            }
+        }
+    }
+    Ok(parts.join("/"))
+}
+
 fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -50,13 +72,16 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<()> {
         if file_type.is_dir() {
             collect(root, &path, out)?;
         } else {
-            let rel = path.strip_prefix(root).expect("在 root 之下");
-            let rel = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            out.push(rel);
+            if !file_type.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "应用包里只允许普通文件和目录(不允许 FIFO/套接字/设备): {}",
+                        path.display()
+                    ),
+                ));
+            }
+            out.push(rel_string(path.strip_prefix(root).expect("在 root 之下"))?);
         }
     }
     Ok(())
@@ -171,5 +196,35 @@ mod tests {
         assert_ne!(data_store_id(&a), data_store_id(&b));
         assert_eq!(data_store_id_hex(&a).len(), 32);
         assert!(data_store_id_hex(&a).bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// 用合成路径测(不依赖文件系统是否允许非 UTF-8 名字):`to_string_lossy` 会把 `a\xff` 和真正叫
+    /// `a\u{FFFD}` 的文件变成同一个字符串,摘要就可能漏掉其中一个文件的内容。
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_names_are_refused_not_converted_lossily() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = Path::new(std::ffi::OsStr::from_bytes(b"dir/a\xff"));
+        assert_eq!(
+            rel_string(raw).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(rel_string(Path::new("dir/a.txt")).unwrap(), "dir/a.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_digest_refuses_fifos_instead_of_blocking_on_them() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "index.html", "a");
+        let status = std::process::Command::new("mkfifo")
+            .arg(d.path().join("pipe"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            digest_tree(d.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

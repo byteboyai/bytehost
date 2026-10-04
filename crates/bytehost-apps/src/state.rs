@@ -49,7 +49,8 @@ impl ObservedState {
     }
 }
 
-/// 想要 `desired` 而实际是 `observed` 时,下一步该做什么;`None` = 什么都不用做(已达成、在等进行中的动作、
+/// 想要 `desired` 而实际是 `observed` 时,下一步该做什么(**不含重试退避**:`Running` + 可重试的 `Failed` 会一直
+/// 给 `Start`,manager 必须自己限制次数/间隔,否则会紧循环);`None` = 什么都不用做(已达成、在等进行中的动作、
 /// 或不可恢复的失败需要人介入)。
 pub fn next_action(desired: DesiredState, observed: &ObservedState) -> Option<Action> {
     use DesiredState as D;
@@ -69,6 +70,8 @@ pub fn next_action(desired: DesiredState, observed: &ObservedState) -> Option<Ac
         (D::Running, _) => None,
 
         (D::Stopped, O::Running) => Some(Action::Stop),
+        // 规格 §4.4:Failed 可经 stop 复位——失败的进程型应用可能还留着活进程/占着端口
+        (D::Stopped, O::Failed { .. }) => Some(Action::Stop),
         (D::Stopped, _) => None,
 
         (D::Removed, O::Running) => Some(Action::Stop),
@@ -79,17 +82,15 @@ pub fn next_action(desired: DesiredState, observed: &ObservedState) -> Option<Ac
 
 /// supervisor(dozerd)重启之后,把持久化下来的观察态修正为现实:应用随 supervisor 一起停止了
 /// (`docs/.../app-host-design.md` §6.1),所以"曾在运行/过渡中"的都回到 `Stopped`;
-/// 被打断的升级/卸载无法判断包是否完整,标成可重试的失败。
+/// 被打断的升级回到 `Stopped`(旧版本完整);被打断的卸载标成可重试的失败(再卸一次即可)。
 pub fn recover_after_supervisor_restart(observed: ObservedState) -> ObservedState {
     match observed {
         ObservedState::Preparing
         | ObservedState::Starting
         | ObservedState::Running
         | ObservedState::Stopping => ObservedState::Stopped,
-        ObservedState::Updating => ObservedState::Failed {
-            reason: "升级被打断".to_string(),
-            retryable: true,
-        },
+        // 每个版本的包目录不可变、`current_version` 最后才写:升级被打断时旧版本仍然完整,回到 Stopped
+        ObservedState::Updating => ObservedState::Stopped,
         ObservedState::Uninstalling => ObservedState::Failed {
             reason: "卸载被打断".to_string(),
             retryable: true,
@@ -161,8 +162,8 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
-                    None,
+                    Some(Stop),
+                    Some(Stop),
                 ],
             ),
             (
@@ -239,13 +240,11 @@ mod tests {
             failed(false),
             "失败原样保留"
         );
-        assert!(matches!(
+        assert_eq!(
             recover_after_supervisor_restart(O::Updating),
-            O::Failed {
-                retryable: true,
-                ..
-            }
-        ));
+            O::Stopped,
+            "升级中断:每个版本的包目录不可变、current_version 最后才写,所以旧版本仍然完整,回到 Stopped"
+        );
         assert!(matches!(
             recover_after_supervisor_restart(O::Uninstalling),
             O::Failed {
@@ -286,5 +285,14 @@ mod tests {
             serde_json::from_str::<O>(&serde_json::to_string(&f).unwrap()).unwrap(),
             f
         );
+    }
+
+    #[test]
+    fn a_failed_app_that_should_be_stopped_is_stopped_to_clean_up_any_residue() {
+        // 规格 §4.4:Failed 可经 start 重试,或经 stop 复位——失败的进程型应用可能还留着活进程/占着端口
+        assert_eq!(next_action(D::Stopped, &failed(true)), Some(Action::Stop));
+        assert_eq!(next_action(D::Stopped, &failed(false)), Some(Action::Stop));
+        // 复位之后(Stopped)就不再有动作,不会循环
+        assert_eq!(next_action(D::Stopped, &O::Stopped), None);
     }
 }

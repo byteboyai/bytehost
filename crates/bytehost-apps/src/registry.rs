@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::id::{AppId, Version};
 use crate::permissions::Permissions;
-use crate::state::DesiredState;
+use crate::state::{DesiredState, ObservedState};
+
+/// `state.json` 的格式版本。读到不认识的版本就拒绝(不猜),升级格式时递增并写迁移。
+pub const RECORD_FORMAT_VERSION: u32 = 1;
 
 /// 一个应用在磁盘上的各个位置。
 #[derive(Debug, Clone)]
@@ -69,8 +72,12 @@ pub struct VersionRecord {
 /// 持久化的应用记录(`state.json`)。**不含密钥**——密钥只存引用,由宿主的凭据服务注入。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppRecord {
+    /// 见 [`RECORD_FORMAT_VERSION`]。
+    pub format_version: u32,
     pub id: AppId,
     pub desired: DesiredState,
+    /// 最后一次观察到的状态(supervisor 持久化;重启后经 `recover_after_supervisor_restart` 修正)。
+    pub observed: ObservedState,
     /// 当前生效的版本(`versions` 里最后一次安装的那个)。
     pub current_version: Version,
     /// 用户**实际授予**的权限(与 manifest 的"申请"分开存)。
@@ -138,22 +145,12 @@ impl Registry {
         let path = self.paths.state_path(id);
         match fs::read_to_string(&path) {
             Ok(text) => {
-                let record: AppRecord = serde_json::from_str(&text).map_err(|e| {
+                let record = parse_record(&text, id.as_str()).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("{}: {e}", path.display()),
                     )
                 })?;
-                if &record.id != id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "{}: 记录里的 id {} 与目录名不一致",
-                            path.display(),
-                            record.id
-                        ),
-                    ));
-                }
                 Ok(Some(record))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -199,7 +196,18 @@ impl Registry {
 
 fn read_record(path: &Path, dir_name: &str) -> Result<AppRecord, String> {
     let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let record: AppRecord = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    parse_record(&text, dir_name)
+}
+
+/// 解析并校验一份 `state.json`:格式版本必须认识,记录里的 id 必须与目录名一致。
+fn parse_record(text: &str, dir_name: &str) -> Result<AppRecord, String> {
+    let record: AppRecord = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if record.format_version != RECORD_FORMAT_VERSION {
+        return Err(format!(
+            "不支持的 state.json 格式版本 {}(本宿主认识 {RECORD_FORMAT_VERSION})",
+            record.format_version
+        ));
+    }
     if record.id.as_str() != dir_name {
         return Err(format!(
             "记录里的 id {} 与目录名 {dir_name} 不一致",
@@ -254,6 +262,8 @@ mod tests {
                 installed_ms: 5,
             }],
             data_store_id: "0123456789abcdef0123456789abcdef".into(),
+            format_version: RECORD_FORMAT_VERSION,
+            observed: ObservedState::Stopped,
         }
     }
 
@@ -317,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn state_json_never_contains_secrets_only_what_the_record_defines() {
+    fn state_json_has_exactly_the_documented_fields_and_no_secret_slot() {
         let tmp = tempfile::tempdir().unwrap();
         let reg = Registry::open(tmp.path()).unwrap();
         reg.save(&record("excalidraw")).unwrap();
@@ -331,8 +341,10 @@ mod tests {
                 "current_version",
                 "data_store_id",
                 "desired",
+                "format_version",
                 "grants",
                 "id",
+                "observed",
                 "versions"
             ]
         );
@@ -446,5 +458,34 @@ mod tests {
         for mode in [UninstallMode::Program, UninstallMode::ProgramAndData] {
             reg.uninstall(&id("ghost"), mode).unwrap();
         }
+    }
+
+    #[test]
+    fn the_observed_state_and_format_version_survive_a_save_load_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path()).unwrap();
+        let mut r = record("excalidraw");
+        r.observed = ObservedState::Failed {
+            reason: "端口被占用".into(),
+            retryable: true,
+        };
+        reg.save(&r).unwrap();
+        let back = reg.load(&r.id).unwrap().unwrap();
+        assert_eq!(back.observed, r.observed);
+        assert_eq!(back.format_version, RECORD_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn a_state_json_with_an_unknown_format_version_is_refused_not_guessed_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path()).unwrap();
+        let mut r = record("excalidraw");
+        r.format_version = RECORD_FORMAT_VERSION + 1;
+        reg.save(&r).unwrap();
+        let err = reg.load(&r.id).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let listing = reg.list().unwrap();
+        assert!(listing.apps.is_empty());
+        assert_eq!(listing.problems.len(), 1);
     }
 }

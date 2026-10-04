@@ -123,13 +123,45 @@ fn will_run(runtime: &Runtime) -> Vec<String> {
                     "按 {lock} 安装依赖(依赖的安装脚本本身可以执行任意代码)"
                 ));
             }
-            out.push(format!("运行: {}", command.join(" ")));
+            out.push(format!(
+                "运行: {}",
+                command
+                    .iter()
+                    .map(|a| shell_quote(a))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
             out
         }
         Runtime::Container { image, .. } => {
             vec![format!("拉取镜像 {image}"), "以容器方式运行".to_string()]
         }
     }
+}
+
+/// 命令行参数的展示用引用(shell 风格):只含 `[A-Za-z0-9_@%+=:,./-]` 的原样输出,其余加单引号,
+/// 内部的 `'` 写成 `'\''`;控制字符与双向控制字符转义成 `\u{..}`——批准界面逐字展示这些文本,
+/// 不能让 `["python","-m app"]` 与 `["python","-m","app"]` 看起来一样,也不能靠换行伪造多行。
+fn shell_quote(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if plain {
+        return arg.to_string();
+    }
+    let mut out = String::from("'");
+    for c in arg.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else if c.is_control() || crate::manifest::is_bidi_control(c) {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// 谁在什么时候批准的(审计用)。
@@ -139,7 +171,9 @@ pub struct Approval {
     pub approved_ms: u64,
 }
 
-/// 已批准的计划。字段私有、只能经 [`InstallPlan::approve`] 构造,安装前必须 [`verify`](Self::verify)。
+/// 已批准的计划。字段私有、正常只经 [`InstallPlan::approve`] 构造——**这只是类型层面的约定,不是安全边界**:
+/// 它可以从线上 JSON 反序列化出来(客户端可以发任何内容)。安全属性只来自 [`verify`](Self::verify):
+/// 安装前必须用重新计算的计划核对,并只使用核对后返回的那份。`Approval` 只是审计记录,不防伪。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovedInstallPlan {
     plan: InstallPlan,
@@ -150,6 +184,8 @@ pub struct ApprovedInstallPlan {
 pub enum VerifyError {
     ManifestChanged,
     SourceChanged,
+    /// 摘要一致,但计划里的其他内容(权限申请、强制等级、差异、来源、信任级别……)与重新计算的不同。
+    PlanChanged,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -157,6 +193,7 @@ impl std::fmt::Display for VerifyError {
         match self {
             Self::ManifestChanged => write!(f, "manifest 在审批之后发生了变化"),
             Self::SourceChanged => write!(f, "应用源码在审批之后发生了变化"),
+            Self::PlanChanged => write!(f, "安装计划的内容与重新计算的不一致"),
         }
     }
 }
@@ -172,19 +209,22 @@ impl ApprovedInstallPlan {
         &self.approval
     }
 
-    /// 安装时用**此刻重新计算**的两个摘要核对:任何一个与审批时不同就拒绝。
-    pub fn verify(
-        &self,
-        manifest_digest: &str,
-        source_digest: &str,
-    ) -> Result<&InstallPlan, VerifyError> {
-        if self.plan.manifest_digest != manifest_digest {
+    /// 安装时用**此刻重新计算**出来的计划 `fresh` 核对,并**返回这份新算的计划**——调用方安装、授予权限时
+    /// 一律用返回值,**不要**用 `self.plan()`:`ApprovedInstallPlan` 可以从线上 JSON 反序列化出来,摘要对得上
+    /// 并不代表 `requested`/`enforcement`/`permission_diff` 没被改过。
+    ///
+    /// 先比两个摘要(`ManifestChanged`/`SourceChanged`),再比整份计划的每个字段(`PlanChanged`)。
+    pub fn verify(&self, fresh: InstallPlan) -> Result<InstallPlan, VerifyError> {
+        if self.plan.manifest_digest != fresh.manifest_digest {
             return Err(VerifyError::ManifestChanged);
         }
-        if self.plan.source_digest != source_digest {
+        if self.plan.source_digest != fresh.source_digest {
             return Err(VerifyError::SourceChanged);
         }
-        Ok(&self.plan)
+        if self.plan != fresh {
+            return Err(VerifyError::PlanChanged);
+        }
+        Ok(fresh)
     }
 }
 
@@ -350,26 +390,106 @@ mod tests {
         assert!(plan.will_run[0].contains(&digest));
     }
 
-    #[test]
-    fn an_approved_plan_verifies_only_against_the_same_digests() {
-        let m = manifest(
+    fn fresh(m: &Manifest, manifest_digest: &str, source_digest: &str) -> InstallPlan {
+        InstallPlan::build(PlanInput {
+            manifest_digest: manifest_digest.into(),
+            source_digest: source_digest.into(),
+            ..input(m, None)
+        })
+    }
+
+    fn static_manifest() -> Manifest {
+        manifest(
             Runtime::StaticWeb {
                 source: "web/".into(),
             },
             Permissions::default(),
-        );
+        )
+    }
+
+    #[test]
+    fn verify_accepts_only_a_freshly_recomputed_plan_and_returns_that_fresh_plan() {
+        let m = static_manifest();
         let approved = InstallPlan::build(input(&m, None)).approve(approval());
-        assert!(approved.verify("m1", "s1").is_ok());
+        let ok = approved.verify(fresh(&m, "m1", "s1")).unwrap();
+        assert_eq!(&ok, approved.plan());
         assert_eq!(
-            approved.verify("m2", "s1"),
+            approved.verify(fresh(&m, "m2", "s1")),
             Err(VerifyError::ManifestChanged)
         );
-        assert_eq!(approved.verify("m1", "s2"), Err(VerifyError::SourceChanged));
         assert_eq!(
-            approved.verify("m2", "s2"),
+            approved.verify(fresh(&m, "m1", "s2")),
+            Err(VerifyError::SourceChanged)
+        );
+        assert_eq!(
+            approved.verify(fresh(&m, "m2", "s2")),
             Err(VerifyError::ManifestChanged),
             "两者都变:先报 manifest"
         );
+    }
+
+    /// 摘要都对、但线上 JSON 里的计划内容被改成更宽——`verify` 不能只比两个摘要。
+    #[test]
+    fn verify_rejects_a_payload_edited_after_the_digests_were_taken() {
+        let m = static_manifest();
+        let original = InstallPlan::build(input(&m, None)).approve(approval());
+
+        let mut approved = original.clone();
+        approved.plan.requested.clipboard = crate::permissions::Access::ReadWrite;
+        assert_eq!(
+            approved.verify(fresh(&m, "m1", "s1")),
+            Err(VerifyError::PlanChanged)
+        );
+
+        let mut approved = original.clone();
+        approved.plan.enforcement.clear();
+        assert_eq!(
+            approved.verify(fresh(&m, "m1", "s1")),
+            Err(VerifyError::PlanChanged)
+        );
+
+        let mut approved = original.clone();
+        approved.plan.upgrading_from = Some(Version::new(0, 0, 1));
+        assert_eq!(
+            approved.verify(fresh(&m, "m1", "s1")),
+            Err(VerifyError::PlanChanged)
+        );
+
+        let mut approved = original;
+        approved.plan.permission_diff.clear();
+        approved.plan.trust = TrustLevel::Trusted;
+        assert_eq!(
+            approved.verify(fresh(&m, "m1", "s1")),
+            Err(VerifyError::PlanChanged)
+        );
+    }
+
+    #[test]
+    fn will_run_quotes_arguments_so_different_commands_never_render_identically() {
+        let run = |cmd: &[&str]| {
+            let py = Runtime::Python {
+                command: cmd.iter().map(|s| s.to_string()).collect(),
+                lockfile: None,
+                python: None,
+                http: ProcessHttp {
+                    port_env: "PORT".into(),
+                },
+            };
+            InstallPlan::build(input(&manifest(py, Permissions::default()), None))
+                .will_run
+                .last()
+                .unwrap()
+                .clone()
+        };
+        assert_ne!(run(&["python", "-m app"]), run(&["python", "-m", "app"]));
+        assert_eq!(run(&["python", "-m", "app"]), "运行: python -m app");
+        assert_eq!(run(&["python", "a b"]), "运行: python 'a b'");
+        assert_eq!(run(&["echo", "it's"]), "运行: echo 'it'\\''s'");
+        assert_eq!(run(&["python", ""]), "运行: python ''");
+        // 控制字符与双向控制字符被转义,不能在批准界面上伪造多行
+        let forged = run(&["python", "x\n运行: rm -rf /"]);
+        assert_eq!(forged, "运行: python 'x\\u{a}运行: rm -rf /'");
+        assert!(!run(&["python", "a\u{202e}b"]).contains('\u{202e}'));
     }
 
     #[test]

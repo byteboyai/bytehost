@@ -171,6 +171,7 @@ impl Manifest {
         if self.name.trim().is_empty() || self.name.chars().count() > 64 {
             problems.push("name 不能为空且最长 64 个字符".to_string());
         }
+        check_display("name", &self.name, &mut problems);
         if self.entrypoints.is_empty() {
             problems.push("entrypoints 至少要有一个".to_string());
         }
@@ -181,8 +182,9 @@ impl Manifest {
             ));
         }
         for (name, ep) in &self.entrypoints {
-            if !ep.path.starts_with('/') {
-                problems.push(format!("entrypoints.{name}.path 必须以 '/' 开头"));
+            check_url_path(&format!("entrypoints.{name}.path"), &ep.path, &mut problems);
+            if let Some(title) = &ep.title {
+                check_display(&format!("entrypoints.{name}.title"), title, &mut problems);
             }
         }
         if let Some(icon) = &self.presentation.icon {
@@ -196,9 +198,7 @@ impl Manifest {
             problems.push("presentation.surface_hint 只能是 1–32 个小写字母或 '_'".to_string());
         }
         self.validate_runtime(&mut problems);
-        if !self.health.path.starts_with('/') {
-            problems.push("health.path 必须以 '/' 开头".to_string());
-        }
+        check_url_path("health.path", &self.health.path, &mut problems);
         if !(1..=60_000).contains(&self.health.timeout_ms) {
             problems.push("health.timeout_ms 必须在 1..=60000".to_string());
         }
@@ -226,6 +226,9 @@ impl Manifest {
             } => {
                 if command.is_empty() || command[0].trim().is_empty() {
                     problems.push("runtime.command 不能为空".to_string());
+                }
+                for arg in command {
+                    check_display("runtime.command 的参数", arg, problems);
                 }
                 if let Some(lock) = lockfile {
                     check_relative("runtime.lockfile", lock, problems);
@@ -277,9 +280,44 @@ fn is_env_name(s: &str) -> bool {
 fn is_pinned_image(image: &str) -> bool {
     match image.split_once("@sha256:") {
         Some((name, digest)) => {
-            !name.is_empty() && digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+            // 名字必须以字母或数字开头(以 `-` 开头的会被 docker CLI 当成选项),且不含空白/控制字符
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+                && !name.chars().any(|c| c.is_whitespace() || c.is_control())
+                && digest.len() == 64
+                && digest.bytes().all(|b| b.is_ascii_hexdigit())
         }
         None => false,
+    }
+}
+
+/// 双向控制字符(U+200E/200F、U+202A–202E、U+2066–2069):能让文本在界面上"看起来"是另一个样子。
+pub(crate) fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// 会原样显示在批准界面上的文本:不得含控制字符(含换行、制表、NUL)与双向控制字符。
+fn check_display(field: &str, text: &str, problems: &mut Vec<String>) {
+    if text.chars().any(|c| c.is_control() || is_bidi_control(c)) {
+        problems.push(format!("{field} 不能含控制字符或双向控制字符"));
+    }
+}
+
+/// 应用内的 URL 路径:以单个 `/` 开头(`//host/x`、`/\\host` 会被浏览器当成另一个 origin),不含反斜杠、
+/// `?`、`#`、控制字符与 `..` 段。
+fn check_url_path(field: &str, path: &str, problems: &mut Vec<String>) {
+    let bad = !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains('\\')
+        || path.contains('?')
+        || path.contains('#')
+        || path.chars().any(|c| c.is_control())
+        || path.split('/').any(|seg| seg == "..");
+    if bad {
+        problems.push(format!(
+            "{field} 必须是以单个 '/' 开头的应用内路径(不能含 //开头、反斜杠、?、#、控制字符、.. 段),收到 {path:?}"
+        ));
     }
 }
 
@@ -600,6 +638,80 @@ source = "web/"
             );
             let m = Manifest::from_toml(&text, &HOST).unwrap();
             assert_eq!(m.runtime.kind_name(), "python");
+        }
+    }
+
+    #[test]
+    fn entrypoint_and_health_paths_cannot_point_at_another_origin() {
+        for bad in [
+            "//evil.example/x",
+            "/\\evil.example",
+            "/a\\b",
+            "/a?b",
+            "/a#b",
+            "/a\nb",
+            "/a/../b",
+        ] {
+            let mut m = valid();
+            m.entrypoints.get_mut("main").unwrap().path = bad.into();
+            assert_eq!(problems(&m).len(), 1, "entrypoint {bad:?}");
+            let mut m = valid();
+            m.health.path = bad.into();
+            assert_eq!(problems(&m).len(), 1, "health {bad:?}");
+        }
+        for ok in ["/", "/app/index.html", "/a.b/c", "/a/b..c"] {
+            let mut m = valid();
+            m.entrypoints.get_mut("main").unwrap().path = ok.into();
+            m.health.path = ok.into();
+            assert_eq!(m.validate(&HOST), Ok(()), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn text_shown_on_the_approval_screen_cannot_carry_control_or_bidi_characters() {
+        for bad in [
+            "Ex\ncal",
+            "Evil\u{202e}gpj",
+            "a\u{2066}b",
+            "tab\there",
+            "nul\0",
+        ] {
+            let mut m = valid();
+            m.name = bad.into();
+            assert_eq!(problems(&m).len(), 1, "name {bad:?}");
+            let mut m = valid();
+            m.entrypoints.get_mut("main").unwrap().title = Some(bad.into());
+            assert_eq!(problems(&m).len(), 1, "title {bad:?}");
+            let mut m = valid();
+            m.runtime = Runtime::Node {
+                command: vec!["node".into(), bad.into()],
+                lockfile: None,
+                node: None,
+                http: ProcessHttp {
+                    port_env: "PORT".into(),
+                },
+            };
+            assert_eq!(problems(&m).len(), 1, "command arg {bad:?}");
+        }
+    }
+
+    #[test]
+    fn container_image_names_cannot_start_with_a_dash_or_hide_whitespace() {
+        let digest = "a".repeat(64);
+        for bad in [
+            format!("--privileged@sha256:{digest}"),
+            format!("-v@sha256:{digest}"),
+            format!("x y@sha256:{digest}"),
+            format!("x\n@sha256:{digest}"),
+        ] {
+            let mut m = valid();
+            m.runtime = Runtime::Container {
+                image: bad.clone(),
+                http: ContainerHttp {
+                    container_port: 3000,
+                },
+            };
+            assert_eq!(problems(&m).len(), 1, "{bad:?}");
         }
     }
 }
