@@ -6,13 +6,24 @@
 //! Cargo features(默认全空,只有类型与纯逻辑,依赖仅 serde/serde_json):
 //! - `manifest-toml`:`Manifest::from_toml`
 //! - `digest`:`digest` 模块(SHA-256、源码目录摘要、数据存储标识)
+//! - `server`:`gateway`、`runtime`、`manager`、`port`(只有 dozerd 打开;隐含 `digest` 与 `manifest-toml`)
 
 #[cfg(feature = "digest")]
 pub mod digest;
 pub mod event;
+#[cfg(feature = "server")]
+pub mod gateway;
 pub mod id;
+#[cfg(feature = "server")]
+pub mod manager;
 pub mod manifest;
 pub mod permissions;
 pub mod plan;
+#[cfg(feature = "server")]
+pub mod port;
 pub mod registry;
+#[cfg(feature = "server")]
+pub mod runtime;
 pub mod state;
+#[cfg(all(test, feature = "server"))]
+mod testutil;
