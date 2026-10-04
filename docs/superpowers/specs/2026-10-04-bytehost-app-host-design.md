@@ -59,7 +59,7 @@ app/registry + app/storage + app/model(manifest、授权、状态、事件)
 **形态:一个 crate,两层 cargo feature,不提前拆多个 crate。**(沿用群聊 10-03 的"一期只建一个 bytehost crate,不提前拆"口径;这里的区别只是它**不含 iced**。)
 
 ```text
-crates/bytehost-apps/                      # 名字待定,见 A10
+crates/bytehost-apps/                      # 已定,见 A10
   features: (默认空)  = 只有类型与纯逻辑,依赖仅 serde/serde_json
             "digest"  = 摘要计算(sha2),dozerd 与需要校验摘要的 GUI 侧打开
             "server"  = manager / runtime adapter / gateway,依赖 tokio + HTTP 栈(隐含 digest);只有 dozerd 打开
@@ -289,6 +289,6 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 | A7 | gateway 放在哪个进程 | 放进 dozerd(与应用同生命周期,origin 随 GUI 重启保持稳定);GUI 里的 wry 只是客户端。**待用户确认** |
 | A8 | Digger 的 supervisor 怎么实现 | bytehost 只定义接口/协议;Digger 自带守护进程或进程内嵌入。**待 Digger 启动时裁决** |
 | A9 | Settings 里运行时安装的范围 | 可装 uv/Python、Node(固定版本+校验和,装到 bytehost 自己的目录);Docker/Colima 只探测与指引;下载必须显式确认。**待用户确认** |
-| A10 | 新 crate 的名字与位置 | `crates/bytehost-apps`(无界面;与将来可能的 iced 侧 `bytehost` 区分);也可叫 `bytehost` 并约定"无 iced"。**待用户裁决** |
-| A11 | `server` feature 的 HTTP 栈 | `hyper` 1.x + `hyper-util` + `http-body-util`,WebSocket 复用 `tokio-tungstenite`。**待用户知悉**(新增依赖只进 dozerd) |
+| A10 | 新 crate 的名字与位置 | **已定(2026-10-04,用户):`crates/bytehost-apps`**(无界面;与将来可能的 iced 侧 `bytehost` 区分) |
+| A11 | `server` feature 的 HTTP 栈 | **已确认(2026-10-04,用户):`hyper` 1.x + `hyper-util` + `http-body-util`,WebSocket 复用 `tokio-tungstenite`**(新增依赖只进 dozerd) |
 | A5 | UML 面板的形态 | Preview 的 `.puml` 类型,而非独立面板/应用 |
