@@ -215,7 +215,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 
 ### 5.3 仍需验证(在落地前的 spike 清单)
 
-- **V1** 单一端口 + Host 路由 + 多应用同时打开时的实际表现(spike 只测了单应用);
+- ~~**V1** 单一端口 + Host 路由 + 多应用同时打开时的实际表现~~ **已实测通过(2026-10-04,见 `spike/origin-gateway/README.md` 的 V1 一节):** 同端口、同存储标识下两个应用的 localStorage/IndexedDB/Cookie 完全互不可见;
 - **V2** 真实 Excalidraw 静态构建的端到端(base path、字体、剪贴板读写、下载、弹窗);
 - **V3** 外部浏览器与 DNS rebinding 的攻击面(Host 校验 + token 的有效性);
 - **V4** 不带 `data_store_identifier` 与 macOS 14 以下的行为;
