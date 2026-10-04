@@ -198,13 +198,14 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 - **origin 含端口。** 端口变了,localStorage/IndexedDB 就丢(实测);所以端口必须稳定。
 - **Cookie 不区分端口。** 同一主机名下不同端口的应用共享 cookie(实测:换端口后 cookie 仍可读)。所以 `127.0.0.1:<不同端口>` 在 cookie 层并不隔离,而 `<app-id>.localhost` 因主机名不同天然隔离。
 
-### 5.2 建议【本文建议,待裁决】
+### 5.2 建议【用户已定(A1),2026-10-04:采纳 1–5,端口策略见 5.2 末】
 
 1. **gateway 采用 `http://<app-id>.localhost:<单一固定端口>/`,Host 头路由。** 一个固定端口服务所有应用(按 Host 分发),避免每应用一个端口的分配、冲突与"端口变了丢数据"问题;`<app-id>` 稳定 ⇒ origin 稳定;主机名不同 ⇒ cookie/存储/Service Worker 作用域天然分离。该端口写进 registry 并持久化,被占用时**显式报错**而不是静默换端口(换端口 = 所有应用丢本地数据)。
 2. **再叠一层 `data_store_identifier`(每应用一个)。** 实测不同标识即使 origin 完全相同也完全隔离 localStorage/IndexedDB/Cookie——这是比 origin 更硬的隔离杠杆。代价:`with_data_store_identifier` 需要 macOS 14+(低版本退回只靠 origin 隔离,并在安装计划里标注)。
 3. **自定义协议不作为应用 gateway。** 它没有同源 WebSocket、没有真流式、没有 Cookie、没有 Service Worker,Excalidraw 这类应用会在细节上坏掉。它仍可用于 host 自己的静态页(如现有 `dozer://html/`)。
 4. **Host 校验是硬要求。** gateway 只接受 `Host` 为已注册的 `<app-id>.localhost:<端口>` 的请求,其余一律拒绝;这是防御 DNS rebinding 的主要手段。另加每会话 token(放在 Cookie 或首次导航的一次性参数里,由宿主注入),防止本机其他网页直接探测应用。**本 spike 没有做攻击实验,这条是设计约束,不是实测结论。**
 5. `AppEndpoint` 对产品暴露 `{ url, origin_id(跨重启稳定), capabilities }`,不暴露 gateway 的实现(以便日后换成别的承载)。
+6. **端口策略【用户已定,2026-10-04】:** 首次启动从高端口段随机选一个并持久化到注册表,跨重启不变(避开 3000/8080 等常用开发端口);选定后若被占用,**显式报错**并在 Settings 给出修改入口,**不静默换端口**——改端口会让所有应用丢失本地存储(origin 含端口),所以修改前必须明确确认。两个产品(Dozer/Digger)同机运行时各自持久化各自的端口,互不冲突。
 
 ### 5.2.1 显示与运行的分工【用户已确认走 wry】
 
@@ -230,14 +231,14 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 - `app/manager`(§3)作为库链接进 dozerd;GUI 通过 dozerd 的 UDS 协议做客户端。生命周期状态 desired/observed(§4.4)由 dozerd 持久化与对账。
 - **进程型应用:** dozerd 退出时杀整个进程组;dozerd **崩溃**时(macOS 没有 `PR_SET_PDEATHSIG`)会留下孤儿进程,所以启动时必须按 pidfile/进程组对账并回收孤儿。
 - **容器:** 容器本来独立于 dozerd,所以"dozerd 停则停"要靠 dozerd 优雅退出时 `docker stop`;崩溃留下的孤儿容器靠 `bytehost.app=<id>` 标签在下次启动时找回并清理。
-- **gateway 同样放进 dozerd**【本文建议,见 A7】:它与应用同生命周期,`<app-id>.localhost:<端口>` 的 origin 在 GUI 重启时保持不变,静态 Web 应用也由它提供文件。GUI 里的 wry 只是客户端。
+- **gateway 同样放进 dozerd**【用户已定,A7,2026-10-04】:它与应用同生命周期,`<app-id>.localhost:<端口>` 的 origin 在 GUI 重启时保持不变,静态 Web 应用也由它提供文件。GUI 里的 wry 只是客户端。
 - **Digger 没有 dozerd。** 所以 supervisor 必须是 bytehost 定义的**接口/协议**,dozerd 是 Dozer 的实现;Digger 需要自己的实现(自带守护进程或进程内嵌入,见 A8)。接口按"client-style、desired/observed、任务句柄"设计,不假定背后是 dozerd。
 
-### 6.2 运行时来源【用户倾向:Settings 提供运行时安装,待细化 A9】
+### 6.2 运行时来源【用户已定,A9,2026-10-04:Settings 可装 uv/Python 与 Node,Docker 只探测】
 
 - **先探测系统已有的**(`node`/`npm`/`pnpm`、`uv`/`python3`、`docker` 及当前 context),探测结果分层:没装 / 装了但不可用(如 Colima 没启动)/ 可用。
 - **Settings 面板提供"运行时安装/管理"**:这是产品 UI;机制归 bytehost 的 `RuntimeManager`(探测、安装、列出版本、卸载),产品的 Settings 调它。
-- **能装什么要区分:** uv(及其管理的 Python)、Node 可由 bytehost 下载到自己的目录(固定版本 + 校验和,不动系统环境);**Docker/Colima 不能由 bytehost 安装**(需要系统权限与虚拟机),只做探测、状态说明与指引。
+- **能装什么要区分:** uv(及其管理的 Python)、Node 可由 bytehost 下载到自己的目录(固定版本 + 校验和,不动系统环境,显式确认);**Docker/Colima 不能由 bytehost 安装**(需要系统权限与虚拟机),只做探测、状态说明与指引。一期(只做静态 Web)不需要任何运行时,这一整块属于二期 Node/Python runtime 的范围;一期 Settings 只展示探测结果。
 - **下载是安全敏感操作:** 版本固定、校验和强制、来源可审、下载在安装计划/设置界面里明示;不静默下载。
 - 本机现状(用户机器实测):docker 29.6(context=colima)、node 24.14、python 3.13、uv 均已可用。
 
@@ -259,7 +260,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 |---|---|---|---|
 | **A0** | 新建 `bytehost-apps` crate(仅类型与纯逻辑;摘要计算在 `digest` feature 下):manifest 解析与校验(`deny_unknown_fields`、`min_host_version`)、摘要、权限/授权/`InstallPlan`/`ApprovedInstallPlan`、`AppState`(desired/observed)与对账纯函数、`AppEvent`、registry/storage 的文件读写;全部有单测;门禁 `cargo tree -p bytehost-apps` 不含 `dozer*` | 新 crate | 无 **已完成(A0,`bytehost-a0`):`6ebec5fe`**——manifest 用 TOML(用户 2026-10-04 裁决,`toml` 0.8,在 `manifest-toml` feature 下);默认 feature 为空、依赖仅 serde/serde_json;门禁 `scripts/check-bytehost-apps-deps.sh` |
 | **A1** | `server` feature:`AppManager`、`static_web` runtime、gateway(Host 校验、静态文件、固定端口);runtime adapter trait + 各 runtime 的 `probe`(docker/colima、node、uv 的分层探测) | 新 crate | A0、V1 |
-| **A2** | 接入 dozerd:`dozer-core::protocol` 加 `Request::App`/`Response::App`/事件,`dozerd/server.rs` 转给 `AppManager`;`dozer-client` 加 `app_*` 方法;dozerd 启动对账、优雅退出停应用、孤儿清理 | dozer-core、dozerd、dozer-client | A1 |
+| **A2** | 接入 dozerd:`dozer-core::protocol` 加 `Request::App`/`Response::App`/事件,`dozerd/server.rs` 转给 `AppManager`;`dozer-client` 加 `app_*` 方法;dozerd 启动对账、优雅退出停应用、孤儿清理 | dozer-core、dozerd、dozer-client | A1 | gateway 方案 | **已定(2026-10-04,用户):`<app-id>.localhost` + 单一固定端口 + Host 头路由 + 每应用 `data_store_identifier`;自定义协议不作应用 gateway**(§5.2) |
 | **A3** | rail 动态条目最小版(H7b-min):条目 id 能表达 `app:<id>`、布局序列化向后兼容、按应用 id 存独立 WebView 状态 | dozer-app | 无(可与 A0–A2 并行) |
 | **A4** | GUI:应用面板(wry,加载 `http://<app-id>.localhost:端口/`,每应用 `data_store_identifier`)、安装计划/审批的最小界面、不可用时的提示页(§6.3,由 host 提供)、Settings 里的运行时探测展示 | dozer-app | A2、A3 |
 | **A5** | Excalidraw 端到端验收(下面的验收 1–8) | 全部 | A4、V2 |
@@ -288,9 +289,10 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 | A3 | 一期切片是否需要 rail 动态条目最小版(H7b-min) | **需要**(A6 选 (a) 已定);作为本规格的前置小计划,要点:rail/布局的条目 id 能表达 `app:<id>`、按应用 id 存独立 WebView 状态、落盘兼容 |
 | A4 | 规格存放位置 | 暂放 dozer 的 `docs/superpowers/specs/`(与其他 bytehost 文档同处);`bytehost-apps` 建在 dozer 仓库的 `crates/` 下,将来随 bytehost 一起拆出时再迁移 |
 | A6 | 应用的"独立入口"是什么形态 | **已定(2026-10-04,用户):(a) rail 图标 → 该应用自己的面板**;(b) 独立窗口留作以后的可选能力 |
-| A7 | gateway 放在哪个进程 | 放进 dozerd(与应用同生命周期,origin 随 GUI 重启保持稳定);GUI 里的 wry 只是客户端。**待用户确认** |
+| A7 | gateway 放在哪个进程 | **已定(2026-10-04,用户):放进 dozerd**,与应用同生命周期;GUI 里的 wry 只是客户端 |
 | A8 | Digger 的 supervisor 怎么实现 | bytehost 只定义接口/协议;Digger 自带守护进程或进程内嵌入。**待 Digger 启动时裁决** |
-| A9 | Settings 里运行时安装的范围 | 可装 uv/Python、Node(固定版本+校验和,装到 bytehost 自己的目录);Docker/Colima 只探测与指引;下载必须显式确认。**待用户确认** |
+| A9 | Settings 里运行时安装的范围 | **已定(2026-10-04,用户):可装 uv/Python、Node(固定版本+校验和,装到 bytehost 自己的目录,显式确认);Docker/Colima 只探测与指引**;属二期,一期 Settings 只展示探测结果 |
+| A12 | gateway 固定端口策略 | **已定(2026-10-04,用户):首次启动从高端口段随机选一个并持久化;被占用显式报错,不静默换**(§5.2 第 6 条) |
 | A10 | 新 crate 的名字与位置 | **已定(2026-10-04,用户):`crates/bytehost-apps`**(无界面;与将来可能的 iced 侧 `bytehost` 区分) |
 | A11 | `server` feature 的 HTTP 栈 | **已确认(2026-10-04,用户):`hyper` 1.x + `hyper-util` + `http-body-util`,WebSocket 复用 `tokio-tungstenite`**(新增依赖只进 dozerd) |
 | A5 | UML 面板的形态 | Preview 的 `.puml` 类型,而非独立面板/应用 |
