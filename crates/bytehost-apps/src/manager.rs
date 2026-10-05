@@ -102,6 +102,9 @@ pub struct AppManager {
     /// `suspend_all` 之后置位、`reconcile` 清除:置位期间 `install`/`start` 在**拿到锁之后**被拒绝——
     /// 一个恰好排在锁后面的 `Start` 不能在撤站点之后又把站点注册回已停止的 gateway。
     closed: std::sync::atomic::AtomicBool,
+    /// (仅测试)`install` 里"拷贝与摘要计算已完成、即将拿锁"的次数,用来证明慢的部分在锁外。
+    #[cfg(test)]
+    prepared: std::sync::atomic::AtomicUsize,
 }
 
 /// 一个已读入并校验过的应用包。
@@ -191,6 +194,8 @@ impl AppManager {
             events,
             lock: Mutex::new(()),
             closed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            prepared: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -273,9 +278,14 @@ impl AppManager {
         // 等到它结束;拷完之后才拿锁做决定、核对、落位
         let result = copy_tree(dir, &staging)
             .map_err(ManagerError::from)
-            .and_then(|()| {
+            // 对整棵 staging 树读 manifest、算摘要同样是慢的(macOS 上拷贝是 clone,哈希才是大头):也在锁外做
+            .and_then(|()| read_package(&staging, &self.host_version))
+            .and_then(|package| {
+                #[cfg(test)]
+                self.prepared
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let _guard = self.guard();
-                self.install_staged(approved, &staging, now_ms)
+                self.install_staged(approved, &staging, package, now_ms)
             });
         // 成功时 staging 已经改名走了,这里是空操作;失败时清掉
         if staging.exists() {
@@ -288,12 +298,12 @@ impl AppManager {
         &self,
         approved: &ApprovedInstallPlan,
         staging: &Path,
+        package: Package,
         now_ms: u64,
     ) -> Result<(), ManagerError> {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ManagerError::ShuttingDown);
         }
-        let package = read_package(staging, &self.host_version)?;
         let id = package.manifest.id.clone();
         let version = package.manifest.version;
         let plan = self.plan_for(&package, approved.plan().provenance, approved.plan().trust)?;
@@ -1406,10 +1416,12 @@ source = "web/"
         rig.install(&b).unwrap();
     }
 
-    /// 慢的拷贝必须发生在拿 manager 锁**之前**:否则 `suspend_all`(dozerd 退出收尾)要一直等到一次大目录的拷贝结束。
-    /// 做法:测试线程先占住锁,另一个线程调 `install`——它应该已经把包拷进 staging、正卡在拿锁上。
+    /// 慢的部分——拷贝**和对整棵 staging 树算摘要**——必须发生在拿 manager 锁**之前**:否则 `suspend_all`
+    /// (dozerd 退出收尾)要一直等到一次大目录安装的哈希结束(macOS 上拷贝是 clone,哈希才是大头)。
+    /// 做法:测试线程先占住锁,另一个线程调 `install`——它应该已经拷完、算完摘要(`prepared` 计数加一),
+    /// 正卡在拿锁上。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_slow_copy_happens_before_the_manager_lock_is_taken() {
+    async fn the_slow_copy_and_hashing_happen_before_the_manager_lock_is_taken() {
         let rig = rig().await;
         let src = write_app(&rig.src_dir("a"), "alpha", "1.0.0", "", "A");
         let approved = rig.approve(&src);
@@ -1418,22 +1430,33 @@ source = "web/"
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| rig.manager.install(&approved, &src, 1));
             let started = std::time::Instant::now();
-            let mut copied = false;
+            let mut prepared = false;
             while started.elapsed() < std::time::Duration::from_secs(5) {
-                let staged = fs::read_dir(&apps_dir).unwrap().any(|e| {
-                    e.unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".staging-")
-                });
-                if staged {
-                    copied = true;
+                if rig
+                    .manager
+                    .prepared
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    >= 1
+                {
+                    prepared = true;
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            // 此刻锁还被测试线程占着:staging 里应该已经有完整的拷贝
+            let staged_manifest = fs::read_dir(&apps_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".staging-")
+                })
+                .map(|p| p.join("manifest.toml").is_file());
             drop(guard);
-            assert!(copied, "install 在锁被占着时也应该先完成拷贝");
+            assert!(prepared, "install 在锁被占着时也应该先完成拷贝与摘要计算");
+            assert_eq!(staged_manifest, Some(true));
             handle.join().unwrap().unwrap();
         });
         assert_eq!(rig.manager.list().unwrap().len(), 1);
