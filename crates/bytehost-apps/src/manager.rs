@@ -78,6 +78,23 @@ impl std::fmt::Display for ManagerError {
     }
 }
 
+impl ManagerError {
+    /// 线上失败类别(GUI 据此呈现,见 [`AppErrorKind`])。
+    pub fn kind(&self) -> crate::proto::AppErrorKind {
+        use crate::proto::AppErrorKind as K;
+        match self {
+            Self::Io(_) => K::Internal,
+            Self::Manifest(_) | Self::Verify(_) | Self::BadSource(_) | Self::MissingSource(_) => {
+                K::Rejected
+            }
+            Self::UnsupportedRuntime(_) => K::Unsupported,
+            Self::AlreadyInstalled(_) | Self::Busy(_) | Self::BadState { .. } => K::Conflict,
+            Self::NotInstalled(_) => K::NotFound,
+            Self::ShuttingDown => K::Unavailable,
+        }
+    }
+}
+
 impl std::error::Error for ManagerError {}
 
 impl From<io::Error> for ManagerError {
@@ -629,6 +646,38 @@ impl ReconcileReport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manager_errors_map_to_stable_wire_kinds() {
+        use crate::proto::AppErrorKind as K;
+        let id = || AppId::new("a").unwrap();
+        let cases = [
+            (ManagerError::BadSource("x".into()), K::Rejected),
+            (ManagerError::MissingSource("/x".into()), K::Rejected),
+            (
+                ManagerError::UnsupportedRuntime("python".into()),
+                K::Unsupported,
+            ),
+            (
+                ManagerError::AlreadyInstalled(Version::new(1, 0, 0)),
+                K::Conflict,
+            ),
+            (ManagerError::Busy(id()), K::Conflict),
+            (
+                ManagerError::BadState {
+                    app: id(),
+                    state: ObservedState::Stopped,
+                },
+                K::Conflict,
+            ),
+            (ManagerError::NotInstalled(id()), K::NotFound),
+            (ManagerError::ShuttingDown, K::Unavailable),
+            (ManagerError::Io(io::Error::other("x")), K::Internal),
+        ];
+        for (error, kind) in cases {
+            assert_eq!(error.kind(), kind, "{error}");
+        }
+    }
+
     use super::*;
     use crate::gateway::GatewayConfig;
     use crate::permissions::{Access, Enforcement, PermissionKey};

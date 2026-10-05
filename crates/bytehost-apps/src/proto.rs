@@ -53,6 +53,49 @@ pub struct RuntimeProbe {
     pub availability: RuntimeAvailability,
 }
 
+/// 失败的类别——GUI 据此决定怎么呈现(不可用走提示页,被拒绝走审批界面,冲突/不存在走 Toast……),
+/// 不靠解析人类可读的 `message`。**新增类别只能往后加**(线上协议)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppErrorKind {
+    /// 应用宿主本身不可用(gateway 端口被占、应用目录打不开、dozerd 正在停止)。
+    Unavailable,
+    /// 请求内容被拒绝:清单/摘要/批准不符、来源不合法、包里缺东西。
+    Rejected,
+    /// 应用没有安装。
+    NotFound,
+    /// 与当前状态冲突:版本已装、应用在运行、状态不允许该操作。
+    Conflict,
+    /// 一期不支持的应用类型。
+    Unsupported,
+    /// 其他(I/O、后台任务崩溃)。
+    Internal,
+}
+
+/// 一次失败:类别 + 给人看的原因。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppFailure {
+    pub kind: AppErrorKind,
+    pub message: String,
+}
+
+impl AppFailure {
+    pub fn new(kind: AppErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AppFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AppFailure {}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum AppRequest {
@@ -107,6 +150,11 @@ pub enum AppReply {
     },
     Runtimes {
         runtimes: Vec<RuntimeProbe>,
+    },
+    /// 请求失败(带类别)。
+    Failed {
+        #[serde(flatten)]
+        failure: AppFailure,
     },
 }
 
@@ -167,6 +215,33 @@ mod tests {
         assert_eq!(
             round_trip(&req),
             json!({"op": "plan", "source": {"kind": "local_dir", "path": "/tmp/app"}, "provenance": "agent_generated", "trust": "untrusted"})
+        );
+    }
+
+    #[test]
+    fn failures_carry_a_stable_kind_tag_next_to_the_message() {
+        let reply = AppReply::Failed {
+            failure: AppFailure::new(AppErrorKind::Unavailable, "端口被占用"),
+        };
+        assert_eq!(
+            round_trip(&reply),
+            json!({"reply": "failed", "kind": "unavailable", "message": "端口被占用"})
+        );
+        for (kind, tag) in [
+            (AppErrorKind::Rejected, "rejected"),
+            (AppErrorKind::NotFound, "not_found"),
+            (AppErrorKind::Conflict, "conflict"),
+            (AppErrorKind::Unsupported, "unsupported"),
+            (AppErrorKind::Internal, "internal"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(tag));
+        }
+        assert!(
+            serde_json::from_value::<AppReply>(
+                json!({"reply": "failed", "kind": "exploded", "message": "x"})
+            )
+            .is_err(),
+            "未知类别被拒绝"
         );
     }
 
