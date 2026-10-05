@@ -220,7 +220,12 @@ fn parse_record(text: &str, dir_name: &str) -> Result<AppRecord, String> {
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
+    {
+        let mut file = fs::File::create(&tmp)?;
+        io::Write::write_all(&mut file, bytes)?;
+        // 先落盘再改名:断电后不会留下"改名成功但内容是空的"的 state.json
+        file.sync_all()?;
+    }
     fs::rename(&tmp, path)
 }
 

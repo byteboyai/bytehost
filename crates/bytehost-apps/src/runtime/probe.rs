@@ -134,24 +134,22 @@ fn first_line(s: &str) -> String {
         .to_string()
 }
 
-fn unavailable(
-    program: &str,
-    err: CommandError,
-    out: Option<CommandOutput>,
-) -> RuntimeAvailability {
-    let detail = match (err, out) {
-        (CommandError::Timeout, _) => format!("{program} 执行超时"),
-        (CommandError::Failed(e), _) => e,
-        (CommandError::NotFound, _) => unreachable!("NotFound 在调用处单独处理"),
-    };
-    RuntimeAvailability::Unavailable { detail }
+/// 命令没跑成时的可用性:找不到可执行文件是"没装",超时/其他失败是"装了但当前用不了"。
+fn unavailable(program: &str, err: &CommandError) -> RuntimeAvailability {
+    match err {
+        CommandError::NotFound => RuntimeAvailability::NotInstalled,
+        CommandError::Timeout => RuntimeAvailability::Unavailable {
+            detail: format!("{program} 执行超时"),
+        },
+        CommandError::Failed(e) => RuntimeAvailability::Unavailable { detail: e.clone() },
+    }
 }
 
 /// Docker:先看 `docker` 命令在不在,再用 `docker info` 看守护进程连得上连不上(Colima 没启动时命令在、守护进程不可用)。
 pub fn probe_docker(runner: &dyn CommandRunner) -> RuntimeAvailability {
     match runner.run("docker", &["--version"]) {
         Err(CommandError::NotFound) => return RuntimeAvailability::NotInstalled,
-        Err(e) => return unavailable("docker", e, None),
+        Err(e) => return unavailable("docker", &e),
         Ok(out) if !out.success => {
             return RuntimeAvailability::Unavailable {
                 detail: first_line(&out.stderr),
@@ -174,7 +172,7 @@ pub fn probe_docker(runner: &dyn CommandRunner) -> RuntimeAvailability {
             }
         }
         Err(CommandError::NotFound) => RuntimeAvailability::NotInstalled,
-        Err(e) => unavailable("docker", e, None),
+        Err(e) => unavailable("docker", &e),
     }
 }
 
@@ -182,7 +180,7 @@ pub fn probe_docker(runner: &dyn CommandRunner) -> RuntimeAvailability {
 pub fn probe_node(runner: &dyn CommandRunner) -> RuntimeAvailability {
     match runner.run("node", &["--version"]) {
         Err(CommandError::NotFound) => RuntimeAvailability::NotInstalled,
-        Err(e) => unavailable("node", e, None),
+        Err(e) => unavailable("node", &e),
         Ok(out) if out.success => RuntimeAvailability::Available {
             detail: format!("node {}", first_line(&out.stdout)),
         },
@@ -201,11 +199,11 @@ pub fn probe_python(runner: &dyn CommandRunner) -> RuntimeAvailability {
             };
         }
         Ok(_) | Err(CommandError::NotFound) => {}
-        Err(e) => return unavailable("uv", e, None),
+        Err(e) => return unavailable("uv", &e),
     }
     match runner.run("python3", &["--version"]) {
         Err(CommandError::NotFound) => RuntimeAvailability::NotInstalled,
-        Err(e) => unavailable("python3", e, None),
+        Err(e) => unavailable("python3", &e),
         // 老版本 python 把版本号打到 stderr
         Ok(out) if out.success => {
             let line = if out.stdout.trim().is_empty() {

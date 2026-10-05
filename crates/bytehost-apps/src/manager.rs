@@ -52,6 +52,8 @@ pub enum ManagerError {
     MissingSource(PathBuf),
     /// supervisor 正在/已经停止(`suspend_all` 之后到下一次 `reconcile` 之前):不再接受会产生新站点或新包的操作。
     ShuttingDown,
+    /// 应用来源不合法(如 `LocalDir` 的路径不是绝对路径)。
+    BadSource(String),
 }
 
 impl std::fmt::Display for ManagerError {
@@ -69,6 +71,7 @@ impl std::fmt::Display for ManagerError {
             Self::BadState { app, state } => {
                 write!(f, "应用 {app} 当前状态 {state:?} 不允许这个操作")
             }
+            Self::BadSource(why) => write!(f, "应用来源不合法: {why}"),
             Self::ShuttingDown => write!(f, "dozerd 正在停止,暂不接受安装/启动"),
             Self::MissingSource(p) => write!(f, "应用包里缺少站点目录: {}", p.display()),
         }
@@ -127,6 +130,30 @@ fn static_source(manifest: &Manifest) -> Result<&str, ManagerError> {
     }
 }
 
+/// 清掉崩溃时留下的 `.staging-*` 目录。manager 启动时调用:单写者,此刻没有别的安装在进行。
+fn sweep_staging(apps_dir: &Path) {
+    let Ok(entries) = fs::read_dir(apps_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(".staging-") {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// `LocalDir` 必须是绝对路径:相对路径会按 dozerd 的工作目录解析,调用方并不知道那是哪里。
+fn ensure_absolute(path: &Path) -> Result<(), ManagerError> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(ManagerError::BadSource(format!(
+            "路径必须是绝对路径,收到 {}",
+            path.display()
+        )))
+    }
+}
+
 /// 递归拷贝目录。只拷普通文件和目录:符号链接/FIFO/设备一律拒绝(与 `digest_tree` 同口径)。
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
@@ -155,14 +182,24 @@ impl AppManager {
         gateway: Arc<Gateway>,
     ) -> io::Result<Self> {
         let (events, _) = broadcast::channel(256);
+        let registry = Registry::open(root)?;
+        sweep_staging(&registry.paths().apps_dir());
         Ok(Self {
-            registry: Registry::open(root)?,
+            registry,
             gateway,
             host_version,
             events,
             lock: Mutex::new(()),
             closed: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// 单写者锁。持锁线程 panic 会毒化它,但它保护的是 `()`(锁住的是"同一时刻只有一个改状态的操作",
+    /// 没有需要保持的数据不变量),所以取回内部数据继续用,不能让此后每个加锁的调用都跟着 panic。
+    fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn events(&self) -> broadcast::Receiver<AppEvent> {
@@ -186,6 +223,7 @@ impl AppManager {
         trust: TrustLevel,
     ) -> Result<InstallPlan, ManagerError> {
         let AppSource::LocalDir { path: dir } = source;
+        ensure_absolute(dir)?;
         let package = read_package(dir, &self.host_version)?;
         self.plan_for(&package, provenance, trust)
     }
@@ -221,14 +259,24 @@ impl AppManager {
         source: &AppSource,
         now_ms: u64,
     ) -> Result<(), ManagerError> {
-        let _guard = self.lock.lock().expect("manager 锁");
         let AppSource::LocalDir { path: dir } = source;
+        ensure_absolute(dir)?;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ManagerError::ShuttingDown);
+        }
         let staging = self
             .registry
             .paths()
             .apps_dir()
             .join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
-        let result = self.install_staged(approved, dir, &staging, now_ms);
+        // 拷贝是慢的(可能是带 node_modules 的大目录):**不持锁**做,否则 `suspend_all`(dozerd 退出收尾)要一直
+        // 等到它结束;拷完之后才拿锁做决定、核对、落位
+        let result = copy_tree(dir, &staging)
+            .map_err(ManagerError::from)
+            .and_then(|()| {
+                let _guard = self.guard();
+                self.install_staged(approved, &staging, now_ms)
+            });
         // 成功时 staging 已经改名走了,这里是空操作;失败时清掉
         if staging.exists() {
             let _ = fs::remove_dir_all(&staging);
@@ -239,14 +287,12 @@ impl AppManager {
     fn install_staged(
         &self,
         approved: &ApprovedInstallPlan,
-        dir: &Path,
         staging: &Path,
         now_ms: u64,
     ) -> Result<(), ManagerError> {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ManagerError::ShuttingDown);
         }
-        copy_tree(dir, staging)?;
         let package = read_package(staging, &self.host_version)?;
         let id = package.manifest.id.clone();
         let version = package.manifest.version;
@@ -338,7 +384,7 @@ impl AppManager {
 
     /// 启动:把应用的静态站点注册进 gateway。返回不含令牌的站点地址。
     pub fn start(&self, id: &AppId) -> Result<String, ManagerError> {
-        let _guard = self.lock.lock().expect("manager 锁");
+        let _guard = self.guard();
         self.start_locked(id)
     }
 
@@ -397,7 +443,7 @@ impl AppManager {
 
     /// 停止(也用来把 `Failed` 复位成 `Stopped`)。对已经停止的应用是空操作。
     pub fn stop(&self, id: &AppId) -> Result<(), ManagerError> {
-        let _guard = self.lock.lock().expect("manager 锁");
+        let _guard = self.guard();
         self.stop_locked(id)
     }
 
@@ -422,7 +468,7 @@ impl AppManager {
 
     /// 卸载(不存在不算错误)。运行中先停。
     pub fn uninstall(&self, id: &AppId, mode: UninstallMode) -> Result<(), ManagerError> {
-        let _guard = self.lock.lock().expect("manager 锁");
+        let _guard = self.guard();
         if self.registry.load(id)?.is_none() {
             self.registry.uninstall(id, mode)?;
             return Ok(());
@@ -434,6 +480,20 @@ impl AppManager {
             state: ObservedState::NotInstalled,
         });
         Ok(())
+    }
+
+    /// 带令牌的启动地址,**只给正在运行的应用**(没运行的应用打开只会是 404)。在锁内判断并构造,
+    /// 不会出现"刚判断完它在运行、构造地址前它被停掉"的空档。**秘密:不要写日志、不要广播。**
+    pub fn launch_url_if_running(&self, id: &AppId) -> Result<String, ManagerError> {
+        let _guard = self.guard();
+        let record = self.load_record(id)?;
+        match record.observed {
+            ObservedState::Running => Ok(self.gateway.launch_url(id)),
+            other => Err(ManagerError::BadState {
+                app: id.clone(),
+                state: other,
+            }),
+        }
     }
 
     pub fn list(&self) -> Result<Vec<AppSummary>, ManagerError> {
@@ -467,45 +527,63 @@ impl AppManager {
     }
 
     /// supervisor 退出前调用:撤下所有站点,把运行中的应用的观察态落成 `Stopped`,但**保留 `desired`**——
-    /// 下次启动时 `reconcile` 会按 `desired = Running` 把它们重新拉起("应用跟随 dozerd")。返回出错的应用。
-    pub fn suspend_all(&self) -> Vec<(AppId, ManagerError)> {
-        let _guard = self.lock.lock().expect("manager 锁");
+    /// 下次启动时 `reconcile` 会按 `desired = Running` 把它们重新拉起("应用跟随 dozerd")。
+    pub fn suspend_all(&self) -> ReconcileReport {
+        let _guard = self.guard();
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
-        let mut failures = Vec::new();
+        let mut report = ReconcileReport::default();
         let listing = match self.registry.list() {
             Ok(l) => l,
-            Err(e) => return vec![(AppId::new("unknown").expect("合法"), ManagerError::Io(e))],
+            Err(e) => {
+                report
+                    .problems
+                    .push(("(应用目录)".to_string(), e.to_string()));
+                return report;
+            }
         };
+        report.problems.extend(listing.problems);
         for mut record in listing.apps {
-            self.gateway.remove_site(&record.id);
+            let was_serving = self.gateway.remove_site(&record.id);
             if matches!(record.observed, ObservedState::Running)
                 && let Err(e) = self.set_observed(&mut record, ObservedState::Stopped)
             {
-                failures.push((record.id.clone(), e));
+                report.failures.push((record.id.clone(), e));
+            }
+            if was_serving {
+                self.emit(AppEvent::EndpointChanged {
+                    app: record.id.clone(),
+                    url: None,
+                });
             }
         }
-        failures
+        report
     }
 
     /// supervisor 启动时调用:把持久化的观察态修正为现实(应用随 supervisor 一起停了),再按 `desired` 对账。
-    /// 返回失败的应用与原因,一个应用失败不影响其他应用。
-    pub fn reconcile(&self) -> Vec<(AppId, ManagerError)> {
-        let _guard = self.lock.lock().expect("manager 锁");
+    /// 一个应用失败不影响其他应用;读不出来的记录(损坏的 `state.json`)单独报告,不会被悄悄忽略。
+    pub fn reconcile(&self) -> ReconcileReport {
+        let _guard = self.guard();
         // reconcile 代表 supervisor(重新)开始工作
         self.closed
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let mut failures = Vec::new();
+        let mut report = ReconcileReport::default();
         let listing = match self.registry.list() {
             Ok(l) => l,
-            Err(e) => return vec![(AppId::new("unknown").expect("合法"), ManagerError::Io(e))],
+            Err(e) => {
+                report
+                    .problems
+                    .push(("(应用目录)".to_string(), e.to_string()));
+                return report;
+            }
         };
+        report.problems.extend(listing.problems);
         for mut record in listing.apps {
             let id = record.id.clone();
             let recovered = recover_after_supervisor_restart(record.observed.clone());
             if recovered != record.observed
                 && let Err(e) = self.set_observed(&mut record, recovered)
             {
-                failures.push((id, e));
+                report.failures.push((id, e));
                 continue;
             }
             let result = match next_action(record.desired, &record.observed) {
@@ -519,10 +597,23 @@ impl AppManager {
                 None => Ok(()),
             };
             if let Err(e) = result {
-                failures.push((id, e));
+                report.failures.push((id, e));
             }
         }
-        failures
+        report
+    }
+}
+
+/// `reconcile`/`suspend_all` 的结果:单个应用的失败,以及读不出来的记录(目录名, 原因)。
+#[derive(Debug, Default)]
+pub struct ReconcileReport {
+    pub failures: Vec<(AppId, ManagerError)>,
+    pub problems: Vec<(String, String)>,
+}
+
+impl ReconcileReport {
+    pub fn is_clean(&self) -> bool {
+        self.failures.is_empty() && self.problems.is_empty()
     }
 }
 
@@ -1047,7 +1138,7 @@ source = "web/"
         );
         assert!(!gw2.has_site(&run), "但新的 gateway 里没有站点");
 
-        assert!(m2.reconcile().is_empty());
+        assert!(m2.reconcile().is_clean());
         assert!(gw2.has_site(&run), "desired=Running 的应用被重新启动");
         assert!(!gw2.has_site(&idle), "desired=Stopped 的保持停止");
         let after = m2.list().unwrap();
@@ -1081,7 +1172,7 @@ source = "web/"
             .package_dir(&bad, &Version::new(1, 0, 0));
         fs::remove_dir_all(pkg.join("web")).unwrap();
 
-        let failures = rig.manager.reconcile();
+        let failures = rig.manager.reconcile().failures;
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].0, bad);
         assert!(matches!(failures[0].1, ManagerError::MissingSource(_)));
@@ -1259,7 +1350,7 @@ source = "web/"
         rig.manager.start(&b).unwrap();
         rig.manager.stop(&b).unwrap(); // beta:用户想要停止
 
-        assert!(rig.manager.suspend_all().is_empty());
+        assert!(rig.manager.suspend_all().is_clean());
         assert!(!rig.gateway.has_site(&a), "站点已撤下");
         let after = rig.manager.list().unwrap();
         let alpha = after.iter().find(|x| x.id == a).unwrap();
@@ -1273,7 +1364,7 @@ source = "web/"
             (DesiredState::Stopped, ObservedState::Stopped)
         );
 
-        assert!(rig.manager.reconcile().is_empty());
+        assert!(rig.manager.reconcile().is_clean());
         assert!(rig.gateway.has_site(&a), "desired=Running 的被重新拉起");
         assert!(!rig.gateway.has_site(&b));
     }
@@ -1287,7 +1378,7 @@ source = "web/"
         rig.install(&write_app(&rig.src_dir("a"), "alpha", "1.0.0", "", "A"))
             .unwrap();
         rig.manager.start(&a).unwrap();
-        assert!(rig.manager.suspend_all().is_empty());
+        assert!(rig.manager.suspend_all().is_clean());
 
         assert!(matches!(
             rig.manager.start(&a),
@@ -1308,10 +1399,172 @@ source = "web/"
         rig.manager.stop(&a).unwrap();
 
         assert!(
-            rig.manager.reconcile().is_empty(),
+            rig.manager.reconcile().is_clean(),
             "reconcile 代表 supervisor 重新开始工作"
         );
         rig.manager.start(&a).unwrap();
         rig.install(&b).unwrap();
+    }
+
+    /// 慢的拷贝必须发生在拿 manager 锁**之前**:否则 `suspend_all`(dozerd 退出收尾)要一直等到一次大目录的拷贝结束。
+    /// 做法:测试线程先占住锁,另一个线程调 `install`——它应该已经把包拷进 staging、正卡在拿锁上。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_slow_copy_happens_before_the_manager_lock_is_taken() {
+        let rig = rig().await;
+        let src = write_app(&rig.src_dir("a"), "alpha", "1.0.0", "", "A");
+        let approved = rig.approve(&src);
+        let apps_dir = rig.manager.registry.paths().apps_dir();
+        let guard = rig.manager.lock.lock().unwrap();
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| rig.manager.install(&approved, &src, 1));
+            let started = std::time::Instant::now();
+            let mut copied = false;
+            while started.elapsed() < std::time::Duration::from_secs(5) {
+                let staged = fs::read_dir(&apps_dir).unwrap().any(|e| {
+                    e.unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".staging-")
+                });
+                if staged {
+                    copied = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            drop(guard);
+            assert!(copied, "install 在锁被占着时也应该先完成拷贝");
+            handle.join().unwrap().unwrap();
+        });
+        assert_eq!(rig.manager.list().unwrap().len(), 1);
+        assert_no_leftovers(&rig);
+    }
+
+    /// `LocalDir.path` 必须是绝对路径:相对路径会按 dozerd 的工作目录解析,调用方并不知道那是哪里。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relative_source_paths_are_refused_before_anything_is_read() {
+        let rig = rig().await;
+        let real = write_app(&rig.src_dir("a"), "alpha", "1.0.0", "", "A");
+        let approved = rig.approve(&real);
+        let relative = AppSource::LocalDir {
+            path: PathBuf::from("relative/dir"),
+        };
+        assert!(matches!(
+            rig.manager
+                .install_plan(&relative, Provenance::Local, TrustLevel::Trusted),
+            Err(ManagerError::BadSource(_))
+        ));
+        assert!(matches!(
+            rig.manager.install(&approved, &relative, 1),
+            Err(ManagerError::BadSource(_))
+        ));
+        assert_no_leftovers(&rig);
+    }
+
+    /// 崩溃时留下的 `.staging-*` 目录在 manager 启动时清掉(单写者:此刻没有别的安装在进行)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leftover_staging_directories_are_swept_when_the_manager_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bytehost");
+        let apps = root.join("apps");
+        write_files(&apps.join(".staging-dead"), &[("junk.txt", "x")]);
+        write_files(&apps.join("keepme"), &[("data/file.txt", "user data")]);
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let _manager = AppManager::new(&root, HOST, gateway).unwrap();
+        assert!(!apps.join(".staging-dead").exists());
+        assert!(
+            apps.join("keepme/data/file.txt").exists(),
+            "别的目录不受影响"
+        );
+    }
+
+    /// 损坏的 `state.json` 不能被 `reconcile` 悄悄忽略,也不能拖住别的应用;读不出来的记录单独报告。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_reports_corrupt_records_and_still_restores_the_others() {
+        let rig = rig().await;
+        let good = id("good");
+        rig.install(&write_app(&rig.src_dir("good"), "good", "1.0.0", "", "ok"))
+            .unwrap();
+        rig.manager.start(&good).unwrap();
+        rig.gateway.remove_site(&good); // 模拟 supervisor 重启
+        let broken = rig.manager.registry.paths().apps_dir().join("broken");
+        write_files(&broken, &[("state.json", "{not json")]);
+
+        let report = rig.manager.reconcile();
+        assert!(report.failures.is_empty());
+        assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+        assert_eq!(report.problems[0].0, "broken");
+        assert!(!report.is_clean());
+        assert!(rig.gateway.has_site(&good), "好应用照常恢复");
+    }
+
+    /// 持锁线程 panic 会毒化 manager 的锁;之后每个加锁的调用都不能跟着 panic。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_poisoned_manager_lock_does_not_make_every_later_call_panic() {
+        let rig = rig().await;
+        let a = id("alpha");
+        rig.install(&write_app(&rig.src_dir("a"), "alpha", "1.0.0", "", "A"))
+            .unwrap();
+        let _ = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _g = rig.manager.lock.lock().unwrap();
+                    panic!("故意毒化");
+                })
+                .join()
+        });
+        assert!(rig.manager.lock.is_poisoned());
+        rig.manager.start(&a).unwrap();
+        rig.manager.stop(&a).unwrap();
+        assert!(rig.manager.reconcile().is_clean());
+    }
+
+    /// 带令牌的启动地址:在锁内判断"是否在运行"并构造,只给运行中的应用。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_launch_url_is_only_given_for_a_running_app() {
+        let rig = rig().await;
+        let a = id("alpha");
+        rig.install(&write_app(&rig.src_dir("a"), "alpha", "1.0.0", "", "A"))
+            .unwrap();
+        assert!(matches!(
+            rig.manager.launch_url_if_running(&a),
+            Err(ManagerError::BadState { .. })
+        ));
+        assert!(matches!(
+            rig.manager.launch_url_if_running(&id("ghost")),
+            Err(ManagerError::NotInstalled(_))
+        ));
+        rig.manager.start(&a).unwrap();
+        let url = rig.manager.launch_url_if_running(&a).unwrap();
+        assert!(
+            url.starts_with("http://alpha.localhost:") && url.contains("bh_token="),
+            "{url}"
+        );
+        rig.manager.stop(&a).unwrap();
+        assert!(rig.manager.launch_url_if_running(&a).is_err());
+    }
+
+    /// `suspend_all` 撤站点时也要发 `EndpointChanged { url: None }`(与 `stop` 一致),订阅方才知道地址没了。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspending_announces_that_the_endpoints_are_gone() {
+        let rig = rig().await;
+        let a = id("alpha");
+        rig.install(&write_app(&rig.src_dir("a"), "alpha", "1.0.0", "", "A"))
+            .unwrap();
+        rig.manager.start(&a).unwrap();
+        let mut rx = rig.manager.events();
+        assert!(rig.manager.suspend_all().is_clean());
+        let events = drain(&mut rx);
+        assert!(
+            events.contains(&AppEvent::EndpointChanged {
+                app: a.clone(),
+                url: None
+            }),
+            "{events:?}"
+        );
+        assert!(events.contains(&AppEvent::StateChanged {
+            app: a,
+            state: ObservedState::Stopped
+        }));
     }
 }

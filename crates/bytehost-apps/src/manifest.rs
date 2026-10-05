@@ -182,9 +182,22 @@ impl Manifest {
             ));
         }
         for (name, ep) in &self.entrypoints {
+            if name.is_empty()
+                || name.len() > 32
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+            {
+                problems.push(format!(
+                    "entrypoints 的键 {name:?} 只能是 1–32 个 [a-z0-9_-]"
+                ));
+            }
             check_url_path(&format!("entrypoints.{name}.path"), &ep.path, &mut problems);
             if let Some(title) = &ep.title {
                 check_display(&format!("entrypoints.{name}.title"), title, &mut problems);
+                if title.chars().count() > 64 {
+                    problems.push(format!("entrypoints.{name}.title 最长 64 个字符"));
+                }
             }
         }
         if let Some(icon) = &self.presentation.icon {
@@ -256,14 +269,19 @@ impl Manifest {
 
 /// 相对路径:非空、不以 `/` 开头、不含 `..` 段、不含反斜杠或 NUL。
 fn check_relative(field: &str, path: &str, problems: &mut Vec<String>) {
+    // 允许且只允许**最后**一个空段(目录写法 `web/`);`.`、`..`、中间的空段(`a//b`)都不行
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
     let bad = path.is_empty()
         || path.starts_with('/')
         || path.contains('\\')
         || path.contains('\0')
-        || path.split('/').any(|seg| seg == "..");
+        || trimmed.is_empty()
+        || trimmed
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..");
     if bad {
         problems.push(format!(
-            "{field} 必须是应用包内的相对路径(不能为空、不能绝对、不能含 ..),收到 {path:?}"
+            "{field} 必须是应用包内的相对路径(不能为空、不能绝对、不能含 `.`/`..`/空段),收到 {path:?}"
         ));
     }
 }
@@ -713,5 +731,41 @@ source = "web/"
             };
             assert_eq!(problems(&m).len(), 1, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn relative_paths_reject_dot_and_empty_segments_but_allow_one_trailing_slash() {
+        for bad in [".", "./web", "a/./b", "a//b", "web//", "//"] {
+            let mut m = valid();
+            m.runtime = Runtime::StaticWeb { source: bad.into() };
+            assert_eq!(problems(&m).len(), 1, "{bad:?}");
+        }
+        for ok in ["web", "web/", "a/b/c.txt", "a/b..c", ".hidden/x"] {
+            let mut m = valid();
+            m.runtime = Runtime::StaticWeb { source: ok.into() };
+            assert_eq!(m.validate(&HOST), Ok(()), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn entrypoint_keys_and_titles_are_validated() {
+        for bad in ["", "Main", "a b", "a/b", &"k".repeat(33)] {
+            let mut m = valid();
+            m.entrypoints.insert(
+                bad.to_string(),
+                Entrypoint {
+                    kind: EntrypointKind::Web,
+                    path: "/x".into(),
+                    title: None,
+                },
+            );
+            assert_eq!(problems(&m).len(), 1, "key {bad:?}");
+        }
+        let mut m = valid();
+        m.entrypoints.get_mut("main").unwrap().title = Some("t".repeat(65));
+        assert_eq!(problems(&m).len(), 1, "标题最长 64 个字符");
+        let mut m = valid();
+        m.entrypoints.get_mut("main").unwrap().title = Some("t".repeat(64));
+        assert_eq!(m.validate(&HOST), Ok(()));
     }
 }

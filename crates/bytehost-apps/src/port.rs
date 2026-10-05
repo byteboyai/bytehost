@@ -55,7 +55,11 @@ pub fn load_or_choose_port(root: &Path) -> io::Result<u16> {
             let json = serde_json::to_string_pretty(&GatewaySettings { port })
                 .map_err(io::Error::other)?;
             let tmp = path.with_extension("tmp");
-            fs::write(&tmp, json)?;
+            {
+                let mut file = fs::File::create(&tmp)?;
+                io::Write::write_all(&mut file, json.as_bytes())?;
+                file.sync_all()?; // 先落盘再改名,避免断电后留下空文件(空文件会变成永久的 InvalidData)
+            }
             fs::rename(&tmp, &path)?;
             Ok(port)
         }

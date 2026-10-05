@@ -248,6 +248,11 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 - **不得静默降级。** 未知来源应用在没有容器时不会悄悄变成裸跑进程;"以普通进程运行"必须是用户在提示页上的显式选择,并写入授权记录。
 - **提示页由 host 提供,不由应用 origin 提供。** 否则它与应用共享 origin/存储,会被应用(或应用的残留状态)伪造;应放在 host 自己的页面承载上(与现有 `preview_fallback_page` 同一思路),动作经 host 的消息回到 `AppService`。
 
+### 6.4 信任模型的两点说明(A2/A1 评审留下的,写下来而不是留作暗知识)
+
+- **UDS 上的请求等于"同一用户"。** dozerd 的 socket 只有同一用户的进程能连——包括在 Dozer 的 PTY 里运行的 Agent。所以任何同用户进程都可以用 `Request::App` 自己出计划、自己批准(`Approval.approver` 与 `trust` 都是客户端自己填的)、自己安装并启动应用。这与 `CreateSession` 已经能运行任意命令是同一个信任级别,**没有引入新的权限**;但"甲方批准"(用户在界面上确认)只是**产品层的约定**,不是 dozerd 强制的——需要强制时,要由 supervisor 保存计划并只接受它自己签发的批准(留给有进程型 runtime 的切片)。
+- **`LocalDir` 安装会把整个源目录永久拷进应用目录**(含 `.env` 之类的敏感文件),即使 gateway 只提供 `runtime.source` 指向的子目录。`path` 必须是绝对路径(相对路径会按 dozerd 的工作目录解析)。崩溃时遗留的 `.staging-*` 在 manager 下次启动时清扫。
+
 ## 7. 一期范围与验收
 
 **一期目标:** 在 Dozer 里装一个静态 Web 应用(Excalidraw),它在 rail 上有自己的图标和面板,由 dozerd 里的 gateway 提供,GUI 退出重开后数据还在。Python/Node/容器只定义 adapter trait 与 `probe`,不实现。
@@ -260,7 +265,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 |---|---|---|---|
 | **A0** | 新建 `bytehost-apps` crate(仅类型与纯逻辑;摘要计算在 `digest` feature 下):manifest 解析与校验(`deny_unknown_fields`、`min_host_version`)、摘要、权限/授权/`InstallPlan`/`ApprovedInstallPlan`、`AppState`(desired/observed)与对账纯函数、`AppEvent`、registry/storage 的文件读写;全部有单测;门禁 `cargo tree -p bytehost-apps` 不含 `dozer*` | 新 crate | 无 **已完成(A0,`bytehost-a0`):`6ebec5fe`**——manifest 用 TOML(用户 2026-10-04 裁决,`toml` 0.8,在 `manifest-toml` feature 下);默认 feature 为空、依赖仅 serde/serde_json;门禁 `scripts/check-bytehost-apps-deps.sh` |
 | **A1** | `server` feature:`AppManager`、`static_web` runtime、gateway(Host 校验、静态文件、固定端口);runtime adapter trait + 各 runtime 的 `probe`(docker/colima、node、uv 的分层探测) | 新 crate | A0、V1 **已完成(A1,`bytehost-a1`):`283ff056`**——`server` feature:`AppManager`、`static_web`、gateway(Host 校验 + 会话令牌 + 路径解析 + CSP)、端口持久化、docker/node/python 分层探测;V1 已实测通过 |
-| **A2** | 接入 dozerd:`dozer-core::protocol` 加 `Request::App`/`Response::App`/事件,`dozerd/server.rs` 转给 `AppManager`;`dozer-client` 加 `app_*` 方法;dozerd 启动对账、优雅退出停应用、孤儿清理 | dozer-core、dozerd、dozer-client | A1 **已完成(A2,`bytehost-a2`):`0fcc66b6`**——线上类型在 `bytehost-apps::proto`;`dozer-core::protocol` 加 `Request::App`/`Reply::App`;dozerd 的 `AppService`(启动永不失败、启动对账、`Shutdown` 时收尾且保留 `desired`);`dozer-client` 的 `app_*` 方法;依赖门禁新增 `dozer-hook` 闭包检查。**推送事件**(GUI 订阅状态变化)本切片没做,A4 之前 GUI 靠轮询 `List`;启动时的"首次绑定成功后才持久化端口"也留给 A4 前的小修 |
+| **A2** | 接入 dozerd:`dozer-core::protocol` 加 `Request::App`/`Reply::App`/事件,`dozerd/server.rs` 转给 `AppManager`;`dozer-client` 加 `app_*` 方法;dozerd 启动对账、优雅退出停应用、孤儿清理 | dozer-core、dozerd、dozer-client | A1 **已完成(A2,`bytehost-a2`):`0fcc66b6`**——线上类型在 `bytehost-apps::proto`;`dozer-core::protocol` 加 `Request::App`/`Reply::App`;dozerd 的 `AppService`(启动永不失败、启动对账、`Shutdown` 时收尾且保留 `desired`);`dozer-client` 的 `app_*` 方法;依赖门禁新增 `dozer-hook` 闭包检查。**推送事件**(GUI 订阅状态变化)本切片没做,A4 之前 GUI 靠轮询 `List`;启动时的"首次绑定成功后才持久化端口"也留给 A4 前的小修 |
 | **A3** | rail 动态条目最小版(H7b-min):条目 id 能表达 `app:<id>`、布局序列化向后兼容、按应用 id 存独立 WebView 状态 | dozer-app | 无(可与 A0–A2 并行) |
 | **A4** | GUI:应用面板(wry,加载 `http://<app-id>.localhost:端口/`,每应用 `data_store_identifier`)、安装计划/审批的最小界面、不可用时的提示页(§6.3,由 host 提供)、Settings 里的运行时探测展示 | dozer-app | A2、A3 **必须同时实现"禁止离开本 origin 的顶层导航/`window.open`"的 WebView 策略**——这是静态应用出站网络的强制等级能从 `Advisory` 升为 `Enforced` 的前提(CSP 挡不住导航与 WebRTC,见 A1 评审) |
 | **A5** | Excalidraw 端到端验收(下面的验收 1–8) | 全部 | A4、V2 |

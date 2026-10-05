@@ -110,7 +110,11 @@ impl Version {
         let mut it = s.split('.');
         let mut next = || -> Result<u32, VersionError> {
             let part = it.next().ok_or_else(bad)?;
-            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            // 不允许前导零(`01.2.3` 与 `1.2.3` 会被当成同一个版本,目录名却不同)
+            if part.is_empty()
+                || !part.bytes().all(|b| b.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+            {
                 return Err(bad());
             }
             part.parse().map_err(|_| bad())
@@ -208,5 +212,17 @@ mod tests {
         assert_eq!(serde_json::to_string(&v).unwrap(), "\"0.17.0\"");
         assert_eq!(serde_json::from_str::<Version>("\"0.17.0\"").unwrap(), v);
         assert!(serde_json::from_str::<Version>("\"0.17\"").is_err());
+    }
+
+    #[test]
+    fn version_parts_cannot_have_leading_zeros() {
+        for bad in ["01.2.3", "1.02.3", "1.2.03", "00.0.0"] {
+            assert!(Version::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(Version::parse("0.0.0").unwrap(), Version::new(0, 0, 0));
+        assert_eq!(
+            Version::parse("10.20.30").unwrap(),
+            Version::new(10, 20, 30)
+        );
     }
 }

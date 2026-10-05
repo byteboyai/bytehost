@@ -34,6 +34,9 @@ if [ -n "$extra" ]; then
   echo "$extra" >&2
   exit 1
 fi
+# 注意:这里检查的是 `cargo tree -p dozer-hook` **单独**解析出的依赖闭包。发布脚本把 hook 与 dozerd 在同一次
+# cargo 调用里构建,feature 会合并(hook 实际是对着带 `server` feature 的 bytehost-apps 编译的),只是链接器会裁掉
+# 用不到的代码。所以本检查保证的是"源码层面 hook 不依赖这些 crate",不是"hook 二进制里没有它们的代码"。
 # 3. `dozer-core` 依赖 bytehost-apps(默认 feature),`dozer-hook` 又依赖 `dozer-core`:hook 的依赖闭包里除了
 #    bytehost-apps 本身不能出现 tokio/hyper/sha2/toml/uuid 这些 server/digest/manifest-toml feature 的依赖。
 hook=$(tree_of dozer-hook)
