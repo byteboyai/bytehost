@@ -50,6 +50,8 @@ pub enum ManagerError {
     },
     /// 应用包里没有 `runtime.source` 指向的目录。
     MissingSource(PathBuf),
+    /// supervisor 正在/已经停止(`suspend_all` 之后到下一次 `reconcile` 之前):不再接受会产生新站点或新包的操作。
+    ShuttingDown,
 }
 
 impl std::fmt::Display for ManagerError {
@@ -67,6 +69,7 @@ impl std::fmt::Display for ManagerError {
             Self::BadState { app, state } => {
                 write!(f, "应用 {app} 当前状态 {state:?} 不允许这个操作")
             }
+            Self::ShuttingDown => write!(f, "dozerd 正在停止,暂不接受安装/启动"),
             Self::MissingSource(p) => write!(f, "应用包里缺少站点目录: {}", p.display()),
         }
     }
@@ -93,6 +96,9 @@ pub struct AppManager {
     events: broadcast::Sender<AppEvent>,
     /// 单写者锁:所有改状态的方法都先拿它。
     lock: Mutex<()>,
+    /// `suspend_all` 之后置位、`reconcile` 清除:置位期间 `install`/`start` 在**拿到锁之后**被拒绝——
+    /// 一个恰好排在锁后面的 `Start` 不能在撤站点之后又把站点注册回已停止的 gateway。
+    closed: std::sync::atomic::AtomicBool,
 }
 
 /// 一个已读入并校验过的应用包。
@@ -155,6 +161,7 @@ impl AppManager {
             host_version,
             events,
             lock: Mutex::new(()),
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -236,6 +243,9 @@ impl AppManager {
         staging: &Path,
         now_ms: u64,
     ) -> Result<(), ManagerError> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ManagerError::ShuttingDown);
+        }
         copy_tree(dir, staging)?;
         let package = read_package(staging, &self.host_version)?;
         let id = package.manifest.id.clone();
@@ -333,6 +343,9 @@ impl AppManager {
     }
 
     fn start_locked(&self, id: &AppId) -> Result<String, ManagerError> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ManagerError::ShuttingDown);
+        }
         let mut record = self.load_record(id)?;
         match &record.observed {
             ObservedState::Running => return Ok(self.gateway.site_url(id)),
@@ -457,6 +470,7 @@ impl AppManager {
     /// 下次启动时 `reconcile` 会按 `desired = Running` 把它们重新拉起("应用跟随 dozerd")。返回出错的应用。
     pub fn suspend_all(&self) -> Vec<(AppId, ManagerError)> {
         let _guard = self.lock.lock().expect("manager 锁");
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut failures = Vec::new();
         let listing = match self.registry.list() {
             Ok(l) => l,
@@ -477,6 +491,9 @@ impl AppManager {
     /// 返回失败的应用与原因,一个应用失败不影响其他应用。
     pub fn reconcile(&self) -> Vec<(AppId, ManagerError)> {
         let _guard = self.lock.lock().expect("manager 锁");
+        // reconcile 代表 supervisor(重新)开始工作
+        self.closed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let mut failures = Vec::new();
         let listing = match self.registry.list() {
             Ok(l) => l,
@@ -1259,5 +1276,42 @@ source = "web/"
         assert!(rig.manager.reconcile().is_empty());
         assert!(rig.gateway.has_site(&a), "desired=Running 的被重新拉起");
         assert!(!rig.gateway.has_site(&b));
+    }
+
+    /// `suspend_all` 之后到下一次 `reconcile` 之前,manager 不再接受会产生新站点/新包的操作(安装、启动),
+    /// 否则一个恰好排在锁后面的 `Start` 会在撤站点之后又把站点注册回一个已经停掉的 gateway。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_suspend_all_installs_and_starts_are_refused_until_the_next_reconcile() {
+        let rig = rig().await;
+        let a = id("alpha");
+        rig.install(&write_app(&rig.src_dir("a"), "alpha", "1.0.0", "", "A"))
+            .unwrap();
+        rig.manager.start(&a).unwrap();
+        assert!(rig.manager.suspend_all().is_empty());
+
+        assert!(matches!(
+            rig.manager.start(&a),
+            Err(ManagerError::ShuttingDown)
+        ));
+        assert!(
+            !rig.gateway.has_site(&a),
+            "被拒绝的 start 不能把站点注册回来"
+        );
+        let b = write_app(&rig.src_dir("b"), "beta", "1.0.0", "", "B");
+        let approved = rig.approve(&b);
+        assert!(matches!(
+            rig.manager.install(&approved, &b, 1),
+            Err(ManagerError::ShuttingDown)
+        ));
+        assert_no_leftovers(&rig);
+        // 停止与卸载照常允许(清理类操作)
+        rig.manager.stop(&a).unwrap();
+
+        assert!(
+            rig.manager.reconcile().is_empty(),
+            "reconcile 代表 supervisor 重新开始工作"
+        );
+        rig.manager.start(&a).unwrap();
+        rig.install(&b).unwrap();
     }
 }
