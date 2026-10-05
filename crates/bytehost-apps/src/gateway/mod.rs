@@ -78,7 +78,7 @@ impl Default for Limits {
 
 #[derive(Debug, Clone, Copy)]
 pub struct GatewayConfig {
-    /// 监听端口(127.0.0.1)。`0` 让系统分配——只给测试用;生产用 `port::load_or_choose_port` 的值。
+    /// 监听端口(127.0.0.1)。`0` 让系统分配——只给测试用;生产用 `port::load_port`/`pick_port` 的值。
     pub port: u16,
 }
 

@@ -26,8 +26,9 @@ pub fn pick_port() -> u16 {
     PORT_MIN + n % (PORT_MAX - PORT_MIN + 1)
 }
 
-/// 读 `<root>/gateway.json` 里持久化的端口;文件不存在就选一个、原子写入、返回。
-pub fn load_or_choose_port(root: &Path) -> io::Result<u16> {
+/// 读 `<root>/gateway.json` 里持久化的端口;文件不存在返回 `None`(首次运行,由调用方选端口、**绑定成功后**
+/// 再 [`persist_port`])。坏文件、越界端口一律是 `InvalidData` 错误,绝不"顺手重新选一个"。
+pub fn load_port(root: &Path) -> io::Result<Option<u16>> {
     let path = root.join("gateway.json");
     match fs::read_to_string(&path) {
         Ok(text) => {
@@ -47,24 +48,26 @@ pub fn load_or_choose_port(root: &Path) -> io::Result<u16> {
                     ),
                 ));
             }
-            Ok(settings.port)
+            Ok(Some(settings.port))
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let port = pick_port();
-            fs::create_dir_all(root)?;
-            let json = serde_json::to_string_pretty(&GatewaySettings { port })
-                .map_err(io::Error::other)?;
-            let tmp = path.with_extension("tmp");
-            {
-                let mut file = fs::File::create(&tmp)?;
-                io::Write::write_all(&mut file, json.as_bytes())?;
-                file.sync_all()?; // 先落盘再改名,避免断电后留下空文件(空文件会变成永久的 InvalidData)
-            }
-            fs::rename(&tmp, &path)?;
-            Ok(port)
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// 原子写入 `<root>/gateway.json`(先落盘再改名,避免断电后留下空文件——空文件会变成永久的 `InvalidData`)。
+/// 只在端口**真的绑定成功之后**调用:选了但没绑上的端口不该被记住。
+pub fn persist_port(root: &Path, port: u16) -> io::Result<()> {
+    let path = root.join("gateway.json");
+    fs::create_dir_all(root)?;
+    let json = serde_json::to_string_pretty(&GatewaySettings { port }).map_err(io::Error::other)?;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = fs::File::create(&tmp)?;
+        io::Write::write_all(&mut file, json.as_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, &path)
 }
 
 #[cfg(test)]
@@ -80,13 +83,13 @@ mod tests {
     }
 
     #[test]
-    fn the_first_call_chooses_and_persists_and_later_calls_return_the_same_port() {
+    fn nothing_is_stored_until_persist_and_then_the_same_port_comes_back() {
         let tmp = tempfile::tempdir().unwrap();
-        let first = load_or_choose_port(tmp.path()).unwrap();
-        assert!((PORT_MIN..=PORT_MAX).contains(&first));
-        assert!(tmp.path().join("gateway.json").is_file());
-        for _ in 0..5 {
-            assert_eq!(load_or_choose_port(tmp.path()).unwrap(), first);
+        assert_eq!(load_port(tmp.path()).unwrap(), None, "只读不写");
+        assert!(!tmp.path().join("gateway.json").exists());
+        persist_port(tmp.path(), 23456).unwrap();
+        for _ in 0..3 {
+            assert_eq!(load_port(tmp.path()).unwrap(), Some(23456));
         }
         assert!(
             !tmp.path().join("gateway.tmp").exists(),
@@ -95,11 +98,11 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_root_directory_is_created() {
+    fn a_missing_root_directory_is_created_by_persist() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("a/b");
-        let port = load_or_choose_port(&root).unwrap();
-        assert_eq!(load_or_choose_port(&root).unwrap(), port);
+        persist_port(&root, 24000).unwrap();
+        assert_eq!(load_port(&root).unwrap(), Some(24000));
     }
 
     #[test]
@@ -114,7 +117,7 @@ mod tests {
             "{}",
         ] {
             fs::write(&path, bad).unwrap();
-            let err = load_or_choose_port(tmp.path()).unwrap_err();
+            let err = load_port(tmp.path()).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{bad}");
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
@@ -128,7 +131,7 @@ mod tests {
     fn an_explicitly_persisted_port_is_returned_as_is() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("gateway.json"), r#"{"port": 51234}"#).unwrap();
-        assert_eq!(load_or_choose_port(tmp.path()).unwrap(), 51234);
+        assert_eq!(load_port(tmp.path()).unwrap(), Some(51234));
     }
 
     /// macOS 的临时端口段是 49152–65535,Linux 是 32768–60999:任何监听端口 0 的程序都从那里拿端口。
