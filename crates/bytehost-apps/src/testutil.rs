@@ -57,6 +57,9 @@ impl<'a> Req<'a> {
 
     pub fn send(&self) -> Resp {
         let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("连上 gateway");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("读超时");
         let mut raw = format!("{} {} HTTP/1.1\r\n", self.method, self.target);
         if let Some(h) = self.host {
             raw.push_str(&format!("Host: {h}\r\n"));
@@ -104,4 +107,16 @@ pub(crate) fn write_files(dir: &Path, files: &[(&str, &str)]) {
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, content).unwrap();
     }
+}
+
+/// 原样发送一段原始请求(测试重复 `Host` 头、绝对形式请求目标这类 `Req` 表达不了的畸形请求)。
+pub(crate) fn send_raw(port: u16, raw: &str) -> Resp {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("连上 gateway");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("读超时");
+    stream.write_all(raw.as_bytes()).expect("发请求");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("读响应");
+    parse(&buf)
 }

@@ -10,6 +10,8 @@ pub(crate) enum Resolved {
     Forbidden,
     /// 编码非法、含 NUL 或反斜杠。
     BadRequest,
+    /// 目录且 URL 不带结尾斜杠:要先重定向到带斜杠的地址(否则页面里的相对链接按上一级解析)。
+    DirRedirect,
 }
 
 /// 百分号解码。非法序列(`%` 后不是两位十六进制)或解出来不是 UTF-8 返回 `None`。
@@ -57,6 +59,9 @@ pub(crate) fn resolve(root: &Path, url_path: &str) -> Resolved {
         }
     }
     if candidate.is_dir() {
+        if candidate != root && !decoded.ends_with('/') {
+            return Resolved::DirRedirect;
+        }
         candidate.push("index.html");
     }
     let (Ok(real), Ok(real_root)) = (candidate.canonicalize(), root.canonicalize()) else {
@@ -144,7 +149,8 @@ mod tests {
         let (_tmp, root) = site();
         assert_eq!(resolve(&root, "/"), file(&root, "index.html"));
         assert_eq!(resolve(&root, ""), file(&root, "index.html"));
-        assert_eq!(resolve(&root, "/docs"), file(&root, "docs/index.html"));
+        // 目录不带结尾斜杠:不直接给 index.html(页面里的相对链接会按 / 解析),而是要求重定向到带斜杠的地址
+        assert_eq!(resolve(&root, "/docs"), Resolved::DirRedirect);
         assert_eq!(resolve(&root, "/docs/"), file(&root, "docs/index.html"));
         assert_eq!(
             resolve(&root, "/assets/app.js"),
@@ -164,6 +170,11 @@ mod tests {
         assert_eq!(resolve(&root, "/nope.html"), Resolved::NotFound);
         assert_eq!(
             resolve(&root, "/assets"),
+            Resolved::DirRedirect,
+            "目录先重定向到带斜杠的地址"
+        );
+        assert_eq!(
+            resolve(&root, "/assets/"),
             Resolved::NotFound,
             "assets/ 没有 index.html"
         );
