@@ -253,6 +253,8 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 - **UDS 上的请求等于"同一用户"。** dozerd 的 socket 只有同一用户的进程能连——包括在 Dozer 的 PTY 里运行的 Agent。所以任何同用户进程都可以用 `Request::App` 自己出计划、自己批准(`Approval.approver` 与 `trust` 都是客户端自己填的)、自己安装并启动应用。这与 `CreateSession` 已经能运行任意命令是同一个信任级别,**没有引入新的权限**;但"甲方批准"(用户在界面上确认)只是**产品层的约定**,不是 dozerd 强制的——需要强制时,要由 supervisor 保存计划并只接受它自己签发的批准(留给有进程型 runtime 的切片)。
 - **`LocalDir` 安装会把整个源目录永久拷进应用目录**(含 `.env` 之类的敏感文件),即使 gateway 只提供 `runtime.source` 指向的子目录。`path` 必须是绝对路径(相对路径会按 dozerd 的工作目录解析)。崩溃时遗留的 `.staging-*` 在 manager 下次启动时清扫。
 
+- **应用 webview 的 wry 默认值不是安全默认。** wry 0.55 默认放行下载、debug 构建开开发者工具、**对摄像头/麦克风请求无条件批准**。前两项已在 `build_app_webview` 显式关闭;媒体权限 wry 没有钩子可改,目前只靠 macOS TCC(Dozer 没声明摄像头/麦克风用途)挡着——将来 Dozer 若加语音输入等功能,必须先给应用 webview 加授权闸门(对照 manifest 的 grants),否则所有应用会静默拿到。IPC 消息带每 webview 的随机 nonce 且只转发真实用户事件,页面伪造不了焦点/缩放。
+
 ## 7. 一期范围与验收
 
 **一期目标:** 在 Dozer 里装一个静态 Web 应用(Excalidraw),它在 rail 上有自己的图标和面板,由 dozerd 里的 gateway 提供,GUI 退出重开后数据还在。Python/Node/容器只定义 adapter trait 与 `probe`,不实现。
