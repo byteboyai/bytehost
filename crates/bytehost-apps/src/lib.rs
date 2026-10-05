@@ -21,9 +21,13 @@ pub mod permissions;
 pub mod plan;
 #[cfg(feature = "server")]
 pub mod port;
+pub mod proto;
 pub mod registry;
 #[cfg(feature = "server")]
 pub mod runtime;
 pub mod state;
 #[cfg(all(test, feature = "server"))]
 mod testutil;
+
+/// 应用宿主的 API 版本:manifest 的 `min_host_version` 比较的是它,**不是**宿主产品(Dozer/Digger)自己的版本号。
+pub const HOST_VERSION: id::Version = id::Version::new(0, 1, 0);

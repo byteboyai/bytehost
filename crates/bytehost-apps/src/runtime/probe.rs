@@ -8,18 +8,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeAvailability {
-    /// 可用;`detail` 是版本之类的人类可读信息。
-    Available {
-        detail: String,
-    },
-    /// 装了但当前用不了(如 Docker 守护进程没启动)。
-    Unavailable {
-        detail: String,
-    },
-    NotInstalled,
-}
+pub use crate::proto::RuntimeAvailability;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {

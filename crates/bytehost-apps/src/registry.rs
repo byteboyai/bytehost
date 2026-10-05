@@ -87,7 +87,8 @@ pub struct AppRecord {
     pub data_store_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UninstallMode {
     /// 只删程序:保留 `data/` 与 `logs/`,重装后数据还在。
     Program,

@@ -8,9 +8,10 @@ cd "$(dirname "$0")/.."
 
 # 注意:`cargo tree` 失败必须让门禁失败(不能被管道/`|| true` 吞掉);边类型含 build-dependency,
 # 并覆盖所有目标平台(`--target all`),否则会漏掉 build 依赖和 `cfg(target_os = …)` 下的依赖。
-tree() {
+tree_of() {
+  local pkg="$1"; shift
   local out
-  out=$(cargo tree -p bytehost-apps -e normal,build --target all --prefix none "$@" 2>&1) || {
+  out=$(cargo tree -p "$pkg" -e normal,build --target all --prefix none "$@" 2>&1) || {
     echo "cargo tree 失败:" >&2
     echo "$out" >&2
     exit 1
@@ -18,6 +19,7 @@ tree() {
   echo "$out" | awk '{print $1}' | sort -u
 }
 
+tree() { tree_of bytehost-apps "$@"; }
 all=$(tree --all-features)
 if echo "$all" | grep -qE '^dozer'; then
   echo "bytehost-apps 不得依赖 dozer* crate,发现:" >&2
@@ -30,6 +32,14 @@ extra=$(tree | grep -Ev "$allowed" || true)
 if [ -n "$extra" ]; then
   echo "bytehost-apps 默认 feature 的依赖闭包里出现了不在白名单里的 crate(新增依赖请放进 feature):" >&2
   echo "$extra" >&2
+  exit 1
+fi
+# 3. `dozer-core` 依赖 bytehost-apps(默认 feature),`dozer-hook` 又依赖 `dozer-core`:hook 的依赖闭包里除了
+#    bytehost-apps 本身不能出现 tokio/hyper/sha2/toml/uuid 这些 server/digest/manifest-toml feature 的依赖。
+hook=$(tree_of dozer-hook)
+if echo "$hook" | grep -qE '^(tokio|hyper|hyper-util|http-body-util|bytes|sha2|toml|uuid)$'; then
+  echo "dozer-hook 的依赖闭包被 bytehost-apps 的可选依赖污染了:" >&2
+  echo "$hook" | grep -E '^(tokio|hyper|hyper-util|http-body-util|bytes|sha2|toml|uuid)$' >&2
   exit 1
 fi
 echo "bytehost-apps deps check: ok"

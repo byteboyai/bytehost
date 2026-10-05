@@ -99,7 +99,7 @@ struct State {
 pub struct Gateway {
     state: Arc<State>,
     shutdown: Arc<Notify>,
-    task: tokio::task::JoinHandle<()>,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// 按**已授予**的权限算 CSP:出站网络为 `none` 时,用 CSP 真正禁止页面向外发请求(`Enforced`);
@@ -155,7 +155,7 @@ impl Gateway {
         Ok(Self {
             state,
             shutdown,
-            task,
+            task: std::sync::Mutex::new(Some(task)),
         })
     }
 
@@ -182,6 +182,12 @@ impl Gateway {
             .is_some()
     }
 
+    /// `stop`/`shutdown` 已经完成(accept 循环已退出)。测试与上层用它判断"这个 gateway 确实停了",
+    /// 而不是靠"再连一次端口"——端口一释放就可能被别的程序(或别的测试)立刻重新占用,连接探测会误判。
+    pub fn is_stopped(&self) -> bool {
+        self.task.lock().expect("task 锁").is_none()
+    }
+
     pub fn has_site(&self, id: &AppId) -> bool {
         self.state
             .sites
@@ -200,10 +206,19 @@ impl Gateway {
         format!("{}?{TOKEN_PARAM}={}", self.site_url(id), self.state.token)
     }
 
-    pub async fn shutdown(self) {
+    /// 停止接受新连接并等 accept 循环退出。**幂等**,且只要 `&self`——`AppManager` 与 dozerd 都持有 `Arc<Gateway>`,
+    /// 没法交出所有权调用 [`Gateway::shutdown`]。已建立的连接不会被主动掐断。
+    pub async fn stop(&self) {
         // notify_one 会存一个许可:即使 accept 循环还没跑到 `notified()`,稍后也能收到(notify_waiters 会丢)
         self.shutdown.notify_one();
-        let _ = self.task.await;
+        let task = self.task.lock().expect("task 锁").take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    pub async fn shutdown(self) {
+        self.stop().await;
     }
 }
 
@@ -917,6 +932,18 @@ mod tests {
             "超出上限的连接什么都收不到"
         );
         assert!(started.elapsed() < Duration::from_secs(3));
+        gw.shutdown().await;
+    }
+
+    /// `stop` 只要 `&self`、可以重复调用;完成之后 `is_stopped()` 为真。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_is_idempotent_and_marks_the_gateway_stopped() {
+        let gw = Gateway::start(GatewayConfig { port: 0 }).await.unwrap();
+        assert!(!gw.is_stopped());
+        gw.stop().await;
+        assert!(gw.is_stopped());
+        gw.stop().await;
+        assert!(gw.is_stopped());
         gw.shutdown().await;
     }
 }
