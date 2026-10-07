@@ -50,6 +50,7 @@ impl ManagedResolver {
         let mut dirs: Vec<PathBuf> = entries
             .flatten()
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter(|e| e.file_name().to_str().is_some_and(is_python_install_name))
             .map(|e| e.path())
             .collect();
         dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
@@ -61,6 +62,12 @@ impl ManagedResolver {
         }
         None
     }
+}
+
+/// uv 安装目录下哪些子目录是"一个 Python 版本":名字以 `cpython-` 开头(uv 的命名)。
+/// 其余(`.cache`、`.temp`、`.lock`……)是 uv 自己的内部文件,不能当版本列出、更不能被卸载。
+pub(super) fn is_python_install_name(name: &str) -> bool {
+    name.starts_with("cpython-")
 }
 
 impl RuntimeResolver for ManagedResolver {
@@ -220,6 +227,22 @@ mod tests {
         assert_eq!(
             chain.resolve("node"),
             Err(ResolveError::NotInstalled("node".into()))
+        );
+    }
+
+    #[test]
+    fn a_python_looking_binary_inside_uvs_internal_dirs_is_never_resolved() {
+        let d = tempfile::tempdir().unwrap();
+        let store = RuntimeStore::new(d.path());
+        exe(&store.root().join("python/.cache"), "bin/python3");
+        let r = ManagedResolver::new(RuntimeStore::new(d.path()));
+        assert!(r.resolve("python3").is_err());
+        exe(&store.root().join("python/cpython-3.13.0"), "bin/python3");
+        assert!(
+            r.resolve("python3")
+                .unwrap()
+                .program
+                .ends_with("cpython-3.13.0/bin/python3")
         );
     }
 }

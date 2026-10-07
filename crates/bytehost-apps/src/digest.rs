@@ -22,6 +22,22 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
+/// 文件的 SHA-256(小写十六进制),**流式**读取:不把整个文件放进内存(运行时压缩包可达几百 MB)。
+pub fn sha256_file(path: &Path) -> io::Result<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
 /// 目录树摘要:按相对路径(`/` 分隔)字典序遍历所有文件,逐个把"路径长度、路径、内容长度、内容"喂给
 /// SHA-256。文件内容、文件名、文件增删、目录结构变化都会改变摘要;遇到符号链接直接报错
 /// (`InvalidInput`)——链接可以指向包外,摘要无法代表它的内容。空目录不计入(只有文件)。
@@ -110,6 +126,18 @@ mod tests {
         let p = root.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn the_streaming_file_hash_equals_the_in_memory_hash_across_buffer_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        for len in [0usize, 1, 65535, 65536, 65537, 200_000] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let p = dir.path().join(format!("f{len}"));
+            std::fs::write(&p, &data).unwrap();
+            assert_eq!(sha256_file(&p).unwrap(), sha256_hex(&data), "{len}");
+        }
+        assert!(sha256_file(&dir.path().join("missing")).is_err());
     }
 
     #[test]

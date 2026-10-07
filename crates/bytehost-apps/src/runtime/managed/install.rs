@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::digest::sha256_hex;
+use crate::digest::sha256_file;
 
 use super::fetch::{Archive, Fetcher};
 use super::pins::Pin;
@@ -127,8 +127,7 @@ impl Installer<'_> {
 
         // --- 校验 ---
         on_progress(Phase::Verifying, 0, None);
-        let bytes = std::fs::read(&archive_path)?;
-        let actual = sha256_hex(&bytes);
+        let actual = sha256_file(&archive_path)?;
         if actual != pin.sha256 {
             return Err(InstallError::ChecksumMismatch {
                 expected: pin.sha256.to_string(),
@@ -315,6 +314,7 @@ fn smoke_test(bin: &Path, cancel: &AtomicBool) -> Result<(), InstallError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::digest::sha256_hex;
     use std::sync::Mutex;
 
     // `Pin` 的字段是 `&'static str`;测试里用 `Box::leak` 造。

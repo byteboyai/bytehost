@@ -59,7 +59,6 @@ else
 fi
 
 # ---------- uv ----------
-declare -A UV_SHA
 for entry in "${UV_TRIPLES[@]}"; do
   triple="${entry%%:*}"
   echo "取 uv 校验和: uv-${triple}.tar.gz.sha256" >&2
@@ -67,8 +66,7 @@ for entry in "${UV_TRIPLES[@]}"; do
   curl -fsSL --max-time 60 \
     "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${triple}.tar.gz.sha256" \
     -o "$sha_file" || fail "下载 uv ${triple} 的 .sha256 失败"
-  # .sha256 文件形如 "<hex>  uv-<triple>.tar.gz"
-  UV_SHA["$triple"]="$(awk '{print $1}' "$sha_file")"
+  # .sha256 文件形如 "<hex>  uv-<triple>.tar.gz";emit 时再按文件读(不用关联数组:macOS 自带 bash 3.2 没有 declare -A)
 done
 
 # ---------- 输出 Rust 字面量 ----------
@@ -105,7 +103,7 @@ for entry in "${UV_TRIPLES[@]}"; do
   triple="${entry%%:*}"
   target="${entry##*:}"
   file="uv-${triple}.tar.gz"
-  sha="${UV_SHA[$triple]}"
+  sha="$(awk '{print $1}' "$WORK/uv-${triple}.sha256")"
   [ -n "$sha" ] || fail "uv ${triple} 校验和为空"
   url="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${file}"
   # uv 包解压后是顶层目录 `uv-<triple>/` 下的 `uv`/`uvx`,strip 掉顶层目录

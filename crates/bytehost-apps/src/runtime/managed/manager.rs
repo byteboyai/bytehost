@@ -31,6 +31,8 @@ pub enum RtError {
     Unsupported(String),
     Conflict(String),
     PlanChanged,
+    /// dozerd 正在退出(`cancel_all_and_join` 之后):不再接受新的安装。
+    ShuttingDown,
     Io(io::Error),
 }
 
@@ -40,6 +42,7 @@ impl std::fmt::Display for RtError {
             Self::Unsupported(m) => write!(f, "不支持:{m}"),
             Self::Conflict(m) => write!(f, "冲突:{m}"),
             Self::PlanChanged => write!(f, "计划已变化"),
+            Self::ShuttingDown => write!(f, "dozerd 正在退出,暂不接受运行时安装"),
             Self::Io(e) => write!(f, "I/O 错误:{e}"),
         }
     }
@@ -150,6 +153,8 @@ pub struct RuntimeManager {
     uv_runner: Arc<dyn UvRunner>,
     pins: &'static [Pin],
     jobs: Mutex<HashMap<ManagedRuntime, JobEntry>>,
+    /// `cancel_all_and_join` 置位后不再起新任务。在 `jobs` 锁内读写,所以不会有任务在收尾之后才被登记。
+    closed: AtomicBool,
 }
 
 impl RuntimeManager {
@@ -183,6 +188,7 @@ impl RuntimeManager {
             uv_runner,
             pins,
             jobs: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -279,6 +285,9 @@ impl RuntimeManager {
         }
 
         let mut jobs = self.jobs.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(RtError::ShuttingDown);
+        }
         if let Some(entry) = jobs.get(&approved.runtime)
             && !entry.job.lock().unwrap().finished
         {
@@ -374,6 +383,8 @@ impl RuntimeManager {
                     .flatten()
                     .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                     .filter_map(|e| e.file_name().into_string().ok())
+                    // uv 在安装目录里还放 `.cache`/`.temp` 等自己的内部目录,不是 Python 版本
+                    .filter(|n| super::resolve::is_python_install_name(n))
                     .collect();
                 versions.sort();
                 versions.reverse();
@@ -387,6 +398,12 @@ impl RuntimeManager {
             ManagedRuntime::Node => "node",
             ManagedRuntime::Python => "python",
         };
+        if rt == ManagedRuntime::Python && !super::resolve::is_python_install_name(version) {
+            return Err(RtError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{version:?} 不是一个受管的 Python 版本"),
+            )));
+        }
         self.store.remove(name, version).map_err(RtError::Io)
     }
 
@@ -394,6 +411,7 @@ impl RuntimeManager {
     pub fn cancel_all_and_join(&self) {
         let entries: Vec<(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>)> = {
             let mut jobs = self.jobs.lock().unwrap();
+            self.closed.store(true, Ordering::SeqCst);
             jobs.values_mut()
                 .map(|e| {
                     e.cancel.store(true, Ordering::SeqCst);
@@ -965,5 +983,60 @@ mod tests {
         assert!(status.success());
         let bytes = std::fs::read(&archive).unwrap();
         (archive, sha256_hex(&bytes))
+    }
+
+    /// 退出收尾之后再来的安装请求被拒绝,而且没有发起任何下载、没有起任何线程。
+    #[test]
+    fn installs_requested_after_shutdown_began_are_refused_without_downloading() {
+        let d = tempfile::tempdir().unwrap();
+        let (tar, sha) = tar_gz(d.path(), "#!/bin/sh\necho v1\n");
+        let pins = node_pins("https://nodejs.org/x.tar.gz", sha);
+        let fetcher = CountingFetcher::ok(tar);
+        let m = manager(d.path(), fetcher.clone(), Arc::new(FakeUv::default()), pins);
+        let plan = m.plan(ManagedRuntime::Node).unwrap();
+        m.cancel_all_and_join();
+        assert!(matches!(m.start_install(&plan), Err(RtError::ShuttingDown)));
+        assert_eq!(fetcher.calls(), 0);
+        assert!(m.jobs().is_empty());
+    }
+
+    /// uv 在安装目录里放的 `.cache`/`.temp`/`.lock` 不是 Python 版本:不列出、不能卸载(卸载会毁掉 uv 的缓存)。
+    #[test]
+    fn uvs_internal_directories_are_not_listed_as_python_versions_nor_removable() {
+        let d = tempfile::tempdir().unwrap();
+        let pins = node_pins("https://nodejs.org/x.tar.gz", "a".repeat(64));
+        let m = manager(
+            d.path(),
+            CountingFetcher::ok(d.path().into()),
+            Arc::new(FakeUv::default()),
+            pins,
+        );
+        let py = m.store().root().join("python");
+        for dir in [
+            "cpython-3.13.1-macos-aarch64-none",
+            "cpython-3.12.9-macos-aarch64-none",
+            ".cache",
+            ".temp",
+        ] {
+            std::fs::create_dir_all(py.join(dir)).unwrap();
+        }
+        std::fs::write(py.join(".lock"), "").unwrap();
+        assert_eq!(
+            m.installed(ManagedRuntime::Python),
+            vec![
+                "cpython-3.13.1-macos-aarch64-none".to_string(),
+                "cpython-3.12.9-macos-aarch64-none".to_string()
+            ]
+        );
+        for internal in [".cache", ".temp", ".lock", "bin"] {
+            assert!(
+                m.uninstall(ManagedRuntime::Python, internal).is_err(),
+                "{internal}"
+            );
+        }
+        assert!(py.join(".cache").exists(), "uv 的缓存不能被卸载掉");
+        m.uninstall(ManagedRuntime::Python, "cpython-3.12.9-macos-aarch64-none")
+            .unwrap();
+        assert_eq!(m.installed(ManagedRuntime::Python).len(), 1);
     }
 }
