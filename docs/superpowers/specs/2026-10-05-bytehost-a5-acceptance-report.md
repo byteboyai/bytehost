@@ -24,7 +24,7 @@
 |---|---|---|
 | 1 | 持久化机制:固定端口 + 固定存储标识时数据跨进程保留 | `spike/v2-excalidraw` 连跑:第一次 `lsAtStart=[]` → 第二次含 `excalidraw`、`excalidraw-state` 等键 |
 | 2 | 篡改源码/清单后用旧批准安装被拒 | `manager::a_source_or_manifest_changed_after_approval_is_refused_and_leaves_nothing_behind`、`plan::verify_rejects_a_payload_edited_after_the_digests_were_taken` 通过 |
-| 3 | 目录层:"仅程序"保留 `data/` 与日志;WebView 存储层:**清除机制**可用 | `manager::uninstalling_the_program_stops_serving_and_keeps_user_data`、`registry::uninstalling_the_program_keeps_data_and_logs_and_a_reinstall_finds_them` 通过;探针:`--purge --store N` 后 `lsAtStart` 回到 `[]`;队列逻辑 `app_webview::store_removal_*` 通过 |
+| 3 | 目录层:"仅程序"保留 `data/` 与日志;WebView 存储层:**清除机制**在**全新进程、没建过 webview** 的情况下可用(Dozer 里是"丢掉 webview 后同一帧内清除",这一路径只有 §3 第 3 项手工能验——刚丢掉时 WebKit 可能还没放开存储,返回 `DataStoreInUse`,所以 Task 3 带重试) | `manager::uninstalling_the_program_stops_serving_and_keeps_user_data`、`registry::uninstalling_the_program_keeps_data_and_logs_and_a_reinstall_finds_them` 通过;探针:`--purge --store N` 后 `lsAtStart` 回到 `[]`;队列逻辑 `app_webview::store_removal_*` 通过 |
 | 4 | 不同应用 origin 隔离 | V1 spike(`spike/origin-gateway/README.md`,2026-10-04) |
 | 5 | 伪造 `Host` 被拒 | `gateway::the_host_header_must_be_exactly_a_valid_app_dot_localhost_with_the_gateways_port` 通过 |
 | 6 | 未知权限字段 → 计划失败 | `manifest::…::unknown_fields_are_a_parse_error_at_the_top_level_and_in_nested_tables` 通过;随包清单 `the_shipped_excalidraw_manifest_parses_and_asks_for_nothing` 通过 |
@@ -50,4 +50,4 @@
 - (无新增缺陷)Task 3 的 App 层接线(意图记录、结果触发清除、窗口层调用 `remove_data_store`)没有 App 夹具可自动验证,依赖 §3 第 3 项手工确认。
 - Excalidraw 的导出/保存在一期不可用(A4b1 拒绝所有下载)。
 - 打包阶段联网下载 3 个字体,未校验摘要;镜像用 `latest`,以本报告记录的摘要为准。
-- 清除 WebView 存储需要 macOS 14+。
+- 清除 WebView 存储需要 macOS 14+:`remove_data_store` 在 12/13 上不存在,wry 不检查,直接调会让进程崩溃(`Info.plist` 最低系统是 12.0)——代码在调用前判断系统版本,低于 14 时跳过并弹 Toast 说明重装后可能还有旧数据。

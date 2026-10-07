@@ -7,7 +7,7 @@ Service Worker 注册、localStorage 可写。会短暂弹出一个窗口(约 20
 """
 import json, subprocess, sys, os
 
-app = sys.argv[1]
+app = os.path.abspath(sys.argv[1])  # cargo 在 spike 目录里跑,相对路径会被解析到那里
 port = sys.argv[sys.argv.index("--fixed-port") + 1] if "--fixed-port" in sys.argv else "0"
 spike = os.path.join(os.path.dirname(__file__), "../../../spike/v2-excalidraw")
 proc = subprocess.run(

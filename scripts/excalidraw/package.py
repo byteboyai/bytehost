@@ -11,11 +11,23 @@
 输出布局(可直接作为 `LocalDir` 安装源):`<输出目录>/manifest.toml` + `<输出目录>/web/`(站点)。
 用法: package.py <官方镜像里的 html 目录> <输出应用目录>
 """
-import os, re, shutil, sys, urllib.request
+import os, re, shutil, sys, tempfile, urllib.request
 
-src, app = sys.argv[1], sys.argv[2]
+src = sys.argv[1]
+app_final = os.path.abspath(sys.argv[2])
+if not os.path.isfile(f"{src}/index.html"):
+    sys.exit(f"源目录不对(没有 index.html): {src}")
+# 输出路径要么不存在、要么是空目录、要么是**上一次的打包输出**(有 manifest.toml 和 web/)——
+# 否则拒绝,不能把用户随手传来的目录(如 ~)整个删掉。
+if os.path.exists(app_final):
+    is_empty_dir = os.path.isdir(app_final) and not os.listdir(app_final)
+    is_old_output = os.path.isfile(f"{app_final}/manifest.toml") and os.path.isdir(f"{app_final}/web")
+    if not (is_empty_dir or is_old_output):
+        sys.exit(f"拒绝覆盖 {app_final}:它既不是空目录,也不是上一次的打包输出(需含 manifest.toml 与 web/)")
+# 先在同级临时目录里做完并自检,成功了再整体换上去:中途失败不会留下半成品,也不会先毁掉旧输出。
+app = tempfile.mkdtemp(prefix=".bh-excalidraw-", dir=os.path.dirname(app_final))
 out = f"{app}/web"
-shutil.rmtree(app, ignore_errors=True)
+shutil.rmtree(app)
 os.makedirs(app)
 shutil.copytree(src, out)
 html = open(f"{out}/index.html", encoding="utf-8").read()
@@ -80,4 +92,7 @@ if problems:
     sys.exit("打包自检失败: " + "; ".join(problems))
 
 shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifest.toml"), f"{app}/manifest.toml")
-print("OK:", app)
+if os.path.exists(app_final):
+    shutil.rmtree(app_final)
+os.rename(app, app_final)
+print("OK:", app_final)
