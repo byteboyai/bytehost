@@ -215,6 +215,9 @@ impl Gateway {
     }
 
     /// 注册(或替换)一个应用的静态站点。
+    ///
+    /// `add_site`/`add_upstream` 各取两把锁、非原子:替换应用类型的瞬间请求可能短暂得到 404。
+    /// 调用方(`AppManager`)对同一个应用串行调用,所以可以接受。
     pub fn add_site(&self, id: &AppId, root: PathBuf, csp: Option<String>) {
         self.state.upstreams_write().remove(id.as_str());
         self.state
@@ -345,8 +348,7 @@ async fn accept_loop(
                                 Routed::Reply(r) => proxy::boxed_reply(r),
                                 Routed::Proxy(upstream) => {
                                     let own_origin = format!(
-                                        "{}://{}",
-                                        "http",
+                                        "http://{}",
                                         header_str(&req, header::HOST).unwrap_or_default()
                                     );
                                     proxy::forward(

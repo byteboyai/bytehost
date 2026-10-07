@@ -2,6 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,8 @@ use super::*;
 struct Upstream {
     addr: SocketAddr,
     seen: Arc<Mutex<Vec<String>>>,
+    /// `/ws` 的那条连接是否已被关闭(读到 EOF 或写失败)。
+    ws_closed: Arc<AtomicBool>,
 }
 
 fn read_head(s: &mut TcpStream) -> Option<(String, Vec<u8>)> {
@@ -41,10 +44,13 @@ fn spawn_upstream() -> Upstream {
     let addr = l.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen2 = seen.clone();
+    let ws_closed = Arc::new(AtomicBool::new(false));
+    let ws_closed2 = ws_closed.clone();
     std::thread::spawn(move || {
         for conn in l.incoming() {
             let Ok(mut s) = conn else { return };
             let seen = seen2.clone();
+            let ws_closed = ws_closed2.clone();
             std::thread::spawn(move || {
                 let Some((head, body)) = read_head(&mut s) else {
                     return;
@@ -75,6 +81,7 @@ fn spawn_upstream() -> Upstream {
                                 break;
                             }
                         }
+                        ws_closed.store(true, Ordering::SeqCst);
                     }
                     "/slow" => std::thread::sleep(Duration::from_secs(3)),
                     _ => {
@@ -84,7 +91,11 @@ fn spawn_upstream() -> Upstream {
             });
         }
     });
-    Upstream { addr, seen }
+    Upstream {
+        addr,
+        seen,
+        ws_closed,
+    }
 }
 
 struct Fixture {
@@ -279,4 +290,50 @@ async fn removing_the_app_stops_proxying_to_it() {
     assert!(f.gw.remove_site(&AppId::new("pyapp").unwrap()));
     assert!(exchange(&f, "GET /echo", "", "").starts_with("HTTP/1.1 404"));
     assert!(up.seen.lock().unwrap().is_empty());
+}
+
+/// 同一个应用 id 同时只在一张表里:静态站点与上游互相替换,而不是并存。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_site_and_an_upstream_replace_each_other_for_the_same_app() {
+    let up = spawn_upstream();
+    let f = fixture(Some(up.addr), Limits::default()).await;
+    let id = AppId::new("pyapp").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("index.html"), "static").unwrap();
+    f.gw.add_site(&id, dir.path().to_path_buf(), None);
+    assert!(f.gw.has_site(&id));
+    assert!(exchange(&f, "GET /", "", "").contains("static"));
+    assert!(
+        up.seen.lock().unwrap().is_empty(),
+        "已换成静态站点,不该再代理"
+    );
+    f.gw.add_upstream(&id, up.addr);
+    assert!(exchange(&f, "GET /echo", "", "").starts_with("HTTP/1.1 201"));
+    assert!(f.gw.state.sites_read().get("pyapp").is_none());
+    // 注销一次就彻底没了
+    assert!(f.gw.remove_site(&id));
+    assert!(!f.gw.has_site(&id));
+}
+
+/// 客户端断开后,隧道另一端(应用那条连接)也要被关掉,不能泄漏。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_the_client_side_of_a_websocket_closes_the_apps_connection() {
+    let up = spawn_upstream();
+    let f = fixture(Some(up.addr), Limits::default()).await;
+    let mut s = TcpStream::connect(("127.0.0.1", f.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(s, "GET /ws HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 13\r\nOrigin: http://{}\r\n\r\n", f.host, f.cookie, f.host).unwrap();
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert_eq!(s.read(&mut b).unwrap(), 1);
+        head.push(b[0]);
+    }
+    assert!(!up.ws_closed.load(Ordering::SeqCst));
+    drop(s);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !up.ws_closed.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "应用那条连接没被关闭");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
