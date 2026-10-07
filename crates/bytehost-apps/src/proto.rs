@@ -30,6 +30,17 @@ pub struct AppSummary {
     pub url: Option<String>,
 }
 
+/// 可由 bytehost **安装到自己的目录**的运行时(规格 A9)。
+///
+/// `Node` 是 Node.js 本身;`Python` 指 **uv + 由 uv 管理的 CPython**(uv 是我们的可装物,CPython 由 uv 下载)。
+/// 定义在 `proto`(默认 feature、只依赖 serde)是因为它要在线上协议里出现;`runtime::managed` 里 `pub use` 它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRuntime {
+    Node,
+    Python,
+}
+
 /// 一个外部运行时的可用性(分层:没装 / 装了但当前不可用 / 可用)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "availability", rename_all = "snake_case")]
@@ -243,6 +254,20 @@ mod tests {
             .is_err(),
             "未知类别被拒绝"
         );
+    }
+
+    #[test]
+    fn managed_runtimes_round_trip_with_a_stable_snake_case_tag() {
+        assert_eq!(
+            serde_json::to_value(ManagedRuntime::Node).unwrap(),
+            json!("node")
+        );
+        assert_eq!(
+            serde_json::to_value(ManagedRuntime::Python).unwrap(),
+            json!("python")
+        );
+        assert_eq!(round_trip(&ManagedRuntime::Node), json!("node"), "往返");
+        assert_eq!(round_trip(&ManagedRuntime::Python), json!("python"));
     }
 
     #[test]

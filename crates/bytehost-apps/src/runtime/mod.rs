@@ -4,6 +4,9 @@
 mod probe;
 mod resolve;
 
+#[cfg(unix)]
+pub mod managed;
+
 pub use probe::{
     CommandError, CommandOutput, CommandRunner, RuntimeAvailability, SystemRunner, probe_all,
     probe_docker, probe_node, probe_python,
