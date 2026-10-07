@@ -345,6 +345,18 @@ mod tests {
 
     const HOST: Version = Version::new(0, 1, 0);
 
+    /// 随仓库提供的 Excalidraw 打包清单(`scripts/bytehost/excalidraw/manifest.toml`)必须能被真实解析器接受
+    /// (含 `deny_unknown_fields`),并且申请的权限全部取最严——Excalidraw 不联网、不需要宿主数据目录。
+    #[cfg(feature = "manifest-toml")]
+    #[test]
+    fn the_shipped_excalidraw_manifest_parses_and_asks_for_nothing() {
+        let text = include_str!("../../../scripts/bytehost/excalidraw/manifest.toml");
+        let m = Manifest::from_toml(text, &HOST).expect("清单应通过校验");
+        assert_eq!(m.id.as_str(), "excalidraw");
+        assert_eq!(m.permissions, Permissions::default(), "所有权限都应是最严");
+        assert!(matches!(m.runtime, Runtime::StaticWeb { ref source } if source == "web/"));
+    }
+
     fn valid() -> Manifest {
         Manifest {
             schema_version: 1,
