@@ -15,6 +15,8 @@ pub mod event;
 pub mod gateway;
 pub mod id;
 #[cfg(feature = "server")]
+pub mod launch;
+#[cfg(feature = "server")]
 pub mod manager;
 pub mod manifest;
 pub mod permissions;
