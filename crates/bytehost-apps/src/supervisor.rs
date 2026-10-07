@@ -54,6 +54,8 @@ pub struct Launch {
     pub cwd: PathBuf,
     /// 已带好重建过的 `PATH` 与 npm/uv 缓存目录变量;端口变量由监管线程每次启动时补上。
     pub parent_env: Vec<(OsString, OsString)>,
+    /// 宿主显式追加的环境变量(不经白名单,见 `EnvSpec::extra`)。
+    pub extra_env: Vec<(OsString, OsString)>,
     pub port_env: String,
     pub data_dir: PathBuf,
     pub health_path: String,
@@ -240,6 +242,7 @@ fn app_env(launch: &Launch, port: u16) -> Vec<(OsString, OsString)> {
             port,
             port_env: &launch.port_env,
             data_dir: &launch.data_dir,
+            extra: &launch.extra_env,
         },
     )
 }
@@ -321,6 +324,7 @@ mod tests {
             install: None,
             cwd: dir.to_path_buf(),
             parent_env: std::env::vars_os().collect(),
+            extra_env: Vec::new(),
             port_env: "APP_PORT".into(),
             data_dir: dir.join("data"),
             health_path: "/".into(),
@@ -332,6 +336,26 @@ mod tests {
             policy: FAST_POLICY,
             grace: Duration::from_secs(1),
         }
+    }
+
+    /// 宿主追加的变量(缓存目录)真的进了子进程;而继承来的同类变量不会。
+    #[test]
+    fn extra_env_reaches_the_child_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("seen.txt");
+        let mut l = launch(
+            dir.path(),
+            &format!("echo \"$npm_config_cache\" > {}; exit 0", out.display()),
+        );
+        l.extra_env = vec![("npm_config_cache".into(), "/apps/x/cache/npm".into())];
+        l.parent_env
+            .push(("npm_config_cache".into(), "/home/u/.npm".into()));
+        let rec = Arc::new(Rec::default());
+        run(l, Arc::new(AtomicBool::new(false)), rec.clone());
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap().trim(),
+            "/apps/x/cache/npm"
+        );
     }
 
     fn have_python3() -> bool {

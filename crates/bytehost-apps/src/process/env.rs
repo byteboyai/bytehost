@@ -79,6 +79,9 @@ pub struct EnvSpec<'a> {
     pub port_env: &'a str,
     /// 应用自己的 `data/` 目录(绝对路径)。
     pub data_dir: &'a Path,
+    /// 宿主**显式**追加的变量(如应用私有的 `npm_config_cache`/`UV_CACHE_DIR`)。它们不经过父环境白名单——
+    /// 白名单只管"从 dozerd 继承什么",宿主自己给的东西不该被它挡掉。排在白名单变量之后、`BYTEHOST_*` 之前。
+    pub extra: &'a [(OsString, OsString)],
 }
 
 /// 组装子进程环境:父环境里的白名单变量 + 宿主给的 `BYTEHOST_APP_ID`/`BYTEHOST_DATA_DIR`/`BYTEHOST_HOST` + 端口变量。
@@ -94,6 +97,7 @@ where
             PASS_EXACT.contains(&k.as_ref()) || PASS_PREFIX.iter().any(|p| k.starts_with(p))
         })
         .collect();
+    out.extend(spec.extra.iter().cloned());
     let mut set = |k: &str, v: &OsStr| out.push((OsString::from(k), v.to_owned()));
     set("BYTEHOST_APP_ID", OsStr::new(spec.app_id.as_str()));
     set("BYTEHOST_DATA_DIR", spec.data_dir.as_os_str());
@@ -133,6 +137,7 @@ mod tests {
                 port: 24001,
                 port_env: "PORT",
                 data_dir: &data,
+                extra: &[],
             },
         );
         let keys: Vec<String> = env
@@ -162,6 +167,36 @@ mod tests {
     }
 
     #[test]
+    fn host_supplied_extras_reach_the_child_but_inherited_lookalikes_do_not() {
+        let id = AppId::new("demo").unwrap();
+        let data = PathBuf::from("/apps/demo/data");
+        let extra = [(os("npm_config_cache"), os("/apps/demo/cache/npm"))];
+        let env = build_env(
+            [
+                (os("npm_config_cache"), os("/home/u/.npm")),
+                (os("UV_CACHE_DIR"), os("/home/u/.cache/uv")),
+            ],
+            &EnvSpec {
+                app_id: &id,
+                port: 1,
+                port_env: "PORT",
+                data_dir: &data,
+                extra: &extra,
+            },
+        );
+        let all: Vec<_> = env
+            .iter()
+            .filter(|(k, _)| k == "npm_config_cache")
+            .collect();
+        assert_eq!(all.len(), 1, "继承来的同名变量不放行,只有宿主给的那个");
+        assert_eq!(all[0].1, os("/apps/demo/cache/npm"));
+        assert!(
+            !env.iter().any(|(k, _)| k == "UV_CACHE_DIR"),
+            "没给的就不该出现"
+        );
+    }
+
+    #[test]
     fn the_host_variables_carry_the_right_values_and_win_over_the_parent() {
         let id = AppId::new("demo").unwrap();
         let data = PathBuf::from("/apps/demo/data");
@@ -173,6 +208,7 @@ mod tests {
                 port: 31337,
                 port_env: "APP_PORT",
                 data_dir: &data,
+                extra: &[],
             },
         );
         let get = |k: &str| {

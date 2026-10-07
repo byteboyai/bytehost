@@ -298,6 +298,46 @@ fn read_package(dir: &Path, host_version: &Version) -> Result<Package, ManagerEr
     })
 }
 
+/// "依赖已装好"的标记文件:按 lockfile **内容**的 sha256 命名,换了 lockfile 的新版本必须重新装。
+/// `start_process_locked` 与测试共用这一处,避免两边各算一份。
+fn deps_marker(cache_dir: &Path, lockfile: Option<&[u8]>) -> PathBuf {
+    match lockfile {
+        Some(bytes) => cache_dir.join(format!("deps-{}.ok", sha256_hex(bytes))),
+        None => cache_dir.join("deps-none.ok"),
+    }
+}
+
+/// 子进程 `PATH`:各解析结果的目录(去重、保持顺序)+ `/usr/bin:/bin` 兜底。
+/// 主命令与依赖安装命令的目录都要在:`npm` 与 `node` 可能不在同一处。
+fn child_path(resolved: &[&Resolved]) -> OsString {
+    let mut seen: Vec<&Path> = Vec::new();
+    let mut path = OsString::new();
+    for d in resolved.iter().flat_map(|r| r.path_dirs.iter()) {
+        if !seen.contains(&d.as_path()) {
+            seen.push(d.as_path());
+            path.push(d);
+            path.push(":");
+        }
+    }
+    path.push("/usr/bin:/bin");
+    path
+}
+
+/// 宿主给子进程的额外变量:npm/uv 的缓存指向应用私有的 `cache/`,不写用户主目录。
+/// 走 `EnvSpec::extra`(不经父环境白名单)。
+fn cache_env(cache_dir: &Path) -> Vec<(OsString, OsString)> {
+    vec![
+        (
+            OsString::from("npm_config_cache"),
+            cache_dir.join("npm").into_os_string(),
+        ),
+        (
+            OsString::from("UV_CACHE_DIR"),
+            cache_dir.join("uv").into_os_string(),
+        ),
+    ]
+}
+
 /// 校验一个 runtime 是否受支持:`StaticWeb`/`Node`/`Python` 通过(进程型还要过 `check_process_runtime`),
 /// `Container` 明确拒绝。返回 `Ok(())` 或可直接映射成 `ManagerError` 的错误。
 fn check_supported(runtime: &Runtime, package_dir: &Path) -> Result<(), ManagerError> {
@@ -808,16 +848,15 @@ impl Core {
 
         let mut argv = argv;
         argv[0] = resolved.program.to_string_lossy().into_owned();
-        let install = match (install_argv(&manifest.runtime), install_resolved) {
+        let install = match (install_argv(&manifest.runtime), install_resolved.as_ref()) {
             (Some(mut inst_argv), Some(inst_resolved)) => {
                 inst_argv[0] = inst_resolved.program.to_string_lossy().into_owned();
-                // 装好依赖的标记按 lockfile 的 sha256 命名:换了 lockfile 的新版本必须重新装
-                let marker = match lockfile_of(&manifest.runtime) {
-                    Some(lf) => {
-                        cache_dir.join(format!("deps-{}.ok", self.lockfile_digest(package_dir, lf)))
-                    }
-                    None => cache_dir.join("deps-none.ok"),
-                };
+                let marker = deps_marker(
+                    &cache_dir,
+                    lockfile_of(&manifest.runtime)
+                        .map(|lf| fs::read(package_dir.join(lf)).unwrap_or_default())
+                        .as_deref(),
+                );
                 Some(crate::supervisor::Install {
                     argv: inst_argv,
                     marker,
@@ -827,13 +866,19 @@ impl Core {
             _ => None,
         };
 
-        let parent_env = self.child_parent_env(&resolved, &cache_dir);
+        let path_sources: Vec<&Resolved> = std::iter::once(&resolved)
+            .chain(install_resolved.as_ref())
+            .collect();
+        let mut parent_env: Vec<(OsString, OsString)> =
+            std::env::vars_os().filter(|(k, _)| k != "PATH").collect();
+        parent_env.push((OsString::from("PATH"), child_path(&path_sources)));
         let launch = Launch {
             app_id: id.clone(),
             argv,
             install,
             cwd: package_dir.to_path_buf(),
             parent_env,
+            extra_env: cache_env(&cache_dir),
             port_env,
             data_dir,
             health_path: manifest.health.path.clone(),
@@ -907,35 +952,6 @@ impl Core {
             reason: RuntimeReason::NotInstalled { runtime },
         });
         Err(err)
-    }
-
-    /// 读 lockfile 内容算 sha256(用来给"依赖已装好"的标记命名:换了 lockfile 必须重装)。
-    fn lockfile_digest(&self, package_dir: &Path, lockfile: &str) -> String {
-        let bytes = fs::read(package_dir.join(lockfile)).unwrap_or_default();
-        sha256_hex(&bytes)
-    }
-
-    /// 给子进程的父环境:沿用宿主环境,但**去掉继承来的 `PATH`**,换成解析器给出的 `path_dirs`
-    /// (`/usr/bin:/bin` 兜底);并指向应用私有的 npm/uv 缓存目录。
-    fn child_parent_env(&self, resolved: &Resolved, cache_dir: &Path) -> Vec<(OsString, OsString)> {
-        let mut vars: Vec<(OsString, OsString)> =
-            std::env::vars_os().filter(|(k, _)| k != "PATH").collect();
-        let mut path = OsString::new();
-        for d in &resolved.path_dirs {
-            path.push(d);
-            path.push(":");
-        }
-        path.push("/usr/bin:/bin");
-        vars.push((OsString::from("PATH"), path));
-        vars.push((
-            OsString::from("npm_config_cache"),
-            cache_dir.join("npm").into_os_string(),
-        ));
-        vars.push((
-            OsString::from("UV_CACHE_DIR"),
-            cache_dir.join("uv").into_os_string(),
-        ));
-        vars
     }
 
     /// 取消并取出(已结束的)监管线程句柄。不 `join`——调用方按上下文决定。
@@ -2575,30 +2591,57 @@ source = "web/"
 
     #[cfg(unix)]
     #[test]
-    fn changing_the_lockfile_changes_the_dependency_marker() {
-        // 重型 e2e(假 npm/node)略;这里钉住关键不变量:标记名随 lockfile 内容变化。
-        let tmp = tempfile::tempdir().unwrap();
-        let gateway = Arc::new(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(Gateway::start(GatewayConfig { port: 0 }))
-                .unwrap(),
+    fn the_dependency_marker_follows_the_lockfile_content() {
+        let cache = Path::new("/apps/x/cache");
+        let one = deps_marker(cache, Some(b"one"));
+        assert_ne!(
+            one,
+            deps_marker(cache, Some(b"two")),
+            "换了 lockfile 必须重装"
         );
-        let manager = AppManager::new(tmp.path().join("bytehost"), HOST, gateway).unwrap();
-        let dir = tmp.path().join("pkg");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("package-lock.json"), b"one").unwrap();
-        let m1 = manager.lockfile_digest(&dir, "package-lock.json");
-        fs::write(dir.join("package-lock.json"), b"two").unwrap();
-        let m2 = manager.lockfile_digest(&dir, "package-lock.json");
-        assert_ne!(m1, m2);
-        // 标记路径确实由这个摘要派生(与 start_process_locked 里一致)
-        let cache = manager.registry.paths().cache_dir(&id("x"));
-        assert!(
-            cache
-                .join(format!("deps-{m1}.ok"))
-                .to_string_lossy()
-                .contains(&m1)
+        assert_eq!(one, deps_marker(cache, Some(b"one")), "同一份内容标记不变");
+        assert!(one.starts_with(cache));
+        assert_eq!(deps_marker(cache, None), cache.join("deps-none.ok"));
+    }
+
+    #[test]
+    fn the_child_path_lists_every_resolved_dir_once_and_keeps_the_system_fallback() {
+        let r = |d: &str| Resolved {
+            program: PathBuf::from(d).join("x"),
+            path_dirs: vec![PathBuf::from(d)],
+        };
+        let (node, npm, node2) = (r("/opt/node/bin"), r("/opt/npm/bin"), r("/opt/node/bin"));
+        assert_eq!(
+            child_path(&[&node, &npm, &node2]),
+            OsString::from("/opt/node/bin:/opt/npm/bin:/usr/bin:/bin")
+        );
+        assert_eq!(child_path(&[]), OsString::from("/usr/bin:/bin"));
+    }
+
+    /// 宿主给的缓存目录变量必须真的穿过 `build_env` 的白名单到达子进程。
+    #[test]
+    fn the_private_cache_variables_survive_the_child_environment_filter() {
+        let id = id("x");
+        let cache = Path::new("/apps/x/cache");
+        let extra = cache_env(cache);
+        let env = crate::process::env::build_env(
+            std::env::vars_os(),
+            &crate::process::env::EnvSpec {
+                app_id: &id,
+                port: 1,
+                port_env: "PORT",
+                data_dir: Path::new("/apps/x/data"),
+                extra: &extra,
+            },
+        );
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(
+            get("npm_config_cache"),
+            Some(OsString::from("/apps/x/cache/npm"))
+        );
+        assert_eq!(
+            get("UV_CACHE_DIR"),
+            Some(OsString::from("/apps/x/cache/uv"))
         );
     }
 }

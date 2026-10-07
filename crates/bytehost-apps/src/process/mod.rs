@@ -46,6 +46,7 @@ mod e2e {
                 port,
                 port_env: "APP_PORT",
                 data_dir: &data,
+                extra: &[],
             },
         );
         // 子进程要找得到 python3:父 PATH 已在白名单里。
