@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::log::{RotatingLog, pump};
+use super::log::{RotatingLog, pump, shared};
 
 /// `stop` 等日志泵线程收尾的最长时间。
 const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -37,6 +37,8 @@ pub struct Running {
     child: Child,
     pgid: i32,
     started: Instant,
+    /// 领头进程的退出状态与被发现退出的时刻;`Some` 之后进程已被收走(pid 可能被复用),**绝不能再对这个进程组发信号**。
+    exit: Option<(ExitStatus, Instant)>,
     pumps: Vec<JoinHandle<()>>,
 }
 
@@ -54,12 +56,42 @@ fn signal_group(pgid: i32, sig: i32) -> io::Result<()> {
     }
 }
 
+/// 不收尸地查看领头进程是否已退出(`waitid(WNOWAIT)`:僵尸留着,pid 仍被保留)。
+fn leader_has_exited(pid: u32) -> io::Result<bool> {
+    // SAFETY: `siginfo_t` 是纯数据,全零是合法的初始值;`waitid` 只写它。
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // WNOHANG 且没有状态变化时 `si_pid` 保持 0。
+    #[cfg(target_os = "macos")]
+    let reported = info.si_pid;
+    #[cfg(not(target_os = "macos"))]
+    // SAFETY: waitid 成功返回后 siginfo 的 `si_pid` 有效。
+    let reported = unsafe { info.si_pid() };
+    Ok(reported != 0)
+}
+
 impl Running {
     pub fn spawn(spec: &ProcessSpec) -> io::Result<Self> {
         let (program, args) = spec
             .argv
             .split_first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "argv 为空"))?;
+        // 先开日志再起进程:日志打不开时不能留下一个没人管的子进程。两个泵共用这一份。
+        let log = shared(RotatingLog::open(
+            &spec.log_path,
+            spec.log_max_bytes,
+            spec.log_keep,
+        )?);
         let mut child = Command::new(program)
             .args(args)
             .current_dir(&spec.cwd)
@@ -85,13 +117,13 @@ impl Running {
         .into_iter()
         .flatten()
         {
-            let log = RotatingLog::open(&spec.log_path, spec.log_max_bytes, spec.log_keep)?;
-            pumps.push(pump(reader, log));
+            pumps.push(pump(reader, log.clone()));
         }
         Ok(Self {
             child,
             pgid,
             started: Instant::now(),
+            exit: None,
             pumps,
         })
     }
@@ -100,20 +132,32 @@ impl Running {
         self.child.id()
     }
 
+    /// 运行了多久;进程退出后定格在"被发现退出"的那一刻(不然晚发现的崩溃循环会被当成稳定运行)。
     pub fn ran_for(&self) -> Duration {
-        self.started.elapsed()
+        match &self.exit {
+            Some((_, at)) => at.saturating_duration_since(self.started),
+            None => self.started.elapsed(),
+        }
     }
 
-    /// 进程已经退出就返回它的状态(不阻塞)。
+    /// 进程已经退出就返回它的状态(不阻塞)。发现退出的同时**先**对整组补一刀 `SIGKILL`、**后**收走领头进程:
+    /// 领头进程是僵尸时它的 pid(也就是 pgid)仍被系统保留,此时发信号不可能打到被复用了这个号的无关进程组。
     pub fn try_exit(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        if let Some((s, _)) = &self.exit {
+            return Ok(Some(*s));
+        }
+        if !leader_has_exited(self.child.id())? {
+            return Ok(None);
+        }
+        let _ = signal_group(self.pgid, libc::SIGKILL);
+        let status = self.child.wait()?;
+        self.exit = Some((status, Instant::now()));
+        Ok(Some(status))
     }
 
     /// 优雅停止整个进程组:`SIGTERM`,最多等 `grace`,还没退就 `SIGKILL`。返回领头进程的退出状态。
     pub fn stop(&mut self, grace: Duration) -> io::Result<ExitStatus> {
-        if let Some(status) = self.child.try_wait()? {
-            // 领头进程已退,但它的孙进程可能还在:仍对整组补一刀。
-            let _ = signal_group(self.pgid, libc::SIGKILL);
+        if let Some(status) = self.try_exit()? {
             self.join_pumps();
             return Ok(status);
         }
@@ -124,7 +168,7 @@ impl Running {
         }
         let deadline = Instant::now() + grace;
         let status = loop {
-            if let Some(s) = self.child.try_wait()? {
+            if let Some(s) = self.try_exit()? {
                 break s;
             }
             if Instant::now() >= deadline {
@@ -136,12 +180,12 @@ impl Running {
                     }
                     Err(e) => return Err(e),
                 }
-                break self.child.wait()?;
+                let status = self.child.wait()?;
+                self.exit = Some((status, Instant::now()));
+                break status;
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        // 领头进程退了,整组里残留的(忽略 SIGTERM 的孙进程)也收掉。
-        let _ = signal_group(self.pgid, libc::SIGKILL);
         self.join_pumps();
         Ok(status)
     }
@@ -164,8 +208,10 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         // 被丢掉时不留子进程(例如 manager 出错路径上忘了 stop)。
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = signal_group(self.pgid, libc::SIGKILL);
+        if self.exit.is_none() {
+            if signal_group(self.pgid, libc::SIGKILL).is_err() {
+                let _ = self.child.kill();
+            }
             let _ = self.child.wait();
         }
     }
@@ -185,6 +231,19 @@ pub fn pick_free_port() -> io::Result<u16> {
 pub struct RunRecord {
     pub pid: u32,
     pub argv: Vec<String>,
+    /// 进程启动时刻(`ps -o lstart=` 的原文)。pid 会被复用、命令行又可能恰好相同(`node server.js`),
+    /// 启动时刻才能把"当初那个进程"和"后来复用了这个号的进程"区分开。旧记录没有这一项,只比命令行。
+    #[serde(default)]
+    pub lstart: Option<String>,
+}
+
+/// 为刚启动的进程做一条记录(取它此刻的启动时刻)。
+pub fn record_for(pid: u32, argv: Vec<String>) -> RunRecord {
+    RunRecord {
+        pid,
+        argv,
+        lstart: ps_field("lstart=", pid),
+    }
 }
 
 fn record_path(run_dir: &Path) -> PathBuf {
@@ -214,8 +273,12 @@ pub enum Reaped {
 
 /// 读进程 `pid` 的完整命令行(`ps -ww -o command= -p`);进程不存在返回 `None`。
 fn command_line(pid: u32) -> Option<String> {
+    ps_field("command=", pid)
+}
+
+fn ps_field(field: &str, pid: u32) -> Option<String> {
     let out = Command::new("ps")
-        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+        .args(["-ww", "-o", field, "-p", &pid.to_string()])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -245,12 +308,23 @@ pub fn reap_orphan(run_dir: &Path, grace: Duration) -> io::Result<Reaped> {
             return Ok(Reaped::Stale);
         }
     };
-    let alive = command_line(record.pid).filter(|c| command_matches(c, &record.argv));
-    let Some(_) = alive else {
+    // pid ≤ 1 或超出 i32 时 `kill(-pid)` 会变成"给所有进程发信号"或负数组号:绝不放行。
+    let Some(pgid) = i32::try_from(record.pid).ok().filter(|p| *p > 1) else {
         clear_record(run_dir);
         return Ok(Reaped::Stale);
     };
-    let pgid = record.pid as i32;
+    // 身份核对:命令行一致 + (有记录时)启动时刻一致 + 它确实是自己进程组的组长(否则 killpg 会误伤整组)。
+    let same_start = record
+        .lstart
+        .as_ref()
+        .is_none_or(|l| ps_field("lstart=", record.pid).as_deref() == Some(l.as_str()));
+    // SAFETY: `getpgid` 只读查询;进程不存在时返回 -1,不会等于 pgid。
+    let leads_group = unsafe { libc::getpgid(pgid) } == pgid;
+    let alive = command_line(record.pid).filter(|c| command_matches(c, &record.argv));
+    if alive.is_none() || !same_start || !leads_group {
+        clear_record(run_dir);
+        return Ok(Reaped::Stale);
+    }
     let _ = signal_group(pgid, libc::SIGTERM);
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline && command_line(record.pid).is_some() {
@@ -443,7 +517,15 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        write_record(dir.path(), &RunRecord { pid, argv }).unwrap();
+        write_record(
+            dir.path(),
+            &RunRecord {
+                pid,
+                argv,
+                lstart: None,
+            },
+        )
+        .unwrap();
         let mut child = child;
         assert_eq!(
             reap_orphan(dir.path(), Duration::from_secs(1)).unwrap(),
@@ -469,6 +551,7 @@ mod tests {
             &RunRecord {
                 pid,
                 argv: vec!["node".into(), "server.js".into()],
+                lstart: None,
             },
         )
         .unwrap();
@@ -498,6 +581,7 @@ mod tests {
             &RunRecord {
                 pid,
                 argv: vec!["true".into()],
+                lstart: None,
             },
         )
         .unwrap();
@@ -511,6 +595,142 @@ mod tests {
             Reaped::Stale
         );
         assert!(!record_path(dir.path()).exists());
+    }
+
+    /// I1:stdout 与 stderr 共用一份轮转日志;stdout 刷屏轮转多次后,稍后的 stderr(崩溃栈)仍要落进日志文件。
+    #[test]
+    fn stderr_written_after_heavy_stdout_rotation_is_still_in_the_log_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = spec(
+            dir.path(),
+            "i=0; while [ $i -lt 40 ]; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; i=$((i+1)); sleep 0.01; done; sleep 0.4; echo FINAL-ERR 1>&2",
+        );
+        s.log_max_bytes = 300;
+        s.log_keep = 2;
+        let mut r = Running::spawn(&s).unwrap();
+        wait_until("退出", || r.try_exit().unwrap().is_some());
+        r.stop(Duration::from_secs(1)).unwrap();
+        let all: String = ["app.log", "app.log.1", "app.log.2"]
+            .iter()
+            .filter_map(|n| std::fs::read_to_string(dir.path().join("logs").join(n)).ok())
+            .collect();
+        assert!(all.contains("FINAL-ERR"), "stderr 丢了: {all}");
+        let total: u64 = ["app.log", "app.log.1", "app.log.2"]
+            .iter()
+            .filter_map(|n| std::fs::metadata(dir.path().join("logs").join(n)).ok())
+            .map(|m| m.len())
+            .sum();
+        assert!(total <= 300 * 3 + 3 * 80, "总量超出上限: {total}");
+    }
+
+    /// I2:日志打不开时 `spawn` 报错,而且**不能**已经把子进程放跑了。
+    #[test]
+    fn a_log_that_cannot_be_opened_fails_before_any_child_is_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let mut s = spec(dir.path(), &format!("touch {}; sleep 30", marker.display()));
+        std::fs::write(dir.path().join("blocker"), "x").unwrap();
+        s.log_path = dir.path().join("blocker/app.log"); // 父路径是个普通文件
+        assert!(Running::spawn(&s).is_err());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!marker.exists(), "子进程不该被启动");
+    }
+
+    /// I3:领头进程一退(被 `try_exit` 发现),整组残留进程立刻被收掉——此后再无需、也不会对这个进程组发信号。
+    #[test]
+    fn noticing_the_leader_exit_sweeps_the_group_before_the_pid_can_be_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("gc.pid");
+        let script = format!("sleep 300 & echo $! > {}; exit 0", pidfile.display());
+        let mut r = Running::spawn(&spec(dir.path(), &script)).unwrap();
+        wait_until("孙进程 pid 写出", || {
+            std::fs::read_to_string(&pidfile)
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false)
+        });
+        let gc: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_until("领头进程退出", || r.try_exit().unwrap().is_some());
+        wait_until("残留孙进程被收掉", || !alive(gc));
+    }
+
+    /// M3:`ran_for` 记的是**退出时**的运行时长,而不是"现在距启动多久"。
+    #[test]
+    fn ran_for_is_frozen_at_the_moment_the_exit_was_noticed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Running::spawn(&spec(dir.path(), "exit 1")).unwrap();
+        wait_until("退出", || r.try_exit().unwrap().is_some());
+        let at_exit = r.ran_for();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            r.ran_for() < at_exit + Duration::from_millis(100),
+            "退出后 ran_for 还在涨"
+        );
+    }
+
+    /// I4/M1:记录里的进程启动时间对不上(pid 被复用)、pid 不合法、或它不是进程组组长,一律只清记录、不杀。
+    #[test]
+    fn orphans_are_matched_by_start_time_and_never_by_a_bogus_or_non_leader_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1) 命令行对、启动时间对不上
+        let mut other = Command::new("sleep")
+            .arg("303")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut rec = record_for(other.id(), vec!["sleep".into(), "303".into()]);
+        rec.lstart = Some("Thu Jan  1 00:00:00 1970".into());
+        write_record(dir.path(), &rec).unwrap();
+        assert_eq!(
+            reap_orphan(dir.path(), Duration::from_millis(200)).unwrap(),
+            Reaped::Stale
+        );
+        assert!(alive(other.id() as i32), "启动时间对不上不能杀");
+        // 2) 启动时间对得上 → 杀
+        write_record(
+            dir.path(),
+            &record_for(other.id(), vec!["sleep".into(), "303".into()]),
+        )
+        .unwrap();
+        assert_eq!(
+            reap_orphan(dir.path(), Duration::from_secs(1)).unwrap(),
+            Reaped::Killed(other.id())
+        );
+        let _ = other.wait();
+        // 3) pid ≤ 1 / 超出 i32:绝不能走到 kill(-pid)
+        for bad in [0u32, 1, u32::MAX] {
+            write_record(
+                dir.path(),
+                &RunRecord {
+                    pid: bad,
+                    argv: vec!["/sbin/launchd".into()],
+                    lstart: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                reap_orphan(dir.path(), Duration::from_millis(100)).unwrap(),
+                Reaped::Stale,
+                "{bad}"
+            );
+        }
+        // 4) 不是进程组组长(和我们同组的子进程):killpg 会误伤整组,所以只清记录
+        let mut member = Command::new("sleep").arg("304").spawn().unwrap();
+        write_record(
+            dir.path(),
+            &record_for(member.id(), vec!["sleep".into(), "304".into()]),
+        )
+        .unwrap();
+        assert_eq!(
+            reap_orphan(dir.path(), Duration::from_millis(200)).unwrap(),
+            Reaped::Stale
+        );
+        assert!(alive(member.id() as i32));
+        member.kill().unwrap();
+        let _ = member.wait();
     }
 
     #[test]
