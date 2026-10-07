@@ -8,6 +8,7 @@
 //! 防 TOCTOU 的安装顺序(见 `digest` 模块文档):**先把包拷进 staging,对 staging 副本重新算摘要并
 //! `verify`,再改名落位**;`current_version` 在最后才写。
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use crate::plan::{
     ApprovedInstallPlan, InstallPlan, Installed, PlanInput, Provenance, TrustLevel, VerifyError,
 };
 use crate::registry::{AppRecord, RECORD_FORMAT_VERSION, Registry, UninstallMode, VersionRecord};
-use crate::runtime::enforcement_for;
+use crate::runtime::{RuntimeResolver, SystemResolver, enforcement_for};
 use crate::state::{
     Action, DesiredState, ObservedState, next_action, recover_after_supervisor_restart,
 };
@@ -109,7 +110,12 @@ impl From<ManifestError> for ManagerError {
     }
 }
 
-pub struct AppManager {
+/// `AppManager` 的共享状态:注册表、gateway、事件、单写者锁、关闭标志,以及解析器与在跑的监管线程登记表。
+/// 抽出来是为了让监管线程能持有 `Arc<Core>`(Task 5 的 `AppTransitions`),`AppManager` 本身经 `Deref` 直接用它。
+///
+/// 因为 `AppManager: Deref<Target = Core>`,这个类型必须 `pub`;它的字段仍是私有的,
+/// 内部方法(`guard`/`try_guard`/`*_locked` 等)为 `pub(crate)`。
+pub struct Core {
     registry: Registry,
     gateway: Arc<Gateway>,
     host_version: Version,
@@ -119,9 +125,33 @@ pub struct AppManager {
     /// `suspend_all` 之后置位、`reconcile` 清除:置位期间 `install`/`start` 在**拿到锁之后**被拒绝——
     /// 一个恰好排在锁后面的 `Start` 不能在撤站点之后又把站点注册回已停止的 gateway。
     closed: std::sync::atomic::AtomicBool,
+    /// 把解释器名解析成绝对路径(进程型应用)。
+    #[allow(dead_code)]
+    resolver: Arc<dyn RuntimeResolver>,
+    /// 每个应用当前那条监管线程(`cancel` 标志 + 句柄)。静态应用不登记。
+    #[allow(dead_code)]
+    supervisions: Mutex<HashMap<AppId, Supervision>>,
     /// (仅测试)`install` 里"拷贝与摘要计算已完成、即将拿锁"的次数,用来证明慢的部分在锁外。
     #[cfg(test)]
     prepared: std::sync::atomic::AtomicUsize,
+}
+
+/// 一条监管线程的取消标志与句柄。
+#[allow(dead_code)]
+pub(crate) struct Supervision {
+    pub(crate) cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) thread: Option<std::thread::JoinHandle<()>>,
+}
+
+pub struct AppManager {
+    core: Arc<Core>,
+}
+
+impl std::ops::Deref for AppManager {
+    type Target = Core;
+    fn deref(&self) -> &Core {
+        &self.core
+    }
 }
 
 /// 一个已读入并校验过的应用包。
@@ -201,21 +231,95 @@ impl AppManager {
         host_version: Version,
         gateway: Arc<Gateway>,
     ) -> io::Result<Self> {
+        Self::with_resolver(root, host_version, gateway, Arc::new(SystemResolver::new()))
+    }
+
+    pub fn with_resolver(
+        root: impl Into<PathBuf>,
+        host_version: Version,
+        gateway: Arc<Gateway>,
+        resolver: Arc<dyn RuntimeResolver>,
+    ) -> io::Result<Self> {
         let (events, _) = broadcast::channel(256);
         let registry = Registry::open(root)?;
         sweep_staging(&registry.paths().apps_dir());
         Ok(Self {
-            registry,
-            gateway,
-            host_version,
-            events,
-            lock: Mutex::new(()),
-            closed: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            prepared: std::sync::atomic::AtomicUsize::new(0),
+            core: Arc::new(Core {
+                registry,
+                gateway,
+                host_version,
+                events,
+                lock: Mutex::new(()),
+                closed: std::sync::atomic::AtomicBool::new(false),
+                resolver,
+                supervisions: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                prepared: std::sync::atomic::AtomicUsize::new(0),
+            }),
         })
     }
 
+    pub fn events(&self) -> broadcast::Receiver<AppEvent> {
+        self.events.subscribe()
+    }
+
+    /// 首次导航用的地址(带一次性换 Cookie 的令牌)。**秘密,不要写日志、不要广播。**
+    pub fn launch_url(&self, id: &AppId) -> String {
+        self.gateway.launch_url(id)
+    }
+}
+
+/// 公开 API 的转发层:实现都在 `Core` 上(`AppManager` 经 `Deref` 也能直接调到它们),
+/// 这几个方法在 crate 外(dozerd)使用,必须有公有的接收者类型,故在 `AppManager` 上再暴露一层。
+impl AppManager {
+    pub fn install_plan(
+        &self,
+        source: &AppSource,
+        provenance: Provenance,
+        trust: TrustLevel,
+    ) -> Result<InstallPlan, ManagerError> {
+        self.core.install_plan(source, provenance, trust)
+    }
+
+    pub fn install(
+        &self,
+        approved: &ApprovedInstallPlan,
+        source: &AppSource,
+        now_ms: u64,
+    ) -> Result<(), ManagerError> {
+        self.core.install(approved, source, now_ms)
+    }
+
+    pub fn start(&self, id: &AppId) -> Result<String, ManagerError> {
+        self.core.start(id)
+    }
+
+    pub fn stop(&self, id: &AppId) -> Result<(), ManagerError> {
+        self.core.stop(id)
+    }
+
+    pub fn uninstall(&self, id: &AppId, mode: UninstallMode) -> Result<(), ManagerError> {
+        self.core.uninstall(id, mode)
+    }
+
+    pub fn launch_url_if_running(&self, id: &AppId) -> Result<String, ManagerError> {
+        self.core.launch_url_if_running(id)
+    }
+
+    pub fn list(&self) -> Result<Vec<AppSummary>, ManagerError> {
+        self.core.list()
+    }
+
+    pub fn suspend_all(&self) -> ReconcileReport {
+        self.core.suspend_all()
+    }
+
+    pub fn reconcile(&self) -> ReconcileReport {
+        self.core.reconcile()
+    }
+}
+
+impl Core {
     /// 单写者锁。持锁线程 panic 会毒化它,但它保护的是 `()`(锁住的是"同一时刻只有一个改状态的操作",
     /// 没有需要保持的数据不变量),所以取回内部数据继续用,不能让此后每个加锁的调用都跟着 panic。
     fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -224,21 +328,25 @@ impl AppManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub fn events(&self) -> broadcast::Receiver<AppEvent> {
-        self.events.subscribe()
+    /// 非阻塞取锁(毒化时同样取回内部数据)。监管线程用它"拿锁 + 查取消"循环,绝不阻塞在锁上——
+    /// `stop_locked`/`suspend_all` 会持着锁 `join` 监管线程,线程若阻塞等锁就是死锁。
+    #[allow(dead_code)]
+    fn try_guard(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.lock.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     fn emit(&self, event: AppEvent) {
         // 没有订阅者时 send 会返回错误——不是问题
         let _ = self.events.send(event);
     }
+}
 
-    /// 首次导航用的地址(带一次性换 Cookie 的令牌)。**秘密,不要写日志、不要广播。**
-    pub fn launch_url(&self, id: &AppId) -> String {
-        self.gateway.launch_url(id)
-    }
-
-    pub fn install_plan(
+impl Core {
+    pub(crate) fn install_plan(
         &self,
         source: &AppSource,
         provenance: Provenance,
@@ -275,7 +383,7 @@ impl AppManager {
 
     /// 安装一份**已批准**的计划。**一切决定都只基于 staging 里的副本**:源目录只被"拷贝"这一个动作读取,
     /// 拷完之后它再怎么变都与本次安装无关;对 staging 副本重新计算并 `verify`,通过才落位。
-    pub fn install(
+    pub(crate) fn install(
         &self,
         approved: &ApprovedInstallPlan,
         source: &AppSource,
@@ -410,7 +518,7 @@ impl AppManager {
     }
 
     /// 启动:把应用的静态站点注册进 gateway。返回不含令牌的站点地址。
-    pub fn start(&self, id: &AppId) -> Result<String, ManagerError> {
+    pub(crate) fn start(&self, id: &AppId) -> Result<String, ManagerError> {
         let _guard = self.guard();
         self.start_locked(id)
     }
@@ -469,7 +577,7 @@ impl AppManager {
     }
 
     /// 停止(也用来把 `Failed` 复位成 `Stopped`)。对已经停止的应用是空操作。
-    pub fn stop(&self, id: &AppId) -> Result<(), ManagerError> {
+    pub(crate) fn stop(&self, id: &AppId) -> Result<(), ManagerError> {
         let _guard = self.guard();
         self.stop_locked(id)
     }
@@ -494,7 +602,7 @@ impl AppManager {
     }
 
     /// 卸载(不存在不算错误)。运行中先停。
-    pub fn uninstall(&self, id: &AppId, mode: UninstallMode) -> Result<(), ManagerError> {
+    pub(crate) fn uninstall(&self, id: &AppId, mode: UninstallMode) -> Result<(), ManagerError> {
         let _guard = self.guard();
         if self.registry.load(id)?.is_none() {
             self.registry.uninstall(id, mode)?;
@@ -511,7 +619,7 @@ impl AppManager {
 
     /// 带令牌的启动地址,**只给正在运行的应用**(没运行的应用打开只会是 404)。在锁内判断并构造,
     /// 不会出现"刚判断完它在运行、构造地址前它被停掉"的空档。**秘密:不要写日志、不要广播。**
-    pub fn launch_url_if_running(&self, id: &AppId) -> Result<String, ManagerError> {
+    pub(crate) fn launch_url_if_running(&self, id: &AppId) -> Result<String, ManagerError> {
         let _guard = self.guard();
         let record = self.load_record(id)?;
         match record.observed {
@@ -523,7 +631,7 @@ impl AppManager {
         }
     }
 
-    pub fn list(&self) -> Result<Vec<AppSummary>, ManagerError> {
+    pub(crate) fn list(&self) -> Result<Vec<AppSummary>, ManagerError> {
         let listing = self.registry.list()?;
         Ok(listing
             .apps
@@ -555,7 +663,7 @@ impl AppManager {
 
     /// supervisor 退出前调用:撤下所有站点,把运行中的应用的观察态落成 `Stopped`,但**保留 `desired`**——
     /// 下次启动时 `reconcile` 会按 `desired = Running` 把它们重新拉起("应用跟随 dozerd")。
-    pub fn suspend_all(&self) -> ReconcileReport {
+    pub(crate) fn suspend_all(&self) -> ReconcileReport {
         let _guard = self.guard();
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut report = ReconcileReport::default();
@@ -588,7 +696,7 @@ impl AppManager {
 
     /// supervisor 启动时调用:把持久化的观察态修正为现实(应用随 supervisor 一起停了),再按 `desired` 对账。
     /// 一个应用失败不影响其他应用;读不出来的记录(损坏的 `state.json`)单独报告,不会被悄悄忽略。
-    pub fn reconcile(&self) -> ReconcileReport {
+    pub(crate) fn reconcile(&self) -> ReconcileReport {
         let _guard = self.guard();
         // reconcile 代表 supervisor(重新)开始工作
         self.closed

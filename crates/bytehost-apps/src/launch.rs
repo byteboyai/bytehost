@@ -185,11 +185,7 @@ mod tests {
     #[test]
     fn install_commands_follow_the_lockfile() {
         assert_eq!(
-            install_argv(&node(
-                &["node", "a.js"],
-                Some("package-lock.json"),
-                "PORT"
-            )),
+            install_argv(&node(&["node", "a.js"], Some("package-lock.json"), "PORT")),
             Some(vec!["npm".into(), "ci".into()])
         );
         assert_eq!(
