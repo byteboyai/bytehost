@@ -8,10 +8,16 @@
 
 pub mod fetch;
 pub mod install;
+pub mod manager;
 pub mod pins;
+pub mod resolve;
 pub mod store;
 
 pub use fetch::{Archive, CurlFetcher, Fetcher, TarArchive};
 pub use install::{InstallError, Installer, Phase};
+pub use manager::{
+    DownloadItem, InstallPlanRt, Job, RealUvRunner, RtError, RuntimeManager, UvRunner,
+};
 pub use pins::{PYTHON_VERSION, Pin, Target, pin_for, pin_names_for};
+pub use resolve::{ChainResolver, ManagedResolver};
 pub use store::RuntimeStore;

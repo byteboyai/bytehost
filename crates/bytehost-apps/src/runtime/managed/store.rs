@@ -18,6 +18,7 @@ fn is_safe_segment(s: &str) -> bool {
 }
 
 /// 受管运行时的存储根(通常是 `<bytehost root>/runtimes`)。
+#[derive(Clone)]
 pub struct RuntimeStore {
     root: PathBuf,
 }
