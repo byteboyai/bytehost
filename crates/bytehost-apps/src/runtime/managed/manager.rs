@@ -10,44 +10,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::proto::ManagedRuntime;
+use crate::proto::{ManagedRuntime, RuntimeDownload, RuntimeInstallPlan, RuntimeJob};
 
 use super::fetch::{Archive, CurlFetcher, Fetcher, TarArchive};
 use super::install::{InstallError, Installer, Phase};
 use super::pins::{PYTHON_VERSION, Pin, Target};
 use super::store::RuntimeStore;
 
-/// 计划里的一个下载项。`sha256: None` 只出现在"由 uv 校验"的 Python 上。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DownloadItem {
-    pub what: String,
-    pub url: String,
-    pub sha256: Option<String>,
-    pub note: String,
-}
+/// 计划里的一个下载项(线上类型 [`RuntimeDownload`];`sha256: None` 只出现在由 uv 校验的 Python 上)。
+pub type DownloadItem = RuntimeDownload;
 
-/// 一份**可审阅的安装计划**;`start_install` 会重算并逐字段核对它。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallPlanRt {
-    pub runtime: ManagedRuntime,
-    /// `(name, version)` 列表(顺序即安装顺序)。
-    pub versions: Vec<(String, String)>,
-    pub downloads: Vec<DownloadItem>,
-    /// 安装根目录(如 `<root>/node/24.21.0`)。
-    pub dest: String,
-    pub will_do: Vec<String>,
-}
+/// 一份**可审阅的安装计划**(线上类型 [`RuntimeInstallPlan`]);`start_install` 会重算并逐字段核对它。
+pub type InstallPlanRt = RuntimeInstallPlan;
 
-/// 任务快照。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Job {
-    pub runtime: ManagedRuntime,
-    pub phase: String,
-    pub done: u64,
-    pub total: Option<u64>,
-    pub failed: Option<String>,
-    pub finished: bool,
-}
+/// 任务快照(线上类型 [`RuntimeJob`])。
+pub type Job = RuntimeJob;
 
 #[derive(Debug)]
 pub enum RtError {

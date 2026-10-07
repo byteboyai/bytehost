@@ -62,6 +62,46 @@ pub struct RuntimeProbe {
     pub runtime: String,
     #[serde(flatten)]
     pub availability: RuntimeAvailability,
+    /// 已装的**受管**版本(新→旧);老客户端没有这个字段,一律默认为空。
+    #[serde(default)]
+    pub managed: Vec<String>,
+    /// 此平台是否有固定版本可自动安装(node/python 为 true,docker 为 false)。
+    #[serde(default)]
+    pub installable: bool,
+    /// 该运行时当前的后台安装任务(有就带上)。
+    #[serde(default)]
+    pub job: Option<RuntimeJob>,
+}
+
+/// 安装计划里的一个下载项。`sha256: None` 只出现在"由 uv 校验"的 Python 上。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeDownload {
+    pub what: String,
+    pub url: String,
+    pub sha256: Option<String>,
+    pub note: String,
+}
+
+/// 一份**可审阅的安装计划**;批准后由服务端重算核对。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeInstallPlan {
+    pub runtime: ManagedRuntime,
+    /// `(name, version)` 列表(顺序即安装顺序)。
+    pub versions: Vec<(String, String)>,
+    pub downloads: Vec<RuntimeDownload>,
+    pub dest: String,
+    pub will_do: Vec<String>,
+}
+
+/// 一次运行时安装任务的快照。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeJob {
+    pub runtime: ManagedRuntime,
+    pub phase: String,
+    pub done: u64,
+    pub total: Option<u64>,
+    pub failed: Option<String>,
+    pub finished: bool,
 }
 
 /// 失败的类别——GUI 据此决定怎么呈现(不可用走提示页,被拒绝走审批界面,冲突/不存在走 Toast……),
@@ -139,6 +179,19 @@ pub enum AppRequest {
     },
     /// 探测 docker/node/python 的可用性(Settings 展示用)。
     ProbeRuntimes,
+    /// 出一份运行时的安装计划(不下载任何东西)。
+    RuntimePlan {
+        runtime: ManagedRuntime,
+    },
+    /// 安装一份**已批准**的运行时计划;服务端会重算并逐字段核对,不一致即拒绝且不下载。
+    InstallRuntime {
+        plan: Box<RuntimeInstallPlan>,
+    },
+    /// 卸载某个受管运行时版本。
+    UninstallRuntime {
+        runtime: ManagedRuntime,
+        version: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -161,6 +214,10 @@ pub enum AppReply {
     },
     Runtimes {
         runtimes: Vec<RuntimeProbe>,
+    },
+    /// 一份运行时安装计划。
+    RuntimePlan {
+        plan: Box<RuntimeInstallPlan>,
     },
     /// 请求失败(带类别)。
     Failed {
@@ -310,21 +367,97 @@ mod tests {
                     availability: RuntimeAvailability::Unavailable {
                         detail: "Colima 没启动".into(),
                     },
+                    managed: Vec::new(),
+                    installable: false,
+                    job: None,
                 },
                 RuntimeProbe {
                     runtime: "node".into(),
                     availability: RuntimeAvailability::NotInstalled,
+                    managed: Vec::new(),
+                    installable: true,
+                    job: None,
                 },
             ],
         };
         let json = round_trip(&runtimes);
         assert_eq!(
             json["runtimes"][0],
-            json!({"runtime": "docker", "availability": "unavailable", "detail": "Colima 没启动"})
+            json!({"runtime": "docker", "availability": "unavailable", "detail": "Colima 没启动", "managed": [], "installable": false, "job": null})
         );
         assert_eq!(
             json["runtimes"][1],
-            json!({"runtime": "node", "availability": "not_installed"})
+            json!({"runtime": "node", "availability": "not_installed", "managed": [], "installable": true, "job": null})
         );
+    }
+
+    #[test]
+    fn runtime_install_requests_and_replies_round_trip() {
+        let plan = RuntimeInstallPlan {
+            runtime: ManagedRuntime::Node,
+            versions: vec![("node".into(), "24.21.0".into())],
+            downloads: vec![RuntimeDownload {
+                what: "Node 24.21.0".into(),
+                url: "https://nodejs.org/x.tar.gz".into(),
+                sha256: Some("a".repeat(64)),
+                note: "官方".into(),
+            }],
+            dest: "/r/node/24.21.0".into(),
+            will_do: vec!["下载并校验 SHA-256".into()],
+        };
+        assert_eq!(
+            round_trip(&AppRequest::RuntimePlan {
+                runtime: ManagedRuntime::Python
+            }),
+            json!({"op": "runtime_plan", "runtime": "python"})
+        );
+        assert_eq!(
+            round_trip(&AppRequest::UninstallRuntime {
+                runtime: ManagedRuntime::Node,
+                version: "24.21.0".into()
+            }),
+            json!({"op": "uninstall_runtime", "runtime": "node", "version": "24.21.0"})
+        );
+        let req = AppRequest::InstallRuntime {
+            plan: Box::new(plan.clone()),
+        };
+        let json = round_trip(&req);
+        assert_eq!(json["op"], "install_runtime");
+        assert_eq!(json["plan"]["runtime"], "node");
+        assert_eq!(json["plan"]["downloads"][0]["sha256"], "a".repeat(64));
+        round_trip(&AppReply::RuntimePlan {
+            plan: Box::new(plan),
+        });
+    }
+
+    #[test]
+    fn runtime_probe_with_managed_installable_and_job_round_trips() {
+        let probe = RuntimeProbe {
+            runtime: "python".into(),
+            availability: RuntimeAvailability::NotInstalled,
+            managed: vec!["cpython-3.13.0".into()],
+            installable: true,
+            job: Some(RuntimeJob {
+                runtime: ManagedRuntime::Python,
+                phase: "downloading".into(),
+                done: 10,
+                total: Some(100),
+                failed: None,
+                finished: false,
+            }),
+        };
+        let json = round_trip(&probe);
+        assert_eq!(json["managed"][0], "cpython-3.13.0");
+        assert_eq!(json["installable"], true);
+        assert_eq!(json["job"]["phase"], "downloading");
+    }
+
+    #[test]
+    fn an_old_runtime_probe_without_the_new_fields_still_parses() {
+        let old = json!({"runtime": "node", "availability": "not_installed"});
+        let probe: RuntimeProbe = serde_json::from_value(old).unwrap();
+        assert!(probe.managed.is_empty());
+        assert!(!probe.installable);
+        assert!(probe.job.is_none());
     }
 }
