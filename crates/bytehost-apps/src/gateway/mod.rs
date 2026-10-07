@@ -16,6 +16,7 @@ mod static_files;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -66,6 +67,10 @@ pub struct Limits {
     pub header_read_timeout: std::time::Duration,
     /// 同时处理的连接数上限;超出的连接被立即丢弃。
     pub max_connections: usize,
+    /// 反向代理:连应用的回环端口最多等多久(超时 502)。
+    pub upstream_connect_timeout: std::time::Duration,
+    /// 反向代理:连上之后等应用给出**响应头**最多多久(超时 504);响应正文开始流动之后不再有总超时(SSE/长轮询)。
+    pub upstream_header_timeout: std::time::Duration,
 }
 
 impl Default for Limits {
@@ -73,6 +78,8 @@ impl Default for Limits {
         Self {
             header_read_timeout: std::time::Duration::from_secs(10),
             max_connections: 128,
+            upstream_connect_timeout: std::time::Duration::from_secs(3),
+            upstream_header_timeout: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -94,9 +101,23 @@ struct State {
     port: u16,
     token: String,
     sites: RwLock<HashMap<String, Site>>,
+    /// 进程型应用:`<app-id>` → 应用监听的回环地址(反向代理的目标)。与 `sites` 互斥(同一个应用只有一种)。
+    upstreams: RwLock<HashMap<String, SocketAddr>>,
 }
 
 impl State {
+    fn upstreams_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, SocketAddr>> {
+        self.upstreams
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn upstreams_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, SocketAddr>> {
+        self.upstreams
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// 站点表的读/写锁:持锁线程 panic 会毒化它,但表里没有需要保持的不变量,
     /// 后续请求不能因此全部 panic——取回内部数据继续用。
     fn sites_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Site>> {
@@ -173,6 +194,7 @@ impl Gateway {
                 uuid::Uuid::new_v4().simple()
             ),
             sites: RwLock::new(HashMap::new()),
+            upstreams: RwLock::new(HashMap::new()),
         });
         let shutdown = Arc::new(Notify::new());
         let task = tokio::spawn(accept_loop(
@@ -194,14 +216,26 @@ impl Gateway {
 
     /// 注册(或替换)一个应用的静态站点。
     pub fn add_site(&self, id: &AppId, root: PathBuf, csp: Option<String>) {
+        self.state.upstreams_write().remove(id.as_str());
         self.state
             .sites_write()
             .insert(id.as_str().to_string(), Site { root, csp });
     }
 
-    /// 注销站点;返回之前是否注册过。
+    /// 注册(或替换)一个进程型应用:请求通过校验后反向代理到 `upstream`(应用监听的 `127.0.0.1:<端口>`)。
+    /// 若这个 id 之前是静态站点,会被替换。
+    pub fn add_upstream(&self, id: &AppId, upstream: SocketAddr) {
+        self.state.sites_write().remove(id.as_str());
+        self.state
+            .upstreams_write()
+            .insert(id.as_str().to_string(), upstream);
+    }
+
+    /// 注销站点或上游;返回之前是否注册过。
     pub fn remove_site(&self, id: &AppId) -> bool {
-        self.state.sites_write().remove(id.as_str()).is_some()
+        let was_static = self.state.sites_write().remove(id.as_str()).is_some();
+        let was_proxy = self.state.upstreams_write().remove(id.as_str()).is_some();
+        was_static || was_proxy
     }
 
     /// `stop`/`shutdown` 已经完成(accept 循环已退出)。测试与上层用它判断"这个 gateway 确实停了",
@@ -214,11 +248,8 @@ impl Gateway {
     }
 
     pub fn has_site(&self, id: &AppId) -> bool {
-        self.state
-            .sites
-            .read()
-            .expect("sites 锁")
-            .contains_key(id.as_str())
+        self.state.sites_read().contains_key(id.as_str())
+            || self.state.upstreams_read().contains_key(id.as_str())
     }
 
     /// 不含令牌的站点地址(可以放进事件/日志)。
@@ -280,7 +311,10 @@ async fn accept_loop(
                                 req.headers().get_all(header::HOST).iter().count(),
                                 req.uri().authority().is_some(),
                             ) {
-                                return Ok::<_, Infallible>(plain(status, "bad request"));
+                                return Ok::<_, Infallible>(proxy::boxed_reply(plain(
+                                    status,
+                                    "bad request",
+                                )));
                             }
                             let method = req.method().clone();
                             let host = header_str(&req, header::HOST);
@@ -290,11 +324,42 @@ async fn accept_loop(
                                 .path_and_query()
                                 .map(|p| p.as_str().to_string())
                                 .unwrap_or_else(|| "/".to_string());
-                            let reply = tokio::task::spawn_blocking(move || {
-                                respond(&state, &method, host.as_deref(), &target, cookie.as_deref())
+                            let routing_state = state.clone();
+                            let routed = tokio::task::spawn_blocking(move || {
+                                route(
+                                    &routing_state,
+                                    &method,
+                                    host.as_deref(),
+                                    &target,
+                                    cookie.as_deref(),
+                                )
                             })
                             .await
-                            .unwrap_or_else(|_| plain(StatusCode::INTERNAL_SERVER_ERROR, "internal error"));
+                            .unwrap_or_else(|_| {
+                                Routed::Reply(plain(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "internal error",
+                                ))
+                            });
+                            let reply = match routed {
+                                Routed::Reply(r) => proxy::boxed_reply(r),
+                                Routed::Proxy(upstream) => {
+                                    let own_origin = format!(
+                                        "{}://{}",
+                                        "http",
+                                        header_str(&req, header::HOST).unwrap_or_default()
+                                    );
+                                    proxy::forward(
+                                        req,
+                                        upstream,
+                                        &own_origin,
+                                        COOKIE_NAME,
+                                        limits.upstream_connect_timeout,
+                                        limits.upstream_header_timeout,
+                                    )
+                                    .await
+                                }
+                            };
                             Ok::<_, Infallible>(reply)
                         }
                     });
@@ -303,7 +368,10 @@ async fn accept_loop(
                     http.timer(hyper_util::rt::TokioTimer::new())
                         .header_read_timeout(limits.header_read_timeout)
                         .keep_alive(false);
-                    let _ = http.serve_connection(TokioIo::new(stream), service).await;
+                    let _ = http
+                        .serve_connection(TokioIo::new(stream), service)
+                        .with_upgrades()
+                        .await;
                 });
             }
         }
@@ -383,17 +451,36 @@ fn split_token(query: Option<&str>) -> (Option<String>, Option<String>) {
     (token, (!rest.is_empty()).then(|| rest.join("&")))
 }
 
-/// 处理一个请求。纯同步、不碰网络,便于直接测试;`target` 是请求行里的 path+query。
-fn respond(
+/// 认证之后的去向。
+enum Routed {
+    /// 直接答复(静态文件、重定向、各种错误)。
+    Reply(Reply),
+    /// 反向代理到进程型应用监听的回环地址(含 WebSocket 升级)。
+    Proxy(SocketAddr),
+}
+
+/// 步骤 1–2:Host 与令牌。要么直接得到一个答复(421/403/302),要么得到通过校验的应用与拆好的路径/查询。
+enum Authed<'a> {
+    Done(Reply),
+    App {
+        app: AppId,
+        path: &'a str,
+        query: Option<&'a str>,
+    },
+}
+
+fn authenticate<'a>(
     state: &State,
-    method: &Method,
     host: Option<&str>,
-    target: &str,
+    target: &'a str,
     cookie: Option<&str>,
-) -> Reply {
+) -> Authed<'a> {
     // 1. Host
     let Some(app) = app_from_host(host, state.port) else {
-        return plain(StatusCode::MISDIRECTED_REQUEST, "misdirected request");
+        return Authed::Done(plain(
+            StatusCode::MISDIRECTED_REQUEST,
+            "misdirected request",
+        ));
     };
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p, Some(q)),
@@ -404,7 +491,7 @@ fn respond(
     let (query_token, rest_query) = split_token(query);
     if let Some(t) = &query_token {
         if !ct_eq(t, &expected) {
-            return plain(StatusCode::FORBIDDEN, "forbidden");
+            return Authed::Done(plain(StatusCode::FORBIDDEN, "forbidden"));
         }
         // Location 永远是站内路径:开头的多个 `/`、`\\` 折成一个(`//evil.com/` 会被浏览器当成另一个 origin)
         let local_path = format!("/{}", path.trim_start_matches(['/', '\\']));
@@ -426,13 +513,42 @@ fn respond(
             .expect("令牌是十六进制"),
         );
         harden(r.headers_mut());
-        return r;
+        return Authed::Done(r);
     }
     let authed = cookie.is_some_and(|c| cookie_values(c, COOKIE_NAME).any(|v| ct_eq(v, &expected)));
     if !authed {
-        return plain(StatusCode::FORBIDDEN, "forbidden");
+        return Authed::Done(plain(StatusCode::FORBIDDEN, "forbidden"));
     }
-    // 3. 站点
+    Authed::App { app, path, query }
+}
+
+/// 处理一个请求:纯同步、不碰网络(反向代理的转发在 `proxy::forward`,这里只决定"去哪");`target` 是请求行里的 path+query。
+fn route(
+    state: &State,
+    method: &Method,
+    host: Option<&str>,
+    target: &str,
+    cookie: Option<&str>,
+) -> Routed {
+    let (app, path, query) = match authenticate(state, host, target, cookie) {
+        Authed::Done(reply) => return Routed::Reply(reply),
+        Authed::App { app, path, query } => (app, path, query),
+    };
+    // 3. 站点:进程型应用走反向代理(不限方法——应用有自己的 API;写方法/WebSocket 的同源检查在 `proxy::forward`)
+    if let Some(addr) = state.upstreams_read().get(app.as_str()).copied() {
+        return Routed::Proxy(addr);
+    }
+    Routed::Reply(serve_static(state, &app, method, path, query))
+}
+
+/// 静态站点的步骤 3–5:站点存在、方法、路径解析。
+fn serve_static(
+    state: &State,
+    app: &AppId,
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
+) -> Reply {
     let Some(site) = state.sites_read().get(app.as_str()).cloned() else {
         return plain(StatusCode::NOT_FOUND, "no such app");
     };
@@ -464,6 +580,21 @@ fn respond(
             harden(r.headers_mut());
             r
         }
+    }
+}
+
+/// 测试辅助:只看直接答复(静态路径与各种错误);进程型应用的路由结果在测试里单独断言。
+#[cfg(test)]
+fn respond(
+    state: &State,
+    method: &Method,
+    host: Option<&str>,
+    target: &str,
+    cookie: Option<&str>,
+) -> Reply {
+    match route(state, method, host, target, cookie) {
+        Routed::Reply(r) => r,
+        Routed::Proxy(_) => plain(StatusCode::BAD_GATEWAY, "proxied"),
     }
 }
 
@@ -502,6 +633,9 @@ fn serve_file(file: &Path, site: &Site, head_only: bool) -> Reply {
 }
 
 #[cfg(test)]
+mod proxy_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::permissions::{NetworkPerm, Outbound};
@@ -524,6 +658,7 @@ mod tests {
             port,
             token: TOKEN.to_string(),
             sites: RwLock::new(sites),
+            upstreams: RwLock::new(HashMap::new()),
         }
     }
 
@@ -987,6 +1122,7 @@ mod tests {
         let limits = Limits {
             header_read_timeout: Duration::from_millis(300),
             max_connections: 64,
+            ..Limits::default()
         };
         let gw = Gateway::start_with_limits(GatewayConfig { port: 0 }, limits)
             .await
@@ -1021,6 +1157,7 @@ mod tests {
         let limits = Limits {
             header_read_timeout: Duration::from_secs(10),
             max_connections: 2,
+            ..Limits::default()
         };
         let gw = Gateway::start_with_limits(GatewayConfig { port: 0 }, limits)
             .await
