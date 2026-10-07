@@ -2,11 +2,13 @@
 //! 一期只有 `static_web` 真正实现;Node/Python/容器只定义探测与强制等级,供安装计划和 Settings 展示。
 
 mod probe;
+mod resolve;
 
 pub use probe::{
     CommandError, CommandOutput, CommandRunner, RuntimeAvailability, SystemRunner, probe_all,
     probe_docker, probe_node, probe_python,
 };
+pub use resolve::{ResolveError, Resolved, RuntimeResolver, SystemResolver};
 
 use crate::manifest::Runtime;
 use crate::permissions::{Enforcement, PermissionKey};
