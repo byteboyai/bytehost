@@ -92,7 +92,7 @@ pub const PINS: &[Pin] = &[
         target: Target::Aarch64Apple,
         url: "https://github.com/astral-sh/uv/releases/download/0.12.23/uv-aarch64-apple-darwin.tar.gz",
         sha256: "50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544",
-        strip_components: 0,
+        strip_components: 1,
         bin_rel: "uv",
     },
     Pin {
@@ -101,7 +101,7 @@ pub const PINS: &[Pin] = &[
         target: Target::X86_64Apple,
         url: "https://github.com/astral-sh/uv/releases/download/0.12.23/uv-x86_64-apple-darwin.tar.gz",
         sha256: "960da44cb4b73685206ddd250b19e0a117fa41095710c1038f081f5cb613efb4",
-        strip_components: 0,
+        strip_components: 1,
         bin_rel: "uv",
     },
 ];

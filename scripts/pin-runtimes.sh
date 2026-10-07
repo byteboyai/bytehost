@@ -108,8 +108,8 @@ for entry in "${UV_TRIPLES[@]}"; do
   sha="${UV_SHA[$triple]}"
   [ -n "$sha" ] || fail "uv ${triple} 校验和为空"
   url="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${file}"
-  # uv 包解压后根下就是 `uv`/`uvx`(无顶层目录)
-  emit_pin "uv" "$UV_VERSION" "$target" "$url" "$sha" 0 "uv"
+  # uv 包解压后是顶层目录 `uv-<triple>/` 下的 `uv`/`uvx`,strip 掉顶层目录
+  emit_pin "uv" "$UV_VERSION" "$target" "$url" "$sha" 1 "uv"
 done
 
 echo "];"

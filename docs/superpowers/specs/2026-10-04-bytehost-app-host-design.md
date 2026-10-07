@@ -239,7 +239,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 - **先探测系统已有的**(`node`/`npm`/`pnpm`、`uv`/`python3`、`docker` 及当前 context),探测结果分层:没装 / 装了但不可用(如 Colima 没启动)/ 可用。
 - **Settings 面板提供"运行时安装/管理"**:这是产品 UI;机制归 bytehost 的 `RuntimeManager`(探测、安装、列出版本、卸载),产品的 Settings 调它。
 - **能装什么要区分:** uv(及其管理的 Python)、Node 可由 bytehost 下载到自己的目录(固定版本 + 校验和,不动系统环境,显式确认);**Docker/Colima 不能由 bytehost 安装**(需要系统权限与虚拟机),只做探测、状态说明与指引。一期(只做静态 Web)不需要任何运行时,这一整块属于二期 Node/Python runtime 的范围;一期 Settings 只展示探测结果。
-- **下载是安全敏感操作:** 版本固定、校验和强制、来源可审、下载在安装计划/设置界面里明示;不静默下载。
+- **下载是安全敏感操作:** 版本固定、校验和强制、来源可审、下载在安装计划/设置界面里明示;不静默下载。**已落地(A6d)**:`runtime::managed` 装到 `<root>/runtimes/<name>/<version>/`,固定版本表由 `scripts/bytehost/pin-runtimes.sh` 从官方源生成,下载走系统 `curl`/`tar`,Python 的哈希由 uv 内置校验(安装计划里如实披露),受管运行时经 `ChainResolver` 优先于系统,安装计划在服务端重算并逐字段核对;只有 macOS 有 pin。
 - 本机现状(用户机器实测):docker 29.6(context=colima)、node 24.14、python 3.13、uv 均已可用。
 
 ### 6.3 运行时/容器不可用时的呈现【用户已定,2026-10-04】:在该应用的 wry 窗口里提示
@@ -299,7 +299,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 | A6 | 应用的"独立入口"是什么形态 | **已定(2026-10-04,用户):(a) rail 图标 → 该应用自己的面板**;(b) 独立窗口留作以后的可选能力 |
 | A7 | gateway 放在哪个进程 | **已定(2026-10-04,用户):放进 dozerd**,与应用同生命周期;GUI 里的 wry 只是客户端 |
 | A8 | Digger 的 supervisor 怎么实现 | bytehost 只定义接口/协议;Digger 自带守护进程或进程内嵌入。**待 Digger 启动时裁决** |
-| A9 | Settings 里运行时安装的范围 | **已定(2026-10-04,用户):可装 uv/Python、Node(固定版本+校验和,装到 bytehost 自己的目录,显式确认);Docker/Colima 只探测与指引**;属二期,一期 Settings 只展示探测结果 |
+| A9 | Settings 里运行时安装的范围 | **已定(2026-10-04,用户):可装 uv/Python、Node(固定版本+校验和,装到 bytehost 自己的目录,显式确认);Docker/Colima 只探测与指引**;属二期,一期 Settings 只展示探测结果。**已落地(A6d,2026-10-07)** |
 | A12 | gateway 固定端口策略 | **已定(2026-10-04,用户):首次启动从高端口段随机选一个并持久化;被占用显式报错,不静默换**(§5.2 第 6 条) |
 | A10 | 新 crate 的名字与位置 | **已定(2026-10-04,用户):`crates/bytehost-apps`**(无界面;与将来可能的 iced 侧 `bytehost` 区分) |
 | A11 | `server` feature 的 HTTP 栈 | **已确认(2026-10-04,用户):`hyper` 1.x + `hyper-util` + `http-body-util`,WebSocket 复用 `tokio-tungstenite`**(新增依赖只进 dozerd) |
