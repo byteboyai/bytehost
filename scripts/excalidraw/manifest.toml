@@ -1,0 +1,28 @@
+schema_version = 1
+min_host_version = "0.1.0"
+id = "excalidraw"
+name = "Excalidraw"
+version = "0.1.0"
+
+[presentation]
+entrypoint = "main"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+
+# 全部取最严:不联网(字体/库都已随包)、不使用宿主数据目录(绘图存在 WebView 自己的 localStorage 里)。
+[permissions]
+clipboard = "none"
+downloads = "deny"
+popups = "deny"
+
+[permissions.network]
+outbound = "none"
+
+[permissions.filesystem]
+data = "none"

@@ -216,7 +216,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 ### 5.3 仍需验证(在落地前的 spike 清单)
 
 - ~~**V1** 单一端口 + Host 路由 + 多应用同时打开时的实际表现~~ **已实测通过(2026-10-04,见 `spike/origin-gateway/README.md` 的 V1 一节):** 同端口、同存储标识下两个应用的 localStorage/IndexedDB/Cookie 完全互不可见;
-- **V2** 真实 Excalidraw 静态构建的端到端(base path、字体、剪贴板读写、下载、弹窗);
+- ~~**V2** 真实 Excalidraw 静态构建的端到端(base path、字体、剪贴板读写、下载、弹窗)~~ **已验证(2026-10-05,见 `specs/2026-10-05-bytehost-a5-acceptance-report.md`):** 原样构建在严格 CSP 下字体全坏(内联脚本被拦、资源路径未设),打包配方(`scripts/bytehost/excalidraw/`)后通过;剪贴板/下载在 wry 无用户手势下不能自动探测,留手工;
 - **V3** 外部浏览器与 DNS rebinding 的攻击面(Host 校验 + token 的有效性);
 - **V4** 不带 `data_store_identifier` 与 macOS 14 以下的行为;
 - **V5** 非 macOS(WebView2/WebKitGTK)上 `*.localhost` 解析与数据目录隔离。
@@ -270,7 +270,7 @@ wry 0.55.1、WKWebView、macOS 26.6.2。三种方案的差异**不是实现细�
 | **A2** | 接入 dozerd:`dozer-core::protocol` 加 `Request::App`/`Reply::App`/事件,`dozerd/server.rs` 转给 `AppManager`;`dozer-client` 加 `app_*` 方法;dozerd 启动对账、优雅退出停应用、孤儿清理 | dozer-core、dozerd、dozer-client | A1 **已完成(A2,`bytehost-a2`):`0fcc66b6`**——线上类型在 `bytehost-apps::proto`;`dozer-core::protocol` 加 `Request::App`/`Reply::App`;dozerd 的 `AppService`(启动永不失败、启动对账、`Shutdown` 时收尾且保留 `desired`);`dozer-client` 的 `app_*` 方法;依赖门禁新增 `dozer-hook` 闭包检查。**推送事件**(GUI 订阅状态变化)本切片没做,A4 之前 GUI 靠轮询 `List`;启动时的"首次绑定成功后才持久化端口"已在 A4a 修好 |
 | **A3** | rail 动态条目最小版(H7b-min):条目 id 能表达 `app:<id>`、布局序列化向后兼容、按应用 id 存独立 WebView 状态 | dozer-app | 无(可与 A0–A2 并行)。**rail 条目已落地(A3,`2026-10-05-bytehost-a3-rail-app-entries.md`):`PanelKind::App(AppSlot)` + `app:<id>` 落盘 + `RailLayout::sync_apps`;`App::sync_installed_apps` 待 A4 接线。按应用 id 存独立 WebView 状态属 A4** |
 | **A4** | GUI:应用面板(wry,加载 `http://<app-id>.localhost:端口/`,每应用 `data_store_identifier`)、安装计划/审批的最小界面、不可用时的提示页(§6.3,由 host 提供)、Settings 里的运行时探测展示 | dozer-app | A2、A3 **必须同时实现"禁止离开本 origin 的顶层导航/`window.open`"的 WebView 策略**——这是静态应用出站网络的强制等级能从 `Advisory` 升为 `Enforced` 的前提(CSP 挡不住导航与 WebRTC,见 A1 评审)。**A4 拆为 A4a(后端:类别化失败 + 首次端口落盘修正,已完成)/A4b(GUI 面板与导航策略)/A4c(安装审批界面 + Settings 探测),见 `plans/2026-10-05-bytehost-a4a-failure-kinds-and-port.md`**。**A4b 再拆为 A4b1(应用 webview 机制,已完成:`plans/2026-10-05-bytehost-a4b1-app-webview-mechanism.md`——`app_webview.rs` 的 origin 策略/id 段/每应用 `data_store_identifier`/独立受限构建路径 `build_app_webview`,以及几何、`preview_desired`、焦点路由接线;**URL 由谁供给属 A4b2**)与 A4b2(接线实际 URL + host 提示页)**。**A4b2 已完成:宿主逻辑(列表轮询 / 每应用面板状态机 / 启停),见 `plans/2026-10-05-bytehost-a4b2-app-host-logic.md`。**A4c 已完成:设置「应用」页(运行时探测 / 安装审批 / 停止 / 卸载),纯状态机在 `extensions/settings_apps.rs`,见 `plans/2026-10-05-bytehost-a4c-settings-apps-page.md`;**A4 全部完成**(Task 3 的手工 GUI 验收待人工执行)——下一步 A5(Excalidraw 端到端验收)** |
-| **A5** | Excalidraw 端到端验收(下面的验收 1–8) | 全部 | A4、V2 |
+| **A5** | Excalidraw 端到端验收(下面的验收 1–8) | 全部 | A4、V2 **代码与自动验证已完成(`plans/2026-10-05-bytehost-a5-excalidraw-acceptance.md`):打包配方、V2 探针、卸载"含数据"清 WebView 存储;验收 8 一期重新表述为"非 static_web 在安装时被明确拒绝"。真实 GUI 手工验收尚未执行,清单见 `specs/2026-10-05-bytehost-a5-acceptance-report.md` §3——全部有结论前不得标完成** |
 
 **验收:**
 1. Excalidraw 静态构建:`install_plan` 展示摘要/来源/强制等级 → 审批 → 安装 → rail 出现图标 → 打开 → 画一笔 → 退出 **GUI** 重开 → 画还在;
