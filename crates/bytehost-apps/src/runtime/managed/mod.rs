@@ -2,10 +2,16 @@
 //!
 //! - `pins`:**代码内常量表**(版本/URL/校验和由 `scripts/bytehost/pin-runtimes.sh` 从官方源生成、人审后提交);
 //! - `store`:`<root>/runtimes/<name>/<version>/` 的布局与列目录/删除;
-//! - (`fetch`/`install`/`manager`/`resolve` 见后续任务)
+//! - `fetch`:`Fetcher`/`Archive` 接口 + 用系统 `curl`/`tar` 的实现;
+//! - `install`:下载 → 校验 → 安全解压 → 试跑 → 原子落位;
+//! - (`manager`/`resolve` 见后续任务)
 
+pub mod fetch;
+pub mod install;
 pub mod pins;
 pub mod store;
 
+pub use fetch::{Archive, CurlFetcher, Fetcher, TarArchive};
+pub use install::{InstallError, Installer, Phase};
 pub use pins::{PYTHON_VERSION, Pin, Target, pin_for, pin_names_for};
 pub use store::RuntimeStore;
