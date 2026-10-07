@@ -30,6 +30,8 @@ pub mod registry;
 #[cfg(feature = "server")]
 pub mod runtime;
 pub mod state;
+#[cfg(all(feature = "server", unix))]
+pub mod supervisor;
 #[cfg(all(test, feature = "server"))]
 mod testutil;
 
