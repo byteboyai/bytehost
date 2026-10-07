@@ -58,6 +58,11 @@ impl AppPaths {
     pub fn logs_dir(&self, id: &AppId) -> PathBuf {
         self.app_dir(id).join("logs")
     }
+
+    /// 进程型应用的运行目录:存放 `process.json`(孤儿回收用)。
+    pub fn run_dir(&self, id: &AppId) -> PathBuf {
+        self.app_dir(id).join("run")
+    }
 }
 
 /// 一次安装留下的版本记录。

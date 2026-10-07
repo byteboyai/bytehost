@@ -1,6 +1,7 @@
 //! `AppManager`:安装、启动、停止、卸载、启动对账——把注册表、gateway 和生命周期纯函数接起来。
 //!
-//! 一期只实现 `static_web`;其他 runtime 在 `install_plan` 就被明确拒绝(`UnsupportedRuntime`)。
+//! 一期实现 `static_web` 与进程型(`node`/`python`,A6c);容器在 `install_plan` 就被明确拒绝
+//! (`UnsupportedRuntime`)。
 //! 所有会改状态的方法都在同一把锁里执行(**单写者**:规格里 supervisor 是唯一写者),
 //! 每次状态变化都先落盘(`AppRecord.observed`)再发事件。耗时任务句柄/进度(规格 §4.3)留到
 //! 有真正耗时的 runtime 时再加:静态应用的安装是瞬时的。
@@ -9,26 +10,30 @@
 //! `verify`,再改名落位**;`current_version` 在最后才写。
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::broadcast;
 
 use crate::digest::{data_store_id_hex, digest_tree, sha256_hex};
-use crate::event::AppEvent;
+use crate::event::{AppEvent, RuntimeReason};
 use crate::gateway::{Gateway, csp_for};
 use crate::id::{AppId, Version};
+use crate::launch::{check_process_runtime, install_argv, lockfile_of};
 use crate::manifest::{Manifest, ManifestError, Runtime};
 use crate::plan::{
     ApprovedInstallPlan, InstallPlan, Installed, PlanInput, Provenance, TrustLevel, VerifyError,
 };
 use crate::registry::{AppRecord, RECORD_FORMAT_VERSION, Registry, UninstallMode, VersionRecord};
-use crate::runtime::{RuntimeResolver, SystemResolver, enforcement_for};
+use crate::runtime::{ResolveError, Resolved, RuntimeResolver, SystemResolver, enforcement_for};
 use crate::state::{
     Action, DesiredState, ObservedState, next_action, recover_after_supervisor_restart,
 };
+use crate::supervisor::{self, Launch, Phase, Transitions};
 
 pub use crate::proto::{AppSource, AppSummary};
 
@@ -55,6 +60,8 @@ pub enum ManagerError {
     ShuttingDown,
     /// 应用来源不合法(如 `LocalDir` 的路径不是绝对路径)。
     BadSource(String),
+    /// 进程型应用所需的运行时没装(如没装 `python3`/`node`)。
+    RuntimeUnavailable(String),
 }
 
 impl std::fmt::Display for ManagerError {
@@ -74,6 +81,7 @@ impl std::fmt::Display for ManagerError {
             }
             Self::BadSource(why) => write!(f, "应用来源不合法: {why}"),
             Self::ShuttingDown => write!(f, "dozerd 正在停止,暂不接受安装/启动"),
+            Self::RuntimeUnavailable(name) => write!(f, "运行时 {name} 不可用:未找到"),
             Self::MissingSource(p) => write!(f, "应用包里缺少站点目录: {}", p.display()),
         }
     }
@@ -92,6 +100,7 @@ impl ManagerError {
             Self::AlreadyInstalled(_) | Self::Busy(_) | Self::BadState { .. } => K::Conflict,
             Self::NotInstalled(_) => K::NotFound,
             Self::ShuttingDown => K::Unavailable,
+            Self::RuntimeUnavailable(_) => K::Unavailable,
         }
     }
 }
@@ -128,9 +137,14 @@ pub struct Core {
     /// 把解释器名解析成绝对路径(进程型应用)。
     #[allow(dead_code)]
     resolver: Arc<dyn RuntimeResolver>,
+    /// 进程型应用崩溃后的重启策略(默认 `RestartPolicy::default()`;测试里注入小退避)。
+    policy: crate::process::restart::RestartPolicy,
     /// 每个应用当前那条监管线程(`cancel` 标志 + 句柄)。静态应用不登记。
     #[allow(dead_code)]
     supervisions: Mutex<HashMap<AppId, Supervision>>,
+    /// 指向自己的 `Arc`(经 `Arc::new_cyclic` 装填):监管线程需要一份 `Arc<Core>` 才能回报状态,
+    /// 而 `start_process_locked` 只有 `&Core`。用 `Weak` 打破强引用环。
+    self_weak: std::sync::OnceLock<std::sync::Weak<Core>>,
     /// (仅测试)`install` 里"拷贝与摘要计算已完成、即将拿锁"的次数,用来证明慢的部分在锁外。
     #[cfg(test)]
     prepared: std::sync::atomic::AtomicUsize,
@@ -141,6 +155,119 @@ pub struct Core {
 pub(crate) struct Supervision {
     pub(crate) cancel: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// 监管线程回报状态的适配器:把它接回 `Core` 的单写者锁 + `AppRecord` + gateway。
+///
+/// **持锁用尝试循环**——`stop`/`suspend_all` 会持着锁 `join` 本线程,线程若阻塞等锁就是死锁。
+/// 每次拿到锁后**再查一遍 `cancel`**:取消之后绝不再写任何状态。
+struct AppTransitions {
+    core: Arc<Core>,
+    id: AppId,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AppTransitions {
+    /// 拿单写者锁(尝试循环),拿到后核对取消标志。返回 `None` = 已取消,调用方必须放弃写入。
+    fn acquire(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        use std::sync::atomic::Ordering;
+        let g = loop {
+            if self.cancel.load(Ordering::SeqCst) {
+                return None;
+            }
+            if let Some(g) = self.core.try_guard() {
+                break g;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        if self.cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(g)
+    }
+}
+
+impl Transitions for AppTransitions {
+    fn phase(&self, phase: Phase) -> bool {
+        let Some(_g) = self.acquire() else {
+            return false;
+        };
+        let Ok(mut record) = self.core.load_record(&self.id) else {
+            return false;
+        };
+        let observed = match phase {
+            Phase::Preparing => ObservedState::Preparing,
+            Phase::Starting => ObservedState::Starting,
+        };
+        self.core.set_observed(&mut record, observed).is_ok()
+    }
+
+    fn ready(&self, port: u16) -> bool {
+        let Some(_g) = self.acquire() else {
+            return false;
+        };
+        let Ok(mut record) = self.core.load_record(&self.id) else {
+            return false;
+        };
+        let upstream = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        self.core.gateway.add_upstream(&self.id, upstream);
+        if self
+            .core
+            .set_observed(&mut record, ObservedState::Running)
+            .is_err()
+        {
+            return false;
+        }
+        let url = self.core.gateway.site_url(&self.id);
+        self.core.emit(AppEvent::EndpointChanged {
+            app: self.id.clone(),
+            url: Some(url),
+        });
+        true
+    }
+
+    fn down(&self, reason: String, restart_in: Option<Duration>) -> bool {
+        let Some(_g) = self.acquire() else {
+            return false;
+        };
+        let Ok(mut record) = self.core.load_record(&self.id) else {
+            return false;
+        };
+        let was_serving = self.core.gateway.remove_site(&self.id);
+        if was_serving {
+            self.core.emit(AppEvent::EndpointChanged {
+                app: self.id.clone(),
+                url: None,
+            });
+        }
+        let observed = match restart_in {
+            Some(_) => ObservedState::Starting,
+            None => ObservedState::Failed {
+                reason,
+                retryable: false,
+            },
+        };
+        self.core.set_observed(&mut record, observed).is_ok()
+    }
+
+    fn failed(&self, reason: String, retryable: bool) -> bool {
+        let Some(_g) = self.acquire() else {
+            return false;
+        };
+        let Ok(mut record) = self.core.load_record(&self.id) else {
+            return false;
+        };
+        let was_serving = self.core.gateway.remove_site(&self.id);
+        if was_serving {
+            self.core.emit(AppEvent::EndpointChanged {
+                app: self.id.clone(),
+                url: None,
+            });
+        }
+        self.core
+            .set_observed(&mut record, ObservedState::Failed { reason, retryable })
+            .is_ok()
+    }
 }
 
 pub struct AppManager {
@@ -169,6 +296,18 @@ fn read_package(dir: &Path, host_version: &Version) -> Result<Package, ManagerEr
         source_digest: digest_tree(dir)?,
         manifest,
     })
+}
+
+/// 校验一个 runtime 是否受支持:`StaticWeb`/`Node`/`Python` 通过(进程型还要过 `check_process_runtime`),
+/// `Container` 明确拒绝。返回 `Ok(())` 或可直接映射成 `ManagerError` 的错误。
+fn check_supported(runtime: &Runtime, package_dir: &Path) -> Result<(), ManagerError> {
+    match runtime {
+        Runtime::StaticWeb { .. } => Ok(()),
+        Runtime::Node { .. } | Runtime::Python { .. } => {
+            check_process_runtime(runtime, package_dir).map_err(ManagerError::BadSource)
+        }
+        Runtime::Container { .. } => Err(ManagerError::UnsupportedRuntime("container".to_string())),
+    }
 }
 
 fn static_source(manifest: &Manifest) -> Result<&str, ManagerError> {
@@ -240,11 +379,27 @@ impl AppManager {
         gateway: Arc<Gateway>,
         resolver: Arc<dyn RuntimeResolver>,
     ) -> io::Result<Self> {
+        Self::with_resolver_and_policy(
+            root,
+            host_version,
+            gateway,
+            resolver,
+            crate::process::restart::RestartPolicy::default(),
+        )
+    }
+
+    fn with_resolver_and_policy(
+        root: impl Into<PathBuf>,
+        host_version: Version,
+        gateway: Arc<Gateway>,
+        resolver: Arc<dyn RuntimeResolver>,
+        policy: crate::process::restart::RestartPolicy,
+    ) -> io::Result<Self> {
         let (events, _) = broadcast::channel(256);
         let registry = Registry::open(root)?;
         sweep_staging(&registry.paths().apps_dir());
-        Ok(Self {
-            core: Arc::new(Core {
+        let core = Arc::new_cyclic(|weak| {
+            let core = Core {
                 registry,
                 gateway,
                 host_version,
@@ -252,11 +407,28 @@ impl AppManager {
                 lock: Mutex::new(()),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 resolver,
+                policy,
                 supervisions: Mutex::new(HashMap::new()),
+                self_weak: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 prepared: std::sync::atomic::AtomicUsize::new(0),
-            }),
-        })
+            };
+            let _ = core.self_weak.set(weak.clone());
+            core
+        });
+        Ok(Self { core })
+    }
+
+    /// (仅测试)注入一个小退避的重启策略,让崩溃-放弃在毫秒级完成。
+    #[cfg(test)]
+    pub(crate) fn with_resolver_and_policy_for_test(
+        root: impl Into<PathBuf>,
+        host_version: Version,
+        gateway: Arc<Gateway>,
+        resolver: Arc<dyn RuntimeResolver>,
+        policy: crate::process::restart::RestartPolicy,
+    ) -> io::Result<Self> {
+        Self::with_resolver_and_policy(root, host_version, gateway, resolver, policy)
     }
 
     pub fn events(&self) -> broadcast::Receiver<AppEvent> {
@@ -343,6 +515,15 @@ impl Core {
         // 没有订阅者时 send 会返回错误——不是问题
         let _ = self.events.send(event);
     }
+
+    /// 拿到指向自己的 `Arc`(装载于 `Arc::new_cyclic`)。构造之后必定已装填,退化为 `panic` 只在被误用时发生。
+    fn self_arc(&self) -> Arc<Core> {
+        self.self_weak
+            .get()
+            .expect("Core::self_weak 未装填")
+            .upgrade()
+            .expect("Core 的 Arc 已全部释放")
+    }
 }
 
 impl Core {
@@ -355,16 +536,17 @@ impl Core {
         let AppSource::LocalDir { path: dir } = source;
         ensure_absolute(dir)?;
         let package = read_package(dir, &self.host_version)?;
-        self.plan_for(&package, provenance, trust)
+        self.plan_for(&package, dir, provenance, trust)
     }
 
     fn plan_for(
         &self,
         package: &Package,
+        package_dir: &Path,
         provenance: Provenance,
         trust: TrustLevel,
     ) -> Result<InstallPlan, ManagerError> {
-        static_source(&package.manifest)?;
+        check_supported(&package.manifest.runtime, package_dir)?;
         let record = self.registry.load(&package.manifest.id)?;
         let installed = record.as_ref().map(|r| Installed {
             version: &r.current_version,
@@ -431,7 +613,12 @@ impl Core {
         }
         let id = package.manifest.id.clone();
         let version = package.manifest.version;
-        let plan = self.plan_for(&package, approved.plan().provenance, approved.plan().trust)?;
+        let plan = self.plan_for(
+            &package,
+            staging,
+            approved.plan().provenance,
+            approved.plan().trust,
+        )?;
         let verified = approved.verify(plan).map_err(ManagerError::Verify)?;
 
         let existing = self.registry.load(&id)?;
@@ -541,19 +728,23 @@ impl Core {
                 });
             }
         }
-        let text = fs::read_to_string(
-            self.registry
-                .paths()
-                .package_dir(id, &record.current_version)
-                .join("manifest.toml"),
-        )?;
-        let manifest = Manifest::from_toml(&text, &self.host_version)?;
-        let source = static_source(&manifest)?.to_string();
-        let root = self
+        let record_dir = self
             .registry
             .paths()
-            .package_dir(id, &record.current_version)
-            .join(&source);
+            .package_dir(id, &record.current_version);
+        let text = fs::read_to_string(record_dir.join("manifest.toml"))?;
+        let manifest = Manifest::from_toml(&text, &self.host_version)?;
+        match &manifest.runtime {
+            Runtime::StaticWeb { .. } => {}
+            Runtime::Node { .. } | Runtime::Python { .. } => {
+                return self.start_process_locked(&mut record, &manifest, &record_dir);
+            }
+            Runtime::Container { .. } => {
+                return Err(ManagerError::UnsupportedRuntime("container".into()));
+            }
+        }
+        let source = static_source(&manifest)?.to_string();
+        let root = record_dir.join(&source);
         if !root.is_dir() {
             let reason = format!("应用包里缺少站点目录 {source}");
             self.set_observed(
@@ -576,6 +767,189 @@ impl Core {
         Ok(url)
     }
 
+    /// 进程型应用:`start` 在监管线程起来后**立即返回**站点地址(`Started{url}` = "已受理"),
+    /// 观察态依次为 `Preparing`(装依赖)→ `Starting`(起进程/等健康)→ `Running`(监管线程回调)。
+    fn start_process_locked(
+        &self,
+        record: &mut AppRecord,
+        manifest: &Manifest,
+        package_dir: &Path,
+    ) -> Result<String, ManagerError> {
+        let id = record.id.clone();
+        // 收掉上一条已结束的监管线程(崩溃后重试、或 Failed 复位后再启动)
+        let _ = self.cancel_supervision(&id);
+
+        let (argv, port_env) = match &manifest.runtime {
+            Runtime::Node { command, http, .. } | Runtime::Python { command, http, .. } => {
+                (command.clone(), http.port_env.clone())
+            }
+            _ => unreachable!("start_process_locked 只接进程型 runtime"),
+        };
+        // argv[0] 与依赖安装命令的 argv[0] 都要解析成绝对路径(npm 是脚本,得在同目录找到 node)
+        let resolved = match self.resolve_program(&argv) {
+            Ok(r) => r,
+            Err(e) => return self.fail_runtime_missing(record, &argv, e),
+        };
+        let install_resolved = match install_argv(&manifest.runtime) {
+            Some(install) => match self.resolve_program(&install) {
+                Ok(r) => Some(r),
+                Err(e) => return self.fail_runtime_missing(record, &install, e),
+            },
+            None => None,
+        };
+
+        let cache_dir = self.registry.paths().cache_dir(&id);
+        let data_dir = self.registry.paths().data_dir(&id);
+        let logs_dir = self.registry.paths().logs_dir(&id);
+        let run_dir = self.registry.paths().run_dir(&id);
+        for d in [&cache_dir, &data_dir, &logs_dir, &run_dir] {
+            fs::create_dir_all(d)?;
+        }
+
+        let mut argv = argv;
+        argv[0] = resolved.program.to_string_lossy().into_owned();
+        let install = match (install_argv(&manifest.runtime), install_resolved) {
+            (Some(mut inst_argv), Some(inst_resolved)) => {
+                inst_argv[0] = inst_resolved.program.to_string_lossy().into_owned();
+                // 装好依赖的标记按 lockfile 的 sha256 命名:换了 lockfile 的新版本必须重新装
+                let marker = match lockfile_of(&manifest.runtime) {
+                    Some(lf) => {
+                        cache_dir.join(format!("deps-{}.ok", self.lockfile_digest(package_dir, lf)))
+                    }
+                    None => cache_dir.join("deps-none.ok"),
+                };
+                Some(crate::supervisor::Install {
+                    argv: inst_argv,
+                    marker,
+                    timeout: supervisor::DEFAULT_INSTALL_TIMEOUT,
+                })
+            }
+            _ => None,
+        };
+
+        let parent_env = self.child_parent_env(&resolved, &cache_dir);
+        let launch = Launch {
+            app_id: id.clone(),
+            argv,
+            install,
+            cwd: package_dir.to_path_buf(),
+            parent_env,
+            port_env,
+            data_dir,
+            health_path: manifest.health.path.clone(),
+            startup_budget: supervisor::DEFAULT_STARTUP_BUDGET,
+            log_path: logs_dir.join("app.log"),
+            log_max_bytes: 1 << 20,
+            log_keep: 3,
+            run_dir,
+            policy: self.policy,
+            grace: supervisor::DEFAULT_GRACE,
+        };
+
+        record.desired = DesiredState::Running;
+        self.set_observed(record, ObservedState::Starting)?;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let core = self.self_arc();
+        let thread = {
+            let cancel = cancel.clone();
+            let app_id = id.clone();
+            let tr: Arc<dyn Transitions> = Arc::new(AppTransitions {
+                core: core.clone(),
+                id: app_id.clone(),
+                cancel: cancel.clone(),
+            });
+            std::thread::Builder::new()
+                .name(format!("bytehost-app-{app_id}"))
+                .spawn(move || supervisor::run(launch, cancel, tr))
+                .map_err(|e| ManagerError::BadSource(format!("无法创建监管线程: {e}")))?
+        };
+        self.supervisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id.clone(),
+                Supervision {
+                    cancel,
+                    thread: Some(thread),
+                },
+            );
+        Ok(self.gateway.site_url(&id))
+    }
+
+    /// 把解释器名解析成绝对路径,失败映射为 `RuntimeUnavailable`。
+    fn resolve_program(&self, argv: &[String]) -> Result<Resolved, ManagerError> {
+        let program = argv.first().map(String::as_str).unwrap_or("");
+        match self.resolver.resolve(program) {
+            Ok(r) => Ok(r),
+            Err(ResolveError::NotInstalled(name)) => Err(ManagerError::RuntimeUnavailable(name)),
+        }
+    }
+
+    /// 运行时缺失:`set_observed(Failed{retryable:true})` + `emit(RuntimeUnavailable{NotInstalled})`,
+    /// 然后把错误交回给调用方(线上类别 `Unavailable`,用户装好运行时可以重试)。
+    fn fail_runtime_missing(
+        &self,
+        record: &mut AppRecord,
+        argv: &[String],
+        err: ManagerError,
+    ) -> Result<String, ManagerError> {
+        let runtime = argv.first().cloned().unwrap_or_default();
+        let reason = format!("运行时 {runtime} 未安装");
+        let _ = self.set_observed(
+            record,
+            ObservedState::Failed {
+                reason,
+                retryable: true,
+            },
+        );
+        self.emit(AppEvent::RuntimeUnavailable {
+            app: record.id.clone(),
+            reason: RuntimeReason::NotInstalled { runtime },
+        });
+        Err(err)
+    }
+
+    /// 读 lockfile 内容算 sha256(用来给"依赖已装好"的标记命名:换了 lockfile 必须重装)。
+    fn lockfile_digest(&self, package_dir: &Path, lockfile: &str) -> String {
+        let bytes = fs::read(package_dir.join(lockfile)).unwrap_or_default();
+        sha256_hex(&bytes)
+    }
+
+    /// 给子进程的父环境:沿用宿主环境,但**去掉继承来的 `PATH`**,换成解析器给出的 `path_dirs`
+    /// (`/usr/bin:/bin` 兜底);并指向应用私有的 npm/uv 缓存目录。
+    fn child_parent_env(&self, resolved: &Resolved, cache_dir: &Path) -> Vec<(OsString, OsString)> {
+        let mut vars: Vec<(OsString, OsString)> =
+            std::env::vars_os().filter(|(k, _)| k != "PATH").collect();
+        let mut path = OsString::new();
+        for d in &resolved.path_dirs {
+            path.push(d);
+            path.push(":");
+        }
+        path.push("/usr/bin:/bin");
+        vars.push((OsString::from("PATH"), path));
+        vars.push((
+            OsString::from("npm_config_cache"),
+            cache_dir.join("npm").into_os_string(),
+        ));
+        vars.push((
+            OsString::from("UV_CACHE_DIR"),
+            cache_dir.join("uv").into_os_string(),
+        ));
+        vars
+    }
+
+    /// 取消并取出(已结束的)监管线程句柄。不 `join`——调用方按上下文决定。
+    fn cancel_supervision(&self, id: &AppId) -> Option<std::thread::JoinHandle<()>> {
+        let mut map = self
+            .supervisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.remove(id).map(|mut s| {
+            s.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            s.thread.take().expect("登记时必有句柄")
+        })
+    }
+
     /// 停止(也用来把 `Failed` 复位成 `Stopped`)。对已经停止的应用是空操作。
     pub(crate) fn stop(&self, id: &AppId) -> Result<(), ManagerError> {
         let _guard = self.guard();
@@ -583,11 +957,18 @@ impl Core {
     }
 
     fn stop_locked(&self, id: &AppId) -> Result<(), ManagerError> {
+        // 先叫停监管线程并等它退出(它绝不会阻塞等锁,所以持锁 join 不会死锁)
+        if let Some(h) = self.cancel_supervision(id) {
+            let _ = h.join();
+        }
         let mut record = self.load_record(id)?;
         let was_serving = self.gateway.remove_site(id);
         record.desired = DesiredState::Stopped;
         match record.observed {
-            ObservedState::Running | ObservedState::Failed { .. } => {
+            ObservedState::Running
+            | ObservedState::Failed { .. }
+            | ObservedState::Preparing
+            | ObservedState::Starting => {
                 self.set_observed(&mut record, ObservedState::Stopped)?;
             }
             _ => self.registry.save(&record)?,
@@ -666,6 +1047,23 @@ impl Core {
     pub(crate) fn suspend_all(&self) -> ReconcileReport {
         let _guard = self.guard();
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // 第一阶段:置取消并收集所有监管线程句柄。线程拿锁用尝试循环,所以持锁 join 不会死锁;
+        // 每个线程的收尾是并行的,总耗时 ≈ 最长的一个宽限,不是 N×宽限。
+        let handles: Vec<std::thread::JoinHandle<()>> = {
+            let mut map = self
+                .supervisions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.drain()
+                .map(|(_, mut s)| {
+                    s.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                    s.thread.take().expect("登记时必有句柄")
+                })
+                .collect()
+        };
+        for h in handles {
+            let _ = h.join();
+        }
         let mut report = ReconcileReport::default();
         let listing = match self.registry.list() {
             Ok(l) => l,
@@ -679,8 +1077,10 @@ impl Core {
         report.problems.extend(listing.problems);
         for mut record in listing.apps {
             let was_serving = self.gateway.remove_site(&record.id);
-            if matches!(record.observed, ObservedState::Running)
-                && let Err(e) = self.set_observed(&mut record, ObservedState::Stopped)
+            if matches!(
+                record.observed,
+                ObservedState::Running | ObservedState::Preparing | ObservedState::Starting
+            ) && let Err(e) = self.set_observed(&mut record, ObservedState::Stopped)
             {
                 report.failures.push((record.id.clone(), e));
             }
@@ -714,6 +1114,16 @@ impl Core {
         report.problems.extend(listing.problems);
         for mut record in listing.apps {
             let id = record.id.clone();
+            // 孤儿回收:supervisor(我们)重启后,上次留下的 `run_dir/process.json` 记的进程可能还活着,
+            // 先按记录的 pid 收掉,再按 desired 启动,避免"旧进程占着端口、新进程起不来"。
+            if let Err(e) = crate::process::supervise::reap_orphan(
+                &self.registry.paths().run_dir(&id),
+                std::time::Duration::from_secs(2),
+            ) {
+                report
+                    .problems
+                    .push((format!("(孤儿回收) {id}"), e.to_string()));
+            }
             let recovered = recover_after_supervisor_restart(record.observed.clone());
             if recovered != record.observed
                 && let Err(e) = self.set_observed(&mut record, recovered)
@@ -1079,16 +1489,19 @@ source = "web/"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn only_static_web_is_supported_in_phase_one() {
+    async fn containers_are_still_unsupported() {
         let rig = rig().await;
-        let dir = rig.src_dir("py");
+        let dir = rig.src_dir("c");
+        let digest = "a".repeat(64);
         write_files(
             &dir,
             &[(
                 "manifest.toml",
-                &manifest_toml("pyapp", "1.0.0", "").replace(
+                &manifest_toml("cont", "1.0.0", "").replace(
                     "kind = \"static_web\"\nsource = \"web/\"",
-                    "kind = \"python\"\ncommand = [\"python\", \"-m\", \"app\"]\n[runtime.http]\nport_env = \"PORT\"",
+                    &format!(
+                        "kind = \"container\"\nimage = \"docker.io/x/y@sha256:{digest}\"\n[runtime.http]\ncontainer_port = 80"
+                    ),
                 ),
             )],
         );
@@ -1097,7 +1510,7 @@ source = "web/"
             Provenance::Local,
             TrustLevel::Trusted,
         ) {
-            Err(ManagerError::UnsupportedRuntime(k)) => assert_eq!(k, "python"),
+            Err(ManagerError::UnsupportedRuntime(k)) => assert_eq!(k, "container"),
             other => panic!("{other:?}"),
         }
     }
@@ -1746,5 +2159,446 @@ source = "web/"
             app: a,
             state: ObservedState::Stopped
         }));
+    }
+
+    // ===== A6c Task 5:进程型应用 =====
+
+    #[cfg(unix)]
+    fn have(program: &str) -> bool {
+        SystemResolver::with_dirs(dirs_for(program))
+            .resolve(program)
+            .is_ok()
+    }
+
+    #[cfg(unix)]
+    fn dirs_for(program: &str) -> Vec<PathBuf> {
+        for d in ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"] {
+            if Path::new(d).join(program).is_file() {
+                return vec![PathBuf::from(d)];
+            }
+        }
+        Vec::new()
+    }
+
+    /// 在 `dir` 下写一个进程型(python)应用,`server_py` 是被 `python3` 执行的内容。
+    #[cfg(unix)]
+    fn write_py_app(dir: &Path, id: &str, version: &str, server_py: &str) -> AppSource {
+        let manifest = manifest_toml(id, version, "").replace(
+            "kind = \"static_web\"\nsource = \"web/\"",
+            "kind = \"python\"\ncommand = [\"python3\", \"server.py\"]\n[runtime.http]\nport_env = \"APP_PORT\"",
+        );
+        write_files(
+            dir,
+            &[("manifest.toml", &manifest), ("server.py", server_py)],
+        );
+        AppSource::LocalDir {
+            path: dir.to_path_buf(),
+        }
+    }
+
+    const PY_SERVER: &str = "import os, http.server\n\
+        http.server.test(HandlerClass=http.server.SimpleHTTPRequestHandler, port=int(os.environ[\"APP_PORT\"]), bind=\"127.0.0.1\")\n";
+
+    #[cfg(unix)]
+    fn observed_of(rig: &Rig, id: &AppId) -> Option<ObservedState> {
+        rig.manager
+            .list()
+            .ok()?
+            .into_iter()
+            .find(|s| &s.id == id)
+            .map(|s| s.observed)
+    }
+
+    /// 轮询直到观察态满足 `pred`(最多 `secs` 秒)。
+    #[cfg(unix)]
+    fn wait_for<F: Fn(&ObservedState) -> bool>(
+        rig: &Rig,
+        id: &AppId,
+        secs: u64,
+        pred: F,
+    ) -> ObservedState {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(o) = observed_of(rig, id)
+                && pred(&o)
+            {
+                return o;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("等待超时:{id} 停在 {:?}", observed_of(rig, id));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_running(o: &ObservedState) -> bool {
+        matches!(o, ObservedState::Running)
+    }
+
+    #[cfg(unix)]
+    fn is_terminal_failure(o: &ObservedState) -> bool {
+        matches!(
+            o,
+            ObservedState::Failed {
+                retryable: false,
+                ..
+            }
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_python_app_installs_starts_runs_behind_the_gateway_and_stops() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig().await;
+        let a = id("pyapp");
+        let src = write_py_app(&rig.src_dir("a"), "pyapp", "1.0.0", PY_SERVER);
+        let mut rx = rig.manager.events();
+        rig.install(&src).unwrap();
+        let url = rig.manager.start(&a).unwrap();
+        assert!(url.starts_with("http://pyapp.localhost:"), "{url}");
+        wait_for(&rig, &a, 15, is_running);
+        assert_eq!(rig.fetch(&a, "/").status, 200);
+
+        let events = drain(&mut rx);
+        assert!(
+            events.contains(&AppEvent::StateChanged {
+                app: a.clone(),
+                state: ObservedState::Starting
+            }),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AppEvent::StateChanged {
+                state: ObservedState::Running,
+                ..
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::EndpointChanged { url: Some(_), .. }))
+        );
+
+        rig.manager.stop(&a).unwrap();
+        assert_eq!(observed_of(&rig, &a), Some(ObservedState::Stopped));
+        assert_eq!(rig.fetch(&a, "/").status, 404);
+        let events = drain(&mut rx);
+        assert!(events.contains(&AppEvent::EndpointChanged { app: a, url: None }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plans_for_process_apps_reject_reserved_port_names_and_foreign_commands_and_missing_lockfiles()
+     {
+        let rig = rig().await;
+        // 保留名作端口变量
+        let d1 = rig.src_dir("p1");
+        let m1 = manifest_toml("p1", "1.0.0", "").replace(
+            "kind = \"static_web\"\nsource = \"web/\"",
+            "kind = \"python\"\ncommand = [\"python3\", \"server.py\"]\n[runtime.http]\nport_env = \"NODE_OPTIONS\"",
+        );
+        write_files(&d1, &[("manifest.toml", &m1), ("server.py", "")]);
+        let e1 = rig
+            .manager
+            .install_plan(
+                &AppSource::LocalDir { path: d1 },
+                Provenance::Local,
+                TrustLevel::Trusted,
+            )
+            .unwrap_err();
+        assert!(matches!(e1, ManagerError::BadSource(_)), "{e1:?}");
+        assert_eq!(e1.kind(), crate::proto::AppErrorKind::Rejected);
+
+        // 外来命令(argv[0] 不是该运行时的解释器)
+        let d2 = rig.src_dir("p2");
+        let m2 = manifest_toml("p2", "1.0.0", "").replace(
+            "kind = \"static_web\"\nsource = \"web/\"",
+            "kind = \"python\"\ncommand = [\"sh\", \"-c\", \"x\"]\n[runtime.http]\nport_env = \"APP_PORT\"",
+        );
+        write_files(&d2, &[("manifest.toml", &m2)]);
+        assert!(matches!(
+            rig.manager.install_plan(
+                &AppSource::LocalDir { path: d2 },
+                Provenance::Local,
+                TrustLevel::Trusted
+            ),
+            Err(ManagerError::BadSource(_))
+        ));
+
+        // 声明了 lockfile 但包里没有
+        let d3 = rig.src_dir("p3");
+        let m3 = manifest_toml("p3", "1.0.0", "").replace(
+            "kind = \"static_web\"\nsource = \"web/\"",
+            "kind = \"node\"\ncommand = [\"node\", \"server.js\"]\nlockfile = \"package-lock.json\"\n[runtime.http]\nport_env = \"APP_PORT\"",
+        );
+        write_files(&d3, &[("manifest.toml", &m3), ("server.js", "")]);
+        assert!(matches!(
+            rig.manager.install_plan(
+                &AppSource::LocalDir { path: d3 },
+                Provenance::Local,
+                TrustLevel::Trusted
+            ),
+            Err(ManagerError::BadSource(_))
+        ));
+
+        // 合法进程型清单:enforcement 里没有任何 Enforced(全是 Advisory)
+        if have("python3") {
+            let d4 = rig.src_dir("p4");
+            let src = write_py_app(&d4, "p4", "1.0.0", PY_SERVER);
+            let plan = rig
+                .manager
+                .install_plan(&src, Provenance::Local, TrustLevel::Trusted)
+                .unwrap();
+            assert!(
+                plan.enforcement
+                    .iter()
+                    .all(|e| e.enforcement != crate::permissions::Enforcement::Enforced),
+                "{:?}",
+                plan.enforcement
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_runtime_fails_the_start_with_a_retryable_failure_and_an_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let manager = AppManager::with_resolver(
+            tmp.path().join("bytehost"),
+            HOST,
+            gateway,
+            Arc::new(SystemResolver::with_dirs(vec![])),
+        )
+        .unwrap();
+        let src = write_py_app(&tmp.path().join("src"), "pyapp", "1.0.0", PY_SERVER);
+        let approved = manager
+            .install_plan(&src, Provenance::Local, TrustLevel::Trusted)
+            .unwrap()
+            .approve(Approval {
+                approver: "test".into(),
+                approved_ms: 1,
+            });
+        manager.install(&approved, &src, 100).unwrap();
+        let mut rx = manager.events();
+        let a = id("pyapp");
+        assert!(matches!(
+            manager.start(&a),
+            Err(ManagerError::RuntimeUnavailable(name)) if name == "python3"
+        ));
+        let summary = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == a)
+            .unwrap();
+        assert!(
+            matches!(
+                summary.observed,
+                ObservedState::Failed {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            summary.observed
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AppEvent::RuntimeUnavailable {
+                    reason: RuntimeReason::NotInstalled { runtime },
+                    ..
+                } if runtime == "python3"
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopping_while_the_app_is_still_starting_does_not_leave_it_running() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig().await;
+        let a = id("slow");
+        let slow = "import os, time, http.server\ntime.sleep(3)\n\
+            http.server.test(HandlerClass=http.server.SimpleHTTPRequestHandler, port=int(os.environ[\"APP_PORT\"]), bind=\"127.0.0.1\")\n";
+        let src = write_py_app(&rig.src_dir("a"), "slow", "1.0.0", slow);
+        rig.install(&src).unwrap();
+        rig.manager.start(&a).unwrap();
+        // 此刻还在 Starting(server 先睡 3 秒)
+        let t0 = std::time::Instant::now();
+        rig.manager.stop(&a).unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "stop 拖太久:{:?}",
+            t0.elapsed()
+        );
+        assert_eq!(observed_of(&rig, &a), Some(ObservedState::Stopped));
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(observed_of(&rig, &a), Some(ObservedState::Stopped));
+        assert_eq!(rig.fetch(&a, "/").status, 404);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_crashing_app_ends_up_failed_and_not_retryable_and_its_site_is_gone() {
+        if !have("python3") {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let manager = AppManager::with_resolver_and_policy_for_test(
+            tmp.path().join("bytehost"),
+            HOST,
+            gateway.clone(),
+            Arc::new(SystemResolver::new()),
+            crate::process::restart::RestartPolicy {
+                max_restarts: 1,
+                base: Duration::from_millis(50),
+                cap: Duration::from_millis(100),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rig = Rig {
+            tmp,
+            gateway,
+            manager,
+        };
+        let a = id("boomer");
+        let src = write_py_app(
+            &rig.src_dir("a"),
+            "boomer",
+            "1.0.0",
+            "raise SystemExit(1)\n",
+        );
+        rig.install(&src).unwrap();
+        rig.manager.start(&a).unwrap();
+        wait_for(&rig, &a, 15, is_terminal_failure);
+        assert_eq!(rig.fetch(&a, "/").status, 404);
+        rig.manager.stop(&a).unwrap();
+        assert_eq!(observed_of(&rig, &a), Some(ObservedState::Stopped));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_all_stops_every_process_and_reconcile_brings_wanted_ones_back() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig().await;
+        let a = id("a-app");
+        let b = id("b-app");
+        rig.install(&write_py_app(
+            &rig.src_dir("a"),
+            "a-app",
+            "1.0.0",
+            PY_SERVER,
+        ))
+        .unwrap();
+        rig.install(&write_py_app(
+            &rig.src_dir("b"),
+            "b-app",
+            "1.0.0",
+            PY_SERVER,
+        ))
+        .unwrap();
+        rig.manager.start(&a).unwrap();
+        rig.manager.start(&b).unwrap();
+        wait_for(&rig, &a, 15, is_running);
+        wait_for(&rig, &b, 15, is_running);
+
+        let t0 = std::time::Instant::now();
+        assert!(rig.manager.suspend_all().is_clean());
+        // 并行收尾:总耗时 ≈ 最长的宽限,不是两倍
+        assert!(
+            t0.elapsed() < 2 * supervisor::DEFAULT_GRACE + Duration::from_secs(1),
+            "suspend_all 太慢:{:?}",
+            t0.elapsed()
+        );
+        for app in [&a, &b] {
+            let s = rig
+                .manager
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|s| &s.id == app)
+                .unwrap();
+            assert_eq!(s.observed, ObservedState::Stopped);
+            assert_eq!(s.desired, DesiredState::Running, "desired 不该被改");
+        }
+        assert_eq!(rig.fetch(&a, "/").status, 404);
+
+        assert!(rig.manager.reconcile().is_clean());
+        wait_for(&rig, &a, 15, is_running);
+        wait_for(&rig, &b, 15, is_running);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_reaps_a_leftover_process_recorded_in_the_run_dir() {
+        use crate::process::supervise::{record_for, write_record};
+        use std::os::unix::process::CommandExt;
+
+        let rig = rig().await;
+        // 装一个应用,好让 reconcile 有 AppPaths(apps/<id>/run)
+        let a = id("orphan");
+        rig.install(&write_app(&rig.src_dir("a"), "orphan", "1.0.0", "", "x"))
+            .unwrap();
+        let run_dir = rig.manager.registry.paths().run_dir(&a);
+        fs::create_dir_all(&run_dir).unwrap();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("306")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        write_record(
+            &run_dir,
+            &record_for(child.id(), vec!["sleep".into(), "306".into()]),
+        )
+        .unwrap();
+
+        assert!(rig.manager.reconcile().is_clean());
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "孤儿进程应被信号终止:{status:?}");
+        assert!(!run_dir.join("process.json").exists(), "记录应被清掉");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changing_the_lockfile_changes_the_dependency_marker() {
+        // 重型 e2e(假 npm/node)略;这里钉住关键不变量:标记名随 lockfile 内容变化。
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(Gateway::start(GatewayConfig { port: 0 }))
+                .unwrap(),
+        );
+        let manager = AppManager::new(tmp.path().join("bytehost"), HOST, gateway).unwrap();
+        let dir = tmp.path().join("pkg");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("package-lock.json"), b"one").unwrap();
+        let m1 = manager.lockfile_digest(&dir, "package-lock.json");
+        fs::write(dir.join("package-lock.json"), b"two").unwrap();
+        let m2 = manager.lockfile_digest(&dir, "package-lock.json");
+        assert_ne!(m1, m2);
+        // 标记路径确实由这个摘要派生(与 start_process_locked 里一致)
+        let cache = manager.registry.paths().cache_dir(&id("x"));
+        assert!(
+            cache
+                .join(format!("deps-{m1}.ok"))
+                .to_string_lossy()
+                .contains(&m1)
+        );
     }
 }
