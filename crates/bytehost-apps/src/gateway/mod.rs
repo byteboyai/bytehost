@@ -11,6 +11,7 @@
 //! 4. **方法**:只允许 GET/HEAD;
 //! 5. **路径解析**(`static_files::resolve`):任何写法都不能走出站点根目录。
 
+mod proxy;
 mod static_files;
 
 use std::collections::HashMap;
