@@ -35,6 +35,8 @@ pub mod registry;
 pub mod runtime;
 pub mod runtime_version;
 #[cfg(feature = "server")]
+pub mod service;
+#[cfg(feature = "server")]
 pub mod source;
 pub mod state;
 #[cfg(all(feature = "server", unix))]

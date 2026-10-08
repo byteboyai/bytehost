@@ -28,6 +28,7 @@ server = [
     "dep:zip",
     "dep:flate2",
     "dep:tar",
+    "dep:tracing",
 ]
 
 [dependencies]
@@ -41,6 +42,8 @@ hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
 http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 uuid = { workspace = true, optional = true }
+# 日志:`server` feature 下 `AppService` 直接写 tracing(target `bytehost::*`),不依赖任何产品 crate。
+tracing = { workspace = true, optional = true }
 # 进程组信号(`kill(-pgid, SIGTERM)`)与存活探测;已在依赖树里(tokio 等依赖它),不新增 crate。
 libc = { version = "0.2", optional = true }
 # A6h 压缩包来源:进程内逐条目校验解压(绝不交给系统 `tar`/`unzip`)。
