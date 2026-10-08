@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::id::AppId;
 use crate::process::env::{EnvSpec, build_env};
-use crate::process::health::{Health, wait_healthy};
+use crate::process::health::{Health, probe_http, wait_healthy};
 use crate::process::restart::{Decision, RestartPolicy, RestartTracker};
 use crate::process::supervise::{
     ProcessSpec, Running, clear_record, pick_free_port, record_for, write_record,
@@ -26,6 +26,12 @@ pub const DEFAULT_STARTUP_BUDGET: Duration = Duration::from_secs(30);
 pub const DEFAULT_INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// 停止子进程的默认宽限(与 A6a 的 `stop` 语义一致)。
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(3);
+/// 运行中周期健康检查的默认间隔(A6e)。
+pub const DEFAULT_MONITOR_INTERVAL: Duration = Duration::from_secs(15);
+/// 运行中健康检查单次探测的默认超时。
+pub const DEFAULT_MONITOR_TIMEOUT: Duration = Duration::from_secs(2);
+/// 连续多少次运行中健康检查失败才判定卡死并重启。`0` 表示关闭检查。
+pub const DEFAULT_MONITOR_FAILURES: u32 = 3;
 
 /// 监管线程在"起来之前"的两个阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +74,12 @@ pub struct Launch {
     pub policy: RestartPolicy,
     /// 停止宽限,默认 3s。
     pub grace: Duration,
+    /// 运行中健康检查间隔(A6e);`monitor_failures == 0` 时不检查。
+    pub monitor_interval: Duration,
+    /// 运行中健康检查的单次探测超时。
+    pub monitor_timeout: Duration,
+    /// 连续失败多少次判定卡死并重启;`0` 关闭检查。
+    pub monitor_failures: u32,
 }
 
 /// 依赖安装:跑 `argv`(已把 `argv[0]` 换绝对路径),成功写 `marker`。
@@ -143,7 +155,9 @@ pub fn run(launch: Launch, cancel: Arc<AtomicBool>, tr: Arc<dyn Transitions>) {
                             clear_record(&launch.run_dir);
                             return;
                         }
-                        // 盯着,直到进程退出或被取消
+                        // 盯着,直到进程退出、被取消、或运行中健康检查连续失败
+                        let mut consecutive: u32 = 0;
+                        let mut last_probe = Instant::now();
                         loop {
                             if cancelled() {
                                 let _ = running.stop(launch.grace);
@@ -152,6 +166,24 @@ pub fn run(launch: Launch, cancel: Arc<AtomicBool>, tr: Arc<dyn Transitions>) {
                             }
                             if let Ok(Some(status)) = running.try_exit() {
                                 break format!("进程退出: {status}");
+                            }
+                            if launch.monitor_failures > 0
+                                && last_probe.elapsed() >= launch.monitor_interval
+                            {
+                                last_probe = Instant::now();
+                                match probe_http(port, &launch.health_path, launch.monitor_timeout)
+                                {
+                                    Health::Healthy => consecutive = 0,
+                                    Health::Unhealthy(_) => {
+                                        consecutive += 1;
+                                        if consecutive >= launch.monitor_failures {
+                                            let _ = running.stop(launch.grace);
+                                            break format!(
+                                                "运行中健康检查连续失败 {consecutive} 次"
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             std::thread::sleep(Duration::from_millis(200));
                         }
@@ -335,6 +367,9 @@ mod tests {
             run_dir: dir.join("run"),
             policy: FAST_POLICY,
             grace: Duration::from_secs(1),
+            monitor_interval: DEFAULT_MONITOR_INTERVAL,
+            monitor_timeout: DEFAULT_MONITOR_TIMEOUT,
+            monitor_failures: 0,
         }
     }
 
@@ -382,6 +417,216 @@ mod tests {
     fn rec() -> (Arc<Rec>, Arc<AtomicBool>) {
         let r = Arc::new(Rec::default());
         (r.clone(), r.cancel.clone())
+    }
+
+    /// 一个按"第几次请求"决定行为的 python 服务器:前 `healthy_probes` 次正常应答,
+    /// 之后按 `fail_ms`(> 单次探测超时即超时失败)处理。`pidfile` 记录 pid 供断言收进程。
+    /// `fail_ms = 0` 表示此后永久卡死(`sleep(3600)`)。
+    fn monitoring_script(dir: &std::path::Path, healthy_probes: u32, fail_ms: u64) -> String {
+        let pidfile = dir.join("monitor.pid");
+        let server = format!(
+            r#"
+import os, time, http.server, socketserver, sys
+count = 0
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        global count
+        count += 1
+        if count <= {healthy_probes}:
+            self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+        elif {fail_ms} == 0:
+            time.sleep(3600)
+        else:
+            time.sleep({fail_ms} / 1000.0)
+            self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+    def log_message(self, *a):
+        pass
+open(r'{pidfile}', 'w').write(str(os.getpid()))
+socketserver.TCPServer.allow_reuse_address = True
+http.server.test(HandlerClass=H, port=int(os.environ['APP_PORT']), bind='127.0.0.1')
+"#,
+            healthy_probes = healthy_probes,
+            fail_ms = fail_ms,
+            pidfile = pidfile.display(),
+        );
+        format!("python3 -c \"{server}\"")
+    }
+
+    /// 监视参数调小:方便测试快速触发。
+    fn monitoring_launch(dir: &std::path::Path, script: &str, failures: u32) -> Launch {
+        let mut l = launch(dir, script);
+        l.monitor_interval = Duration::from_millis(150);
+        l.monitor_timeout = Duration::from_millis(300);
+        l.monitor_failures = failures;
+        l
+    }
+
+    fn read_pid(path: &std::path::Path) -> i32 {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn pid_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[test]
+    fn a_process_that_stops_answering_is_killed_and_restarted() {
+        if !have_python3() {
+            eprintln!("跳过:没有 python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // 启动期探测 + 一次监视探测应答(前 3 次),之后永久卡死。
+        let script = monitoring_script(dir.path(), 3, 0);
+        let (r, cancel) = rec();
+        let mut l = monitoring_launch(dir.path(), &script, 3);
+        l.startup_budget = Duration::from_secs(5);
+        run(l, cancel, r.clone());
+        let names = r.names();
+        let log = r.log.lock().unwrap().clone();
+        // ready 之后应出现一次"运行中健康检查连续失败",随后重启并再次 ready。
+        assert_eq!(names.first().map(String::as_str), Some("Starting"));
+        assert!(names.contains(&"ready".to_string()), "{log:?}");
+        assert!(
+            log.iter()
+                .any(|s| s.starts_with("down") && s.contains("运行中健康检查连续失败")),
+            "{log:?}"
+        );
+        assert!(
+            names.iter().filter(|n| *n == "ready").count() >= 2,
+            "应重启并重新就绪:{log:?}"
+        );
+        // 旧进程已被收掉。
+        let pid = read_pid(&dir.path().join("monitor.pid"));
+        assert!(!pid_alive(pid), "卡死的旧进程应已被收掉");
+    }
+
+    #[test]
+    fn a_slow_but_answering_app_is_not_killed() {
+        if !have_python3() {
+            eprintln!("跳过:没有 python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // 每次应答 sleep 100ms(< timeout 300ms):慢但活着,不应被判死。
+        let script = monitoring_script(dir.path(), u32::MAX, 100);
+        let (r, cancel) = rec();
+        let l = monitoring_launch(dir.path(), &script, 3);
+        let started = Instant::now();
+        // 观察 ~1.5s 后取消。
+        *r.cancel_on.lock().unwrap() = Some("__timeout__".into());
+        let handle = std::thread::spawn({
+            let cancel = cancel.clone();
+            move || {
+                // 让监管跑 1.5s 再取消
+                std::thread::sleep(Duration::from_millis(1500));
+                cancel.store(true, Ordering::SeqCst);
+            }
+        });
+        run(l, cancel, r.clone());
+        let _ = handle.join();
+        let _ = started;
+        assert!(
+            !r.names().iter().any(|n| n == "down"),
+            "慢但应答的应用不应被杀:{:?}",
+            r.log
+        );
+    }
+
+    #[test]
+    fn a_single_failed_probe_does_not_count_after_a_success() {
+        if !have_python3() {
+            eprintln!("跳过:没有 python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // 交替:成功一次、失败一次……连续失败永不到 3。
+        let script = "python3 -c \"import os,time,http.server,socketserver\n\
+             count=0\n\
+             class H(http.server.BaseHTTPRequestHandler):\n\
+             \x20 def do_GET(self):\n\
+             \x20   global count\n\
+             \x20   count+=1\n\
+             \x20   if count%2==1:\n\
+             \x20     self.send_response(200);self.end_headers();self.wfile.write(b'ok')\n\
+             \x20   else:\n\
+             \x20     time.sleep(0.4);self.send_response(200);self.end_headers()\n\
+             \x20 def log_message(self,*a): pass\n\
+             socketserver.TCPServer.allow_reuse_address=True\n\
+             http.server.test(HandlerClass=H,port=int(os.environ['APP_PORT']),bind='127.0.0.1')\n\"";
+        let (r, cancel) = rec();
+        let l = monitoring_launch(dir.path(), script, 3);
+        let handle = std::thread::spawn({
+            let cancel = cancel.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(2000));
+                cancel.store(true, Ordering::SeqCst);
+            }
+        });
+        run(l, cancel, r.clone());
+        let _ = handle.join();
+        assert!(
+            !r.names().iter().any(|n| n == "down"),
+            "交替失败不应累积到阈值:{:?}",
+            r.log
+        );
+    }
+
+    #[test]
+    fn disabling_the_monitor_keeps_the_old_behaviour() {
+        if !have_python3() {
+            eprintln!("跳过:没有 python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // 前 3 次应答后永久卡死,但 monitor_failures=0 表示关闭检查 → 不该被杀。
+        let script = monitoring_script(dir.path(), 3, 0);
+        let (r, cancel) = rec();
+        let l = monitoring_launch(dir.path(), &script, 0);
+        let handle = std::thread::spawn({
+            let cancel = cancel.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(1000));
+                cancel.store(true, Ordering::SeqCst);
+            }
+        });
+        run(l, cancel, r.clone());
+        let _ = handle.join();
+        assert!(
+            !r.names().iter().any(|n| n == "down"),
+            "关闭检查后卡死的应用不该被杀:{:?}",
+            r.log
+        );
+    }
+
+    #[test]
+    fn cancelling_during_monitoring_stops_without_further_probes() {
+        if !have_python3() {
+            eprintln!("跳过:没有 python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<h1>hi</h1>").unwrap();
+        let (r, cancel) = rec();
+        *r.cancel_on.lock().unwrap() = Some("ready".into());
+        let mut l = monitoring_launch(dir.path(), &serve_script(0), 3);
+        l.grace = Duration::from_secs(1);
+        let grace = l.grace;
+        let started = Instant::now();
+        run(l, cancel, r.clone());
+        assert!(
+            started.elapsed() < grace + Duration::from_secs(1),
+            "取消后应尽快收尾:{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            r.names().iter().next_back().map(String::as_str),
+            Some("ready")
+        );
     }
 
     #[test]

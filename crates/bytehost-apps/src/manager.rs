@@ -951,6 +951,9 @@ impl Core {
             run_dir,
             policy: self.policy,
             grace: supervisor::DEFAULT_GRACE,
+            monitor_interval: supervisor::DEFAULT_MONITOR_INTERVAL,
+            monitor_timeout: supervisor::DEFAULT_MONITOR_TIMEOUT,
+            monitor_failures: supervisor::DEFAULT_MONITOR_FAILURES,
         };
 
         record.desired = DesiredState::Running;
