@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# 门禁:bytehost-apps 是要让 Digger 也能用的、与产品无关的 crate。
-#  1. 任何 feature 组合下,依赖树里都不得出现 dozer* crate(不依赖 Dozer 的任何东西);
-#  2. 默认 feature(只有类型与纯逻辑)的依赖闭包只能是 serde/serde_json 家族——`dozer-core` 依赖它时,
-#     `dozer-hook`/`dozer-mcp` 才不会因此多出新 crate。
+# 门禁:bytehost 各 crate 必须与产品、界面框架、平台 webview 库解耦。
+#  1. 任一 crate 的依赖树里都不得出现 dozer*、iced*、wry、tauri*、objc2*(含 build 依赖与所有目标平台);
+#  2. bytehost-apps 默认 feature 的依赖闭包只能是 serde 家族(dozer-core 依赖它时 hook/mcp 不多出新 crate);
+#  3. bytehost-panel 的依赖只能是 bytehost-apps、bytehost-client 及其传递依赖;
+#  4. bytehost-panel 源码里不得出现 `AppSlot` 或小写 `toast` 字样(它只认 `AppKey` 与 `Notice`)。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,30 +20,52 @@ tree_of() {
   echo "$out" | awk '{print $1}' | sort -u
 }
 
-tree() { tree_of bytehost-apps "$@"; }
-all=$(tree --all-features)
-if echo "$all" | grep -qE '^dozer'; then
-  echo "bytehost-apps 不得依赖 dozer* crate,发现:" >&2
-  echo "$all" | grep -E '^dozer' >&2
-  exit 1
-fi
+# 1. 四个 crate 在 --all-features 下都不得出现被禁依赖。
+banned='^(dozer.*|iced.*|wry|tauri.*|objc2.*)$'
+for pkg in bytehost-apps bytehost-client bytehost-webview bytehost-panel; do
+  tree=$(tree_of "$pkg" --all-features)
+  hits=$(echo "$tree" | grep -E "$banned" || true)
+  if [ -n "$hits" ]; then
+    echo "$pkg 的依赖里出现了被禁的 crate:" >&2
+    echo "$hits" >&2
+    exit 1
+  fi
+done
 
+# 2. bytehost-apps 默认 feature 的依赖闭包只允许 serde 家族。
+apps_default=$(tree_of bytehost-apps)
 allowed='^(bytehost-apps|serde|serde_core|serde_derive|serde_json|proc-macro2|quote|syn|unicode-ident|itoa|memchr|zmij)$'
-extra=$(tree | grep -Ev "$allowed" || true)
+extra=$(echo "$apps_default" | grep -Ev "$allowed" || true)
 if [ -n "$extra" ]; then
   echo "bytehost-apps 默认 feature 的依赖闭包里出现了不在白名单里的 crate(新增依赖请放进 feature):" >&2
   echo "$extra" >&2
   exit 1
 fi
-# 注意:这里检查的是 `cargo tree -p dozer-hook` **单独**解析出的依赖闭包。发布脚本把 hook 与 dozerd 在同一次
-# cargo 调用里构建,feature 会合并(hook 实际是对着带 `server` feature 的 bytehost-apps 编译的),只是链接器会裁掉
-# 用不到的代码。所以本检查保证的是"源码层面 hook 不依赖这些 crate",不是"hook 二进制里没有它们的代码"。
-# 3. `dozer-core` 依赖 bytehost-apps(默认 feature),`dozer-hook` 又依赖 `dozer-core`:hook 的依赖闭包里除了
-#    bytehost-apps 本身不能出现 tokio/hyper/sha2/toml/uuid 这些 server/digest/manifest-toml feature 的依赖。
-hook=$(tree_of dozer-hook)
-if echo "$hook" | grep -qE '^(tokio|hyper|hyper-util|http-body-util|bytes|sha2|toml|uuid)$'; then
-  echo "dozer-hook 的依赖闭包被 bytehost-apps 的可选依赖污染了:" >&2
-  echo "$hook" | grep -E '^(tokio|hyper|hyper-util|http-body-util|bytes|sha2|toml|uuid)$' >&2
+
+# 3. bytehost-panel 的依赖只能是 bytehost-apps、bytehost-client 及其传递依赖。
+panel=$(tree_of bytehost-panel --all-features)
+panel_banned='^(iced.*|wry|tauri.*|objc2.*|dozer.*)$'
+hits=$(echo "$panel" | grep -E "$panel_banned" || true)
+if [ -n "$hits" ]; then
+  echo "bytehost-panel 的依赖里出现了被禁的 crate:" >&2
+  echo "$hits" >&2
   exit 1
 fi
-echo "bytehost-apps deps check: ok"
+# panel 的直接依赖(去掉 bytehost-apps/client 的传递闭包)只允许 bytehost-apps/client。
+# 用 `cargo tree -p bytehost-panel --depth 1` 取直接依赖名单。
+direct=$(cargo tree -p bytehost-panel --depth 1 --prefix none --all-features 2>/dev/null \
+  | awk '{print $1}' | sort -u | grep -v '^bytehost-panel$' || true)
+unexpected=$(echo "$direct" | grep -Ev '^(bytehost-apps|bytehost-client)$' || true)
+if [ -n "$unexpected" ]; then
+  echo "bytehost-panel 的直接依赖超出了 bytehost-apps/bytehost-client:" >&2
+  echo "$unexpected" >&2
+  exit 1
+fi
+
+# 4. 源码里不得出现 dozer 词汇。
+if grep -rn "AppSlot\|toast" crates/bytehost-panel/src; then
+  echo "bytehost-panel 源码里出现了 AppSlot/toast(应改用 AppKey/Notice):" >&2
+  exit 1
+fi
+
+echo "bytehost deps check: ok"

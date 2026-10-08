@@ -3,7 +3,7 @@
 //! 用手工要求的命令运行:
 //! `cargo test -p bytehost-apps --test process_apps_live -- --ignored --nocapture`
 //!
-//! 这里用真 `SystemResolver`、真 gateway、真监管线程,对 `scripts/bytehost/samples/`
+//! 这里用真 `SystemResolver`、真 gateway、真监管线程,对 `scripts/samples/`
 //! 里的 `py-notes`(Python)与 `node-notes`(Node)各跑同一条流程:安装 → 启动 →
 //! 同源/令牌检查 → SSE → WebSocket → 持久化计数 → 崩溃重启 → 卡死被健康检查重启 →
 //! 停止/卸载 → 日志 → 版本要求不满足。
@@ -40,7 +40,7 @@ fn samples_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
-        .join("scripts/bytehost/samples")
+        .join("scripts/samples")
 }
 
 /// 一个示例应用:样例目录名(也是应用 id)与它的 manifest 文件名。

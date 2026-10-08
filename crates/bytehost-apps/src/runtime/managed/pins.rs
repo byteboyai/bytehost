@@ -1,6 +1,6 @@
 //! 固定版本表(A6d):每个可装物的**唯一** `Pin`——版本、来源 URL、SHA-256、解压后进程的相对路径。
 //!
-//! **数据段 `PINS` 由 `scripts/bytehost/pin-runtimes.sh` 从官方源直接 `curl` 生成,不许手写哈希、
+//! **数据段 `PINS` 由 `scripts/pin-runtimes.sh` 从官方源直接 `curl` 生成,不许手写哈希、
 //! 不许模型转述**;见脚本头注释。这里只放类型、查表与纯测试。
 //!
 //! Python 本身**不在表里**:它由已装好的 uv 执行 `uv python install`(来源 python-build-standalone,
@@ -62,10 +62,10 @@ pub fn pin_names_for(rt: ManagedRuntime) -> &'static [&'static str] {
     }
 }
 
-// ---- 数据段(由 scripts/bytehost/pin-runtimes.sh 生成,请勿手写)----
+// ---- 数据段(由 scripts/pin-runtimes.sh 生成,请勿手写)----
 
-/// 本数据段由 scripts/bytehost/pin-runtimes.sh 从官方源生成,请勿手写。
-/// 生成命令: scripts/bytehost/pin-runtimes.sh 24.21.0 0.12.23
+/// 本数据段由 scripts/pin-runtimes.sh 从官方源生成,请勿手写。
+/// 生成命令: scripts/pin-runtimes.sh 24.21.0 0.12.23
 /// Node 24.21.0 LTS, uv 0.12.23。
 pub const PINS: &[Pin] = &[
     Pin {
