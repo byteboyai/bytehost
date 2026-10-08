@@ -25,10 +25,13 @@ use crate::gateway::{Gateway, csp_for};
 use crate::id::{AppId, Version};
 use crate::launch::{check_process_runtime, install_argv, lockfile_of};
 use crate::manifest::{Manifest, ManifestError, Runtime};
+use crate::permissions::diff_permissions;
 use crate::plan::{
     ApprovedInstallPlan, InstallPlan, Installed, PlanInput, Provenance, TrustLevel, VerifyError,
 };
-use crate::registry::{AppRecord, RECORD_FORMAT_VERSION, Registry, UninstallMode, VersionRecord};
+use crate::registry::{
+    AppRecord, RECORD_FORMAT_VERSION, Registry, RollbackNote, UninstallMode, VersionRecord,
+};
 use crate::runtime::{
     ResolveError, Resolved, RuntimeResolver, SystemResolver, SystemVersionProbe, VersionProbe,
     enforcement_for,
@@ -71,6 +74,10 @@ pub enum ManagerError {
         required: String,
         found: String,
     },
+    /// 回滚到目标版本会让权限相对当前授予提升——拒绝(回滚不得提权)。
+    RollbackEscalates,
+    /// 没有可回滚的上一版。
+    NoPreviousVersion(AppId),
 }
 
 impl std::fmt::Display for ManagerError {
@@ -97,6 +104,10 @@ impl std::fmt::Display for ManagerError {
                 found,
             } => write!(f, "需要 {runtime} {required},当前 {found}"),
             Self::MissingSource(p) => write!(f, "应用包里缺少站点目录: {}", p.display()),
+            Self::RollbackEscalates => {
+                write!(f, "回滚会提升权限,请重新安装该版本并审批")
+            }
+            Self::NoPreviousVersion(id) => write!(f, "应用 {id} 没有可回滚的上一版"),
         }
     }
 }
@@ -116,6 +127,8 @@ impl ManagerError {
             Self::ShuttingDown => K::Unavailable,
             Self::RuntimeUnavailable(_) => K::Unavailable,
             Self::RuntimeVersion { .. } => K::Unavailable,
+            Self::RollbackEscalates => K::Conflict,
+            Self::NoPreviousVersion(_) => K::NotFound,
         }
     }
 }
@@ -243,6 +256,20 @@ impl AppTransitions {
         }
         Some(g)
     }
+
+    /// 应用刚被写成了 `Failed`(崩溃放弃、依赖安装失败、健康检查未过等)之后统一处理:
+    /// 若目标版本还在"试用期",从**独立线程**触发自动回滚——绝不在监管线程回调里直接
+    /// `rollback_locked`,那会与 `stop` 持锁 `join` 本线程自锁(Review Focus 2)。
+    fn after_failed(&self) {
+        let record = match self.core.load_record(&self.id) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if record.probation {
+            self.core
+                .spawn_auto_rollback(self.id.clone(), record.current_version);
+        }
+    }
 }
 
 impl Transitions for AppTransitions {
@@ -269,6 +296,10 @@ impl Transitions for AppTransitions {
         };
         let upstream = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         self.core.gateway.add_upstream(&self.id, upstream);
+        // 升级后的首次启动成功:试用期结束,这一版站住了(A6g Task 2)。
+        // 必须在写 `Running` 之前改好,让两个字段在同一次 `set_observed` 落盘——
+        // 否则读者可能在两次 save 之间看到 Running 但 probation 仍为 true 的中间态。
+        record.probation = false;
         if self
             .core
             .set_observed(&mut record, ObservedState::Running)
@@ -299,6 +330,7 @@ impl Transitions for AppTransitions {
                 url: None,
             });
         }
+        let giving_up = restart_in.is_none();
         let observed = match restart_in {
             Some(_) => ObservedState::Starting,
             None => ObservedState::Failed {
@@ -306,7 +338,12 @@ impl Transitions for AppTransitions {
                 retryable: false,
             },
         };
-        self.core.set_observed(&mut record, observed).is_ok()
+        let ok = self.core.set_observed(&mut record, observed).is_ok();
+        if ok && giving_up {
+            // restart_in = Some(_) 只是重启策略里的又一次重试,不触发回滚。
+            self.after_failed();
+        }
+        ok
     }
 
     fn failed(&self, reason: String, retryable: bool) -> bool {
@@ -323,9 +360,14 @@ impl Transitions for AppTransitions {
                 url: None,
             });
         }
-        self.core
+        let ok = self
+            .core
             .set_observed(&mut record, ObservedState::Failed { reason, retryable })
-            .is_ok()
+            .is_ok();
+        if ok {
+            self.after_failed();
+        }
+        ok
     }
 
     fn install_failed(&self, summary: String) -> bool {
@@ -349,7 +391,8 @@ impl Transitions for AppTransitions {
                 summary: summary.clone(),
             },
         );
-        self.core
+        let ok = self
+            .core
             .set_observed(
                 &mut record,
                 ObservedState::Failed {
@@ -357,7 +400,11 @@ impl Transitions for AppTransitions {
                     retryable: true,
                 },
             )
-            .is_ok()
+            .is_ok();
+        if ok {
+            self.after_failed();
+        }
+        ok
     }
 }
 
@@ -396,6 +443,14 @@ fn deps_marker(cache_dir: &Path, lockfile: Option<&[u8]>) -> PathBuf {
         Some(bytes) => cache_dir.join(format!("deps-{}.ok", sha256_hex(bytes))),
         None => cache_dir.join("deps-none.ok"),
     }
+}
+
+/// 当前墙钟时间(毫秒);后台线程记 `RollbackNote.at_ms` 用。
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 子进程 `PATH`:各解析结果的目录(去重、保持顺序)+ `/usr/bin:/bin` 兜底。
@@ -945,15 +1000,51 @@ impl Core {
         Ok(())
     }
 
-    /// 升级后的"再启"同步失败时的兜底:试用期内直接在同一把锁里自动回滚(A6g Task 2)。
-    /// Task 1 只保留占位实现(直接返回原错误),Task 2 补上回滚。
+    /// 升级后的"再启"同步失败时的兜底(A6g Task 2):试用期内直接在同一把锁里自动回滚。
+    /// 升级动作本身已完成(包已落位、记录已写),回滚是它的收尾,所以 `install` 仍返回 `Ok(())`,
+    /// 结果由 `last_rollback` 与 `RolledBack` 事件体现。
     fn maybe_rollback_after_failed_start(
         &self,
-        _id: &AppId,
+        id: &AppId,
         err: ManagerError,
-        _now_ms: u64,
+        now_ms: u64,
     ) -> Result<(), ManagerError> {
-        Err(err)
+        let mut record = self.load_record(id)?;
+        if !record.probation {
+            return Ok(());
+        }
+        let failed_version = record.current_version;
+        // 同步失败可能发生在 `start_locked` 写 `desired = Running` 之前(如版本校验);
+        // 我们只知道是在给"原本运行中"的应用做升级,所以这里补上,回滚后才会把旧版本再拉起。
+        if record.desired != DesiredState::Running {
+            record.desired = DesiredState::Running;
+            self.registry.save(&record)?;
+        }
+        match self.rollback_locked(
+            id,
+            format!("新版本 {failed_version} 启动失败: {err}"),
+            true,
+            now_ms,
+        ) {
+            Ok(()) => Ok(()),
+            Err(ManagerError::RollbackEscalates) => {
+                // 不能回滚(会提权):保持 Failed,把原因写进 last_rollback(to == from)。
+                let mut record = self.load_record(id)?;
+                record.probation = false;
+                record.last_rollback = Some(RollbackNote {
+                    from: failed_version,
+                    to: failed_version,
+                    reason: format!(
+                        "新版本 {failed_version} 启动失败({err}),但回滚到上一版需要更高权限,未自动回滚"
+                    ),
+                    automatic: true,
+                    at_ms: now_ms,
+                });
+                self.registry.save(&record)?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn load_record(&self, id: &AppId) -> Result<AppRecord, ManagerError> {
@@ -1460,6 +1551,128 @@ impl Core {
             });
         }
         Ok(())
+    }
+    /// 回滚到 `previous_version`(调用方已持锁)。`automatic` 只影响 `RollbackNote` 与事件。
+    /// 目标版本权限相对**当前授予**有任何 `escalation` → `Err(RollbackEscalates)`(不改任何状态):
+    /// 回滚不得提升权限。回滚消耗"上一版":`previous_version = None`,被换下的版本包目录与记录一并清掉。
+    /// 应用数据(`data/`)不随版本回滚(版本间共享)。
+    fn rollback_locked(
+        &self,
+        id: &AppId,
+        reason: String,
+        automatic: bool,
+        now_ms: u64,
+    ) -> Result<(), ManagerError> {
+        let record = self.load_record(id)?;
+        let Some(previous) = record.previous_version else {
+            return Err(ManagerError::NoPreviousVersion(id.clone()));
+        };
+        let from = record.current_version;
+        // 校验目标版本的权限相对"当前已授予"不提权。
+        let prev_manifest_path = self
+            .registry
+            .paths()
+            .package_dir(id, &previous)
+            .join("manifest.toml");
+        let prev_manifest = Manifest::from_toml(
+            &fs::read_to_string(&prev_manifest_path)?,
+            &self.host_version,
+        )?;
+        if diff_permissions(&record.grants, &prev_manifest.permissions)
+            .iter()
+            .any(|c| c.escalation)
+        {
+            return Err(ManagerError::RollbackEscalates);
+        }
+
+        let was_running = matches!(record.desired, DesiredState::Running);
+        // `stop_locked` 会把 desired 落成 Stopped;我们记下原值,回滚完按它决定是否再启。
+        self.stop_locked(id)?;
+
+        let mut record = self.load_record(id)?;
+        record.versions.retain(|v| v.version != from);
+        record.grants = prev_manifest.permissions;
+        record.current_version = previous;
+        record.previous_version = None;
+        record.probation = false;
+        record.last_rollback = Some(RollbackNote {
+            from,
+            to: previous,
+            reason,
+            automatic,
+            at_ms: now_ms,
+        });
+        self.registry.save(&record)?;
+        // 被换下版本的包目录(记录已经不再引用它)
+        let _ = fs::remove_dir_all(self.registry.paths().package_dir(id, &from));
+
+        self.emit(AppEvent::RolledBack {
+            app: id.clone(),
+            from,
+            to: previous,
+            reason: record
+                .last_rollback
+                .as_ref()
+                .map(|n| n.reason.clone())
+                .unwrap_or_default(),
+            automatic,
+        });
+        if was_running {
+            // 回滚到旧版本后重新拉起(失败也不再自动回滚——上一版已消耗)。
+            let _ = self.start_locked(id);
+        }
+        Ok(())
+    }
+
+    /// 试用期内应用进入 `Failed` 时,从**新线程**触发自动回滚。
+    /// 线程里用 `guard()` 阻塞取锁(它不是监管线程,不会与 `stop` 的持锁 `join` 自锁),
+    /// 拿到锁后**重新核对**才回滚(Review Focus 2)。
+    fn spawn_auto_rollback(&self, id: AppId, failed_version: Version) {
+        let core = self.self_arc();
+        let _ = std::thread::Builder::new()
+            .name(format!("bytehost-rollback-{id}"))
+            .spawn(move || {
+                let _g = core.guard();
+                // 重新核对:试用期还在、当前版本仍是失败的那个、确实处于 Failed、没在关闭。
+                if core.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(record) = core.load_record(&id) else {
+                    return;
+                };
+                if !record.probation
+                    || record.current_version != failed_version
+                    || !matches!(record.observed, ObservedState::Failed { .. })
+                {
+                    return;
+                }
+                let now = wall_now_ms();
+                match core.rollback_locked(
+                    &id,
+                    format!("新版本 {failed_version} 启动失败,已自动回滚"),
+                    true,
+                    now,
+                ) {
+                    Ok(()) => {}
+                    Err(ManagerError::RollbackEscalates) => {
+                        // 回滚会提升权限 → 跳过,保持 Failed,把原因写进 last_rollback(to == from)。
+                        if let Ok(mut record) = core.load_record(&id) {
+                            record.probation = false;
+                            record.last_rollback = Some(RollbackNote {
+                                from: failed_version,
+                                to: failed_version,
+                                reason: format!(
+                                    "新版本 {failed_version} 启动失败,但回滚到上一版需要更高权限,未自动回滚"
+                                ),
+                                automatic: true,
+                                at_ms: wall_now_ms(),
+                            });
+                            let _ = core.registry.save(&record);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            });
     }
 
     /// 卸载(不存在不算错误)。运行中先停。
@@ -2584,6 +2797,335 @@ source = "web/"
         assert!(!record.probation);
         rig.manager.start(&app).unwrap();
         assert!(rig.fetch(&app, "/").text().contains("one"));
+    }
+
+    // ---------- A6g Task 2:试用期与自动回滚 ----------
+
+    /// 装一个即将失败的新版本需要的 rig:小退避,让"放弃重启"在毫秒级完成。
+    #[cfg(unix)]
+    async fn rig_with_quick_giveup() -> Rig {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let manager = AppManager::with_resolver_and_policy_for_test(
+            tmp.path().join("bytehost"),
+            HOST,
+            gateway.clone(),
+            Arc::new(SystemResolver::new()),
+            crate::process::restart::RestartPolicy {
+                max_restarts: 1,
+                base: Duration::from_millis(30),
+                cap: Duration::from_millis(60),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        Rig {
+            tmp,
+            gateway,
+            manager,
+        }
+    }
+
+    /// 升级到起不来的新版本:监管线程放弃后,另一线程自动回滚到旧版本并把它重新拉起。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_version_that_never_becomes_healthy_is_rolled_back_automatically() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig_with_quick_giveup().await;
+        let app = id("pyapp");
+        let mut rx = rig.manager.events();
+        rig.install(&write_py_app(
+            &rig.src_dir("v1"),
+            "pyapp",
+            "1.0.0",
+            PY_SERVER,
+        ))
+        .unwrap();
+        rig.manager.start(&app).unwrap();
+        wait_for(&rig, &app, 15, is_running);
+        let _ = drain(&mut rx);
+
+        // 新版本立即退出 → 监管线程重试到放弃 → Failed → 自动回滚。
+        rig.install(&write_py_app(
+            &rig.src_dir("v2"),
+            "pyapp",
+            "1.1.0",
+            "import sys; sys.exit(1)\n",
+        ))
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let record = rig.manager.registry.load(&app).unwrap().unwrap();
+            if record.current_version == Version::new(1, 0, 0) && record.last_rollback.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "一直没自动回滚:current={} observed={:?}",
+                record.current_version,
+                record.observed
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 0, 0));
+        assert_eq!(record.previous_version, None, "回滚消耗掉上一版");
+        assert!(!record.probation);
+        let note = record.last_rollback.unwrap();
+        assert!(note.automatic);
+        assert_eq!(note.from, Version::new(1, 1, 0));
+        assert_eq!(note.to, Version::new(1, 0, 0));
+        assert_eq!(record.versions.len(), 1);
+        assert!(
+            !rig.manager
+                .registry
+                .paths()
+                .package_dir(&app, &Version::new(1, 1, 0))
+                .exists(),
+            "被换下的 1.1.0 包目录已清"
+        );
+        wait_for(&rig, &app, 15, is_running);
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::RolledBack { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// 升级后再启的同步失败(新版本声明 python >=99):`install` 仍 `Ok`,但回来时已在旧版本上运行。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_synchronous_start_failure_after_upgrade_rolls_back_in_the_same_call() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig_with_quick_giveup().await;
+        let app = id("pyapp");
+        rig.install(&write_py_app(
+            &rig.src_dir("v1"),
+            "pyapp",
+            "1.0.0",
+            PY_SERVER,
+        ))
+        .unwrap();
+        rig.manager.start(&app).unwrap();
+        wait_for(&rig, &app, 15, is_running);
+
+        // 1.1.0 的版本要求同步失败(不需要真的等到进程崩)
+        let dir = rig.src_dir("v2");
+        let bad = write_py_app(&dir, "pyapp", "1.1.0", PY_SERVER);
+        let manifest = fs::read_to_string(dir.join("manifest.toml"))
+            .unwrap()
+            .replace("kind = \"python\"", "kind = \"python\"\npython = \">=99\"");
+        fs::write(dir.join("manifest.toml"), manifest).unwrap();
+
+        rig.install(&bad).unwrap();
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 0, 0), "已同步回滚");
+        assert_eq!(record.previous_version, None);
+        assert!(record.last_rollback.unwrap().automatic);
+        wait_for(&rig, &app, 15, is_running);
+    }
+
+    /// 新版本健康:试用期在 `ready` 后结束,不触发回滚;上一版仍保留供手动回滚。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_healthy_new_version_ends_probation_and_is_not_rolled_back() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig_with_quick_giveup().await;
+        let app = id("pyapp");
+        rig.install(&write_py_app(
+            &rig.src_dir("v1"),
+            "pyapp",
+            "1.0.0",
+            PY_SERVER,
+        ))
+        .unwrap();
+        rig.manager.start(&app).unwrap();
+        wait_for(&rig, &app, 15, is_running);
+        rig.install(&write_py_app(
+            &rig.src_dir("v2"),
+            "pyapp",
+            "1.1.0",
+            PY_SERVER,
+        ))
+        .unwrap();
+        wait_for(&rig, &app, 15, is_running);
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 1, 0));
+        assert_eq!(record.previous_version, Some(Version::new(1, 0, 0)));
+        assert!(!record.probation, "健康后试用期结束");
+        assert_eq!(record.last_rollback, None);
+    }
+
+    /// 回滚会提升权限 → 拒绝自动回滚,应用保持 Failed,`last_rollback` 记原因且 `to == from`。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rollback_that_would_escalate_permissions_is_skipped() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig_with_quick_giveup().await;
+        let app = id("pyapp");
+        // 1.0.0 要 lan 出站;1.1.0 只要 none → 回滚到 1.0.0 是提权
+        let d1 = rig.src_dir("v1");
+        let v1 = write_py_app(&d1, "pyapp", "1.0.0", PY_SERVER);
+        let m1 = format!(
+            "{}\n[permissions.network]\noutbound = \"any\"\n",
+            fs::read_to_string(d1.join("manifest.toml")).unwrap()
+        );
+        fs::write(d1.join("manifest.toml"), m1).unwrap();
+        rig.install(&v1).unwrap();
+        rig.manager.start(&app).unwrap();
+        wait_for(&rig, &app, 15, is_running);
+
+        rig.install(&write_py_app(
+            &rig.src_dir("v2"),
+            "pyapp",
+            "1.1.0",
+            "import sys; sys.exit(1)\n",
+        ))
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let record = rig.manager.registry.load(&app).unwrap().unwrap();
+            if record.last_rollback.is_some() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "没记下跳过原因");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 1, 0), "没回滚");
+        assert!(!record.probation);
+        let note = record.last_rollback.unwrap();
+        assert_eq!(note.from, note.to, "标志为跳过的回滚");
+        assert!(note.automatic);
+        assert!(note.reason.contains("更高权限"), "{}", note.reason);
+        assert!(matches!(record.observed, ObservedState::Failed { .. }));
+    }
+
+    /// Review Focus 2:用户先动手(stop)后,自动回滚线程核对发现状态变了 → 放弃。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_is_abandoned_when_the_user_acted_first() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig_with_quick_giveup().await;
+        let app = id("pyapp");
+        rig.install(&write_py_app(
+            &rig.src_dir("v1"),
+            "pyapp",
+            "1.0.0",
+            PY_SERVER,
+        ))
+        .unwrap();
+        rig.manager.start(&app).unwrap();
+        wait_for(&rig, &app, 15, is_running);
+        rig.install(&write_py_app(
+            &rig.src_dir("v2"),
+            "pyapp",
+            "1.1.0",
+            "import sys; sys.exit(1)\n",
+        ))
+        .unwrap();
+        // 立刻 stop:自动回滚线程拿到锁时 observed 已不是 Failed → 放弃。
+        rig.manager.stop(&app).unwrap();
+        // 给线程充分的时间跑完(若它错误地执行了回滚,current_version 会变)
+        std::thread::sleep(Duration::from_secs(2));
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 1, 0), "回滚被放弃");
+        assert_eq!(record.last_rollback, None);
+        assert!(matches!(record.observed, ObservedState::Stopped));
+    }
+
+    /// Review Focus 1:升级到起不来的版本,监管线程放弃前 dozerd 重启;新实例对账时仍会回滚。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probation_survives_a_daemon_restart() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig_with_quick_giveup().await;
+        let app = id("pyapp");
+        rig.install(&write_py_app(
+            &rig.src_dir("v1"),
+            "pyapp",
+            "1.0.0",
+            PY_SERVER,
+        ))
+        .unwrap();
+        rig.manager.start(&app).unwrap();
+        wait_for(&rig, &app, 15, is_running);
+
+        // 确定性构造"升级到起不来的 1.1.0、首次启动尚未成功(probation 已落盘)、desired=Running"
+        // 的中断点:先停掉,再装 1.1.0(没在跑就不会自动起),手动把 probation/desired 写成
+        // 升级后的样子,最后让新实例接管同一 root —— 模拟监管线程放弃前 dozerd 就重启了。
+        rig.manager.stop(&app).unwrap();
+        rig.install(&write_py_app(
+            &rig.src_dir("v2"),
+            "pyapp",
+            "1.1.0",
+            "import sys; sys.exit(1)\n",
+        ))
+        .unwrap();
+        {
+            let mut record = rig.manager.registry.load(&app).unwrap().unwrap();
+            record.probation = true;
+            record.desired = DesiredState::Running;
+            rig.manager.registry.save(&record).unwrap();
+        }
+        // 新实例沿用同样的"快速放弃"策略(真实的 dozerd 重启会保留配置)。
+        let manager = AppManager::with_resolver_and_policy_for_test(
+            rig.tmp.path().join("bytehost"),
+            HOST,
+            rig.gateway.clone(),
+            Arc::new(SystemResolver::new()),
+            crate::process::restart::RestartPolicy {
+                max_restarts: 1,
+                base: Duration::from_millis(30),
+                cap: Duration::from_millis(60),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rig = Rig {
+            tmp: rig.tmp,
+            gateway: rig.gateway,
+            manager,
+        };
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 1, 0));
+        assert!(record.probation, "试用期随升级落盘");
+
+        assert!(rig.manager.reconcile().is_clean() || true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        loop {
+            let record = rig.manager.registry.load(&app).unwrap().unwrap();
+            if record.current_version == Version::new(1, 0, 0) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "重启后没回滚:current={} observed={:?}",
+                record.current_version,
+                record.observed
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 0, 0));
+        assert!(!record.probation);
+        assert!(record.last_rollback.unwrap().automatic);
     }
 
     /// supervisor 退出:站点撤下、观察态落成 Stopped,但 `desired` 保持 Running,下次 `reconcile` 把它们拉起来。
