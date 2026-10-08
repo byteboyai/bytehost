@@ -1,0 +1,25 @@
+schema_version = 1
+min_host_version = "0.1.0"
+id = "py-notes"
+name = "Py Notes"
+version = "1.0.0"
+
+[presentation]
+entrypoint = "main"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title = "Py Notes"
+
+[runtime]
+kind = "python"
+command = ["python3", "server.py"]
+python = ">=3.9"
+
+[runtime.http]
+port_env = "PORT"
+
+[health]
+path = "/"
+timeout_ms = 3000

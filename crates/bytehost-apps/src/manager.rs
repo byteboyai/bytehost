@@ -160,6 +160,8 @@ pub struct Core {
     issues: Mutex<HashMap<AppId, AppIssue>>,
     /// 进程型应用崩溃后的重启策略(默认 `RestartPolicy::default()`;测试里注入小退避)。
     policy: crate::process::restart::RestartPolicy,
+    /// 运行中周期健康检查的参数(默认 `DEFAULT_MONITOR_*`;测试里调小以便观察)。
+    monitor: MonitorConfig,
     /// 每个应用当前那条监管线程(`cancel` 标志 + 句柄)。静态应用不登记。
     #[allow(dead_code)]
     supervisions: Mutex<HashMap<AppId, Supervision>>,
@@ -169,6 +171,24 @@ pub struct Core {
     /// (仅测试)`install` 里"拷贝与摘要计算已完成、即将拿锁"的次数,用来证明慢的部分在锁外。
     #[cfg(test)]
     prepared: std::sync::atomic::AtomicUsize,
+}
+
+/// 运行中周期健康检查的参数;默认取 `supervisor::DEFAULT_MONITOR_*`。
+#[derive(Debug, Clone, Copy)]
+struct MonitorConfig {
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+    failures: u32,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            interval: supervisor::DEFAULT_MONITOR_INTERVAL,
+            timeout: supervisor::DEFAULT_MONITOR_TIMEOUT,
+            failures: supervisor::DEFAULT_MONITOR_FAILURES,
+        }
+    }
 }
 
 /// 一条监管线程的取消标志与句柄。
@@ -475,6 +495,27 @@ impl AppManager {
         policy: crate::process::restart::RestartPolicy,
         version_probe: Arc<dyn VersionProbe>,
     ) -> io::Result<Self> {
+        Self::with_parts_full(
+            root,
+            host_version,
+            gateway,
+            resolver,
+            policy,
+            version_probe,
+            MonitorConfig::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_parts_full(
+        root: impl Into<PathBuf>,
+        host_version: Version,
+        gateway: Arc<Gateway>,
+        resolver: Arc<dyn RuntimeResolver>,
+        policy: crate::process::restart::RestartPolicy,
+        version_probe: Arc<dyn VersionProbe>,
+        monitor: MonitorConfig,
+    ) -> io::Result<Self> {
         let (events, _) = broadcast::channel(256);
         let registry = Registry::open(root)?;
         sweep_staging(&registry.paths().apps_dir());
@@ -490,6 +531,7 @@ impl AppManager {
                 version_probe,
                 issues: Mutex::new(HashMap::new()),
                 policy,
+                monitor,
                 supervisions: Mutex::new(HashMap::new()),
                 self_weak: std::sync::OnceLock::new(),
                 #[cfg(test)]
@@ -524,6 +566,36 @@ impl AppManager {
         version_probe: Arc<dyn VersionProbe>,
     ) -> io::Result<Self> {
         Self::with_parts(root, host_version, gateway, resolver, policy, version_probe)
+    }
+
+    /// (仅测试)在 `with_parts_for_test` 基础上调小运行中健康检查的间隔/超时。
+    /// 跨 crate 集成测试要用,所以不做 `#[cfg(test)]`,而是 `#[doc(hidden)]` 的不稳定钩子。
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn with_monitor_for_test(
+        root: impl Into<PathBuf>,
+        host_version: Version,
+        gateway: Arc<Gateway>,
+        resolver: Arc<dyn RuntimeResolver>,
+        policy: crate::process::restart::RestartPolicy,
+        version_probe: Arc<dyn VersionProbe>,
+        monitor_interval: std::time::Duration,
+        monitor_timeout: std::time::Duration,
+        monitor_failures: u32,
+    ) -> io::Result<Self> {
+        Self::with_parts_full(
+            root,
+            host_version,
+            gateway,
+            resolver,
+            policy,
+            version_probe,
+            MonitorConfig {
+                interval: monitor_interval,
+                timeout: monitor_timeout,
+                failures: monitor_failures,
+            },
+        )
     }
 
     pub fn events(&self) -> broadcast::Receiver<AppEvent> {
@@ -951,9 +1023,9 @@ impl Core {
             run_dir,
             policy: self.policy,
             grace: supervisor::DEFAULT_GRACE,
-            monitor_interval: supervisor::DEFAULT_MONITOR_INTERVAL,
-            monitor_timeout: supervisor::DEFAULT_MONITOR_TIMEOUT,
-            monitor_failures: supervisor::DEFAULT_MONITOR_FAILURES,
+            monitor_interval: self.monitor.interval,
+            monitor_timeout: self.monitor.timeout,
+            monitor_failures: self.monitor.failures,
         };
 
         record.desired = DesiredState::Running;

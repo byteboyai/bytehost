@@ -1,0 +1,25 @@
+schema_version = 1
+min_host_version = "0.1.0"
+id = "node-notes"
+name = "Node Notes"
+version = "1.0.0"
+
+[presentation]
+entrypoint = "main"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title = "Node Notes"
+
+[runtime]
+kind = "node"
+command = ["node", "server.js"]
+node = ">=18"
+
+[runtime.http]
+port_env = "PORT"
+
+[health]
+path = "/"
+timeout_ms = 3000
