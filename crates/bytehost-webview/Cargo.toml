@@ -1,0 +1,12 @@
+[package]
+name = "bytehost-webview"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "应用 webview 的纯安全策略:origin 导航白名单、每应用存储标识、IPC nonce 与注入脚本、数据存储清除排队。不依赖 wry/iced/tauri,供 wry 宿主(dozer)与 Tauri 宿主(Digger)共用。"
+
+[dependencies]
+bytehost-apps = { path = "../bytehost-apps" }
+url = "2"
+uuid = { workspace = true }
