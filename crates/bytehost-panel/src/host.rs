@@ -1491,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn logs_failure_is_kept_in_place_not_noticed() {
+    fn logs_failure_is_kept_in_place_not_a_notice() {
         let mut s = PanelState::<TestKey>::default();
         let a = slot("logsfail-a");
         loaded(&mut s, vec![app("logsfail-a", failed("崩了"))], &[]);

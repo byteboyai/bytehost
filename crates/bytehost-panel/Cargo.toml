@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "应用面板与日志查看器的状态机:与界面框架无关,以 `AppKey` 泛型标识应用,供 wry 宿主(dozer)与 Tauri 宿主(Digger)共用。不依赖 iced/wry/tauri。"
+description = "应用面板、安装流程与日志查看器的状态机:与界面框架无关,以 `AppKey` 泛型标识应用,供 wry 宿主(dozer)与 Tauri 宿主(Digger)共用。不依赖任何界面框架或平台 webview 库。"
 
 [dependencies]
 bytehost-apps = { path = "../bytehost-apps" }
