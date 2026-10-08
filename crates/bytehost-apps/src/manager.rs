@@ -3302,6 +3302,42 @@ source = "web/"
         assert!(summary.issue.is_none(), "{:?}", summary.issue);
     }
 
+    /// `list()` 不持单写者锁,GUI 因推送重拉时可能与 `install_failed` 并发:读到 `Failed` 就一定要
+    /// 同时带着 issue,所以 issue 必须先于状态落地。确定性地钉住:测试线程攥住 issue 表的锁,
+    /// `install_failed` 卡在"记 issue"这一步时,注册表里的状态还不能是 `Failed`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_issue_is_recorded_before_the_failed_state_becomes_visible() {
+        let rig = rig().await;
+        let src = write_app(&rig.src_dir("a"), "excalidraw", "0.17.0", "", "<h1>x</h1>");
+        rig.install(&src).unwrap();
+        let a = id("excalidraw");
+        let tr = AppTransitions {
+            core: rig.manager.core.clone(),
+            id: a.clone(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let held = rig.manager.core.issues.lock().unwrap();
+        let worker = std::thread::spawn(move || tr.install_failed("npm ci 失败".into()));
+        std::thread::sleep(Duration::from_millis(300));
+        let during = rig.manager.core.load_record(&a).unwrap().observed;
+        assert!(
+            !matches!(during, ObservedState::Failed { .. }),
+            "issue 还没记下,状态不该已是 Failed:{during:?}"
+        );
+        drop(held);
+        assert!(worker.join().unwrap());
+        let summary = rig
+            .manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == a)
+            .unwrap();
+        assert!(matches!(summary.observed, ObservedState::Failed { .. }));
+        assert!(summary.issue.is_some());
+    }
+
     /// issue 只在 `Failed` 时带出:装依赖失败后即使还没重试,只要不是 `Failed`(这里用
     /// `set_observed(Stopped)` 模拟)就不带 issue。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

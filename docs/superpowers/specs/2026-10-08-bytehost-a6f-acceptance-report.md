@@ -60,7 +60,7 @@ Task 4 相关 filter 单跑(证据):
 | `scripts/check-log-scope.sh` | ok |
 | `cargo fmt --check` | ok |
 | `cargo clippy -p dozer-app -p dozer-client --all-targets` | A6f 触碰的文件(`app_logs.rs`/`settings_apps.rs`/`app_host.rs`/`view.rs`/`app.rs`/`window_events.rs`)**无新警告** |
-| `cargo clippy --all-targets` | **`dozer-core`(lib test)编译失败**,见 §3 缺陷 1(与本切片无关的既有缺陷) |
+| `cargo clippy --all-targets` | 审阅后全树无 error(`dozer-core` 测试初始化已补齐,见 §3 缺陷 1) |
 
 ## 2. 待人工在真实 GUI 里完成(**未执行**)
 
@@ -73,7 +73,9 @@ Task 4 相关 filter 单跑(证据):
 
 ## 3. 发现的缺陷与已知局限
 
-1. **既有缺陷(A6d 引入,与本切片无关,未修)**:**`cargo clippy --all-targets` 因 `dozer-core`(lib test)编译失败而中断**。`crates/dozer-core/src/protocol.rs:1611` 的 `RuntimeProbe { runtime, availability }` 初始化缺 `installable` / `job` / `managed` 三个字段。字段由 A6d `adb85a58` 加入 `bytehost-apps::proto::RuntimeProbe`,但 `protocol.rs`(最后改动于更早的 `0fcc66b6`)的该测试未同步更新。**不在 A6f 范围,未顺手改**;新代码的 `clippy` 结论按 1.3 逐包核对(不依赖全树 `--all-targets` 通过)。
+0. **审阅发现并已修**:设置页日志 `Tick` 定时器每条消息多排一条(改为 `tick_armed` 单链);应用面板日志在面板不可见时仍每秒刷新(`tick_logs`/`any_logs_open` 按可见槽位过滤);"先记 issue 再改状态"补确定性测试(攥住 issue 表锁,断言状态此时还不是 `Failed`)。
+
+1. **既有缺陷(A6d 引入;审阅后已修:测试初始化补齐三个字段,`cargo clippy --all-targets` 与 `cargo test -p dozer-core` 恢复)**:**`cargo clippy --all-targets` 因 `dozer-core`(lib test)编译失败而中断**。`crates/dozer-core/src/protocol.rs:1611` 的 `RuntimeProbe { runtime, availability }` 初始化缺 `installable` / `job` / `managed` 三个字段。字段由 A6d `adb85a58` 加入 `bytehost-apps::proto::RuntimeProbe`,但 `protocol.rs`(最后改动于更早的 `0fcc66b6`)的该测试未同步更新。**不在 A6f 范围,未顺手改**;新代码的 `clippy` 结论按 1.3 逐包核对(不依赖全树 `--all-targets` 通过)。
 2. **已知无关的偶发/确定失败**(在计划"全量"命令里已列,逐个注明):`extensions::files::tests::delete_confirm_spec_reflects_pending_target`(dozer-app,clean tree 亦失败)。本次 `dozerd --lib` 并行未复现 `app_service::tests::the_first_run_is_unavailable_when_the_port_cannot_be_saved` / `summary_provider::tests::absolute_script_can_find_sibling_interpreter_with_minimal_parent_path`。
 3. **已知局限(与计划"已知局限"一节一致,非缺陷)**:
    - 推送只是"失效信号":每次变化 GUI 仍要 `List` 一次(本机 UDS,开销可忽略);换来的是只有一份状态真相。
