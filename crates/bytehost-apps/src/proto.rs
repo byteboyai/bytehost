@@ -210,6 +210,11 @@ pub enum AppRequest {
         runtime: ManagedRuntime,
         version: String,
     },
+    /// 读某应用日志的末尾(有界、已清洗;仅在内存里返回,不落 dozerd 日志、不广播)。
+    Logs {
+        id: AppId,
+        max_lines: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -236,6 +241,11 @@ pub enum AppReply {
     /// 一份运行时安装计划。
     RuntimePlan {
         plan: Box<RuntimeInstallPlan>,
+    },
+    /// 应用日志的末尾(已清洗);`truncated` 表示因行数/字节上限被截。
+    Logs {
+        text: String,
+        truncated: bool,
     },
     /// 请求失败(带类别)。
     Failed {
@@ -455,6 +465,20 @@ mod tests {
         round_trip(&AppReply::RuntimePlan {
             plan: Box::new(plan),
         });
+        assert_eq!(
+            round_trip(&AppRequest::Logs {
+                id: AppId::new("excalidraw").unwrap(),
+                max_lines: 200,
+            }),
+            json!({"op": "logs", "id": "excalidraw", "max_lines": 200})
+        );
+        assert_eq!(
+            round_trip(&AppReply::Logs {
+                text: "hi\n".into(),
+                truncated: true,
+            }),
+            json!({"reply": "logs", "text": "hi\n", "truncated": true})
+        );
     }
 
     #[test]

@@ -577,6 +577,11 @@ impl AppManager {
         self.core.list()
     }
 
+    /// 读某应用日志的末尾(有界、已清洗)。未安装 → `NotInstalled`;日志不存在 → 空文本。
+    pub fn logs(&self, id: &AppId, max_lines: u32) -> Result<(String, bool), ManagerError> {
+        self.core.logs(id, max_lines)
+    }
+
     pub fn suspend_all(&self) -> ReconcileReport {
         self.core.suspend_all()
     }
@@ -1230,6 +1235,16 @@ impl Core {
                 state: other,
             }),
         }
+    }
+
+    /// 读某应用日志的末尾(有界、已清洗)。未安装 → `NotInstalled`;日志不存在 → 空文本。
+    /// 只在本机返回给 GUI,不写 dozerd 日志、不广播事件。
+    pub(crate) fn logs(&self, id: &AppId, max_lines: u32) -> Result<(String, bool), ManagerError> {
+        let _guard = self.guard();
+        let _ = self.load_record(id)?;
+        let tail = crate::logs::read_tail(&self.registry.paths().logs_dir(id), max_lines as usize)
+            .map_err(|e| ManagerError::Io(io::Error::other(format!("读取应用日志失败:{e}"))))?;
+        Ok((tail.text, tail.truncated))
     }
 
     pub(crate) fn list(&self) -> Result<Vec<AppSummary>, ManagerError> {
@@ -2980,6 +2995,49 @@ source = "web/"
             "{:?}",
             summary.issue
         );
+    }
+
+    // ===== A6e Task 3:日志末尾 =====
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn logs_for_an_uninstalled_app_are_not_found_and_for_a_never_run_app_are_empty() {
+        let rig = rig().await;
+        assert!(matches!(
+            rig.manager.logs(&id("nope"), 100),
+            Err(ManagerError::NotInstalled(_))
+        ));
+        let src = write_app(&rig.src_dir("a"), "excalidraw", "0.17.0", "", "<h1>x</h1>");
+        rig.install(&src).unwrap();
+        let (text, truncated) = rig.manager.logs(&id("excalidraw"), 100).unwrap();
+        assert_eq!(text, "");
+        assert!(!truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn logs_return_the_tail_of_the_apps_log_file() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig().await;
+        let a = id("logger");
+        let src = write_py_app(&rig.src_dir("a"), "logger", "1.0.0", PY_SERVER);
+        rig.install(&src).unwrap();
+        let logs_dir = rig.manager.registry.paths().logs_dir(&a);
+        fs::create_dir_all(&logs_dir).unwrap();
+        fs::write(
+            logs_dir.join("app.log"),
+            (0..600)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let (text, truncated) = rig.manager.logs(&a, 10).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[9], "line 599");
+        assert!(truncated);
     }
 
     #[cfg(unix)]
