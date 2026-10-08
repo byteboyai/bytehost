@@ -1,0 +1,23 @@
+[package]
+name = "bytehost-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "与传输无关的应用宿主客户端 API:trait `AppHostApi`、统一的失败类型、进程内实现与「两种实现都必须通过」的契约测试。不依赖任何 dozer crate。"
+
+[features]
+# 默认空:只有 trait、错误类型、`AppChange`——依赖仅 bytehost-apps 的默认 feature。
+default = []
+# 进程内实现(直接驱动 `bytehost-apps::service::AppService`,不需要 dozerd)。隐含 bytehost-apps 的 server。
+in-process = ["bytehost-apps/server"]
+# 契约测试:两种实现(UDS / 进程内)调用同一份 `run`,断言行为一致。
+conformance = []
+
+[dependencies]
+bytehost-apps = { path = "../bytehost-apps" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
