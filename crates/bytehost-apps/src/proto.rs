@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::id::{AppId, Version};
 use crate::plan::{ApprovedInstallPlan, InstallPlan, Provenance, TrustLevel};
-use crate::registry::UninstallMode;
+use crate::registry::{RollbackNote, UninstallMode};
 use crate::state::{DesiredState, ObservedState};
 
 /// 应用从哪来。一期只有本地目录(目录里要有 `manifest.toml`);压缩包/仓库以后再加。
@@ -32,6 +32,12 @@ pub struct AppSummary {
     /// 只存内存,不持久化。旧形状 JSON(无此字段)解析为 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<AppIssue>,
+    /// 有可回滚的上一版时才带出(值即"可回滚到"的版本)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<Version>,
+    /// 最近一次回滚记录(含被跳过的自动回滚);没有则 `None`。旧形状 JSON 解析为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_note: Option<RollbackNote>,
 }
 
 /// 应用当前的问题(供 GUI 画提示页,见规格 §6.3)。
@@ -190,6 +196,10 @@ pub enum AppRequest {
     Stop {
         id: AppId,
     },
+    /// 手动回滚到上一版(仅当有 `previous_version` 时可用;回滚不得提升权限)。
+    Rollback {
+        id: AppId,
+    },
     Uninstall {
         id: AppId,
         mode: UninstallMode,
@@ -301,6 +311,10 @@ mod tests {
             json!({"op": "stop", "id": "excalidraw"})
         );
         assert_eq!(
+            round_trip(&AppRequest::Rollback { id: id() }),
+            json!({"op": "rollback", "id": "excalidraw"})
+        );
+        assert_eq!(
             round_trip(&AppRequest::LaunchUrl { id: id() }),
             json!({"op": "launch_url", "id": "excalidraw"})
         );
@@ -401,6 +415,14 @@ mod tests {
                     required: ">=3.12".into(),
                     found: "3.9.1".into(),
                 }),
+                previous_version: Some(Version::new(0, 16, 0)),
+                rollback_note: Some(RollbackNote {
+                    from: Version::new(0, 17, 0),
+                    to: Version::new(0, 16, 0),
+                    reason: "用户手动回滚".into(),
+                    automatic: false,
+                    at_ms: 1_700_000_000_000,
+                }),
             }],
         };
         let json = round_trip(&apps);
@@ -409,6 +431,11 @@ mod tests {
         assert_eq!(
             json["apps"][0]["issue"],
             json!({"issue": "runtime_version", "runtime": "python3", "required": ">=3.12", "found": "3.9.1"})
+        );
+        assert_eq!(json["apps"][0]["previous_version"], "0.16.0");
+        assert_eq!(
+            json["apps"][0]["rollback_note"],
+            json!({"from": "0.17.0", "to": "0.16.0", "reason": "用户手动回滚", "automatic": false, "at_ms": 1_700_000_000_000_u64})
         );
 
         let runtimes = AppReply::Runtimes {

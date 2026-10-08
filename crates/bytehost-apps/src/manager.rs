@@ -733,6 +733,10 @@ impl AppManager {
         self.core.stop(id)
     }
 
+    pub fn rollback(&self, id: &AppId) -> Result<(), ManagerError> {
+        self.core.rollback(id)
+    }
+
     pub fn uninstall(&self, id: &AppId, mode: UninstallMode) -> Result<(), ManagerError> {
         self.core.uninstall(id, mode)
     }
@@ -1552,6 +1556,12 @@ impl Core {
         }
         Ok(())
     }
+    /// 用户手动回滚到上一版(wire `AppRequest::Rollback` 的落点)。
+    pub(crate) fn rollback(&self, id: &AppId) -> Result<(), ManagerError> {
+        let _guard = self.guard();
+        self.rollback_locked(id, "用户手动回滚".to_string(), false, wall_now_ms())
+    }
+
     /// 回滚到 `previous_version`(调用方已持锁)。`automatic` 只影响 `RollbackNote` 与事件。
     /// 目标版本权限相对**当前授予**有任何 `escalation` → `Err(RollbackEscalates)`(不改任何状态):
     /// 回滚不得提升权限。回滚消耗"上一版":`previous_version = None`,被换下的版本包目录与记录一并清掉。
@@ -1751,6 +1761,8 @@ impl Core {
                     observed: r.observed,
                     url,
                     issue,
+                    previous_version: r.previous_version,
+                    rollback_note: r.last_rollback,
                     id: r.id,
                 }
             })
@@ -3126,6 +3138,143 @@ source = "web/"
         assert_eq!(record.current_version, Version::new(1, 0, 0));
         assert!(!record.probation);
         assert!(record.last_rollback.unwrap().automatic);
+    }
+
+    // ---------- A6g Task 3:手动回滚 ----------
+
+    /// 手动回滚:回到上一版,消耗掉上一版,清掉被换下版本的包目录,`automatic == false`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_manual_rollback_restores_and_consumes_the_previous_version() {
+        let rig = rig().await;
+        let app = id("site");
+        rig.install(&write_app(&rig.src_dir("v1"), "site", "1.0.0", "", "V1"))
+            .unwrap();
+        rig.install(&write_app(&rig.src_dir("v2"), "site", "1.1.0", "", "V2"))
+            .unwrap();
+        assert!(
+            rig.manager
+                .registry
+                .paths()
+                .package_dir(&app, &Version::new(1, 1, 0))
+                .exists()
+        );
+
+        rig.manager.rollback(&app).unwrap();
+
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 0, 0));
+        assert_eq!(record.previous_version, None, "回滚消耗掉上一版");
+        let note = record.last_rollback.unwrap();
+        assert_eq!(note.from, Version::new(1, 1, 0));
+        assert_eq!(note.to, Version::new(1, 0, 0));
+        assert!(!note.automatic);
+        assert!(
+            !rig.manager
+                .registry
+                .paths()
+                .package_dir(&app, &Version::new(1, 1, 0))
+                .exists(),
+            "被换下的版本包目录已清"
+        );
+        // 再次回滚:没有上一版了。
+        assert!(matches!(
+            rig.manager.rollback(&app),
+            Err(ManagerError::NoPreviousVersion(_))
+        ));
+    }
+
+    /// 首次安装的应用没有上一版,回滚被拒(`NoPreviousVersion`)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rolling_back_a_fresh_install_is_refused() {
+        let rig = rig().await;
+        let app = id("site");
+        rig.install(&write_app(&rig.src_dir("v1"), "site", "1.0.0", "", "V1"))
+            .unwrap();
+        assert!(matches!(
+            rig.manager.rollback(&app),
+            Err(ManagerError::NoPreviousVersion(_))
+        ));
+    }
+
+    /// 回滚会提升权限 → `RollbackEscalates`,且记录**逐字段未变**。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rollback_that_would_escalate_permissions_is_refused() {
+        let rig = rig().await;
+        let app = id("site");
+        let d1 = rig.src_dir("v1");
+        write_app(&d1, "site", "1.0.0", "", "V1");
+        let m1 = format!(
+            "{}\n[permissions.network]\noutbound = \"any\"\n",
+            fs::read_to_string(d1.join("manifest.toml")).unwrap()
+        );
+        fs::write(d1.join("manifest.toml"), m1).unwrap();
+        let s1 = AppSource::LocalDir { path: d1.clone() };
+        rig.install(&s1).unwrap();
+        rig.install(&write_app(&rig.src_dir("v2"), "site", "1.1.0", "", "V2"))
+            .unwrap();
+
+        let before = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert!(matches!(
+            rig.manager.rollback(&app),
+            Err(ManagerError::RollbackEscalates)
+        ));
+        let after = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(before, after, "被拒的回滚不得改动任何字段");
+    }
+
+    /// 运行中的应用回滚后仍保持运行,且提供的是旧版本的内容。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rolling_back_a_running_app_keeps_it_running_on_the_old_version() {
+        let rig = rig().await;
+        let app = id("site");
+        rig.install(&write_app(&rig.src_dir("v1"), "site", "1.0.0", "", "OLD"))
+            .unwrap();
+        rig.install(&write_app(&rig.src_dir("v2"), "site", "1.1.0", "", "NEW"))
+            .unwrap();
+        rig.manager.start(&app).unwrap();
+        wait_for(&rig, &app, 15, is_running);
+        assert_eq!(rig.fetch(&app, "/").body, b"NEW");
+
+        rig.manager.rollback(&app).unwrap();
+
+        wait_for(&rig, &app, 15, is_running);
+        assert_eq!(rig.fetch(&app, "/").body, b"OLD");
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 0, 0));
+        assert_eq!(record.previous_version, None);
+    }
+
+    /// `list()` 带出 `previous_version` / `rollback_note`,回滚后随之变化。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_listing_exposes_the_rollback_target_and_last_rollback() {
+        let rig = rig().await;
+        let app = id("site");
+        rig.install(&write_app(&rig.src_dir("v1"), "site", "1.0.0", "", "V1"))
+            .unwrap();
+        rig.install(&write_app(&rig.src_dir("v2"), "site", "1.1.0", "", "V2"))
+            .unwrap();
+        let row = rig
+            .manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == app)
+            .unwrap();
+        assert_eq!(row.previous_version, Some(Version::new(1, 0, 0)));
+        assert_eq!(row.rollback_note, None);
+
+        rig.manager.rollback(&app).unwrap();
+        let row = rig
+            .manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == app)
+            .unwrap();
+        assert_eq!(row.previous_version, None);
+        let note = row.rollback_note.unwrap();
+        assert!(!note.automatic);
+        assert_eq!(note.to, Version::new(1, 0, 0));
     }
 
     /// supervisor 退出:站点撤下、观察态落成 Stopped,但 `desired` 保持 Running,下次 `reconcile` 把它们拉起来。
