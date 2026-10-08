@@ -83,11 +83,21 @@ fn read_newest_bytes(path: &Path, byte_budget: usize) -> io::Result<Option<(Vec<
     };
     let len = file.metadata()?.len();
     let budget = byte_budget.min(MAX_BYTES) as u64;
-    let start = len.saturating_sub(budget);
     let truncated = len > budget;
-    file.seek(SeekFrom::Start(start))?;
-    let mut buf = Vec::with_capacity(budget as usize);
-    file.read_to_end(&mut buf)?;
+    let start = len.saturating_sub(budget);
+    // 被截时多读截点前的一个字节:它是 '\n' 说明截点正好在行首;否则开头是半行,丢到第一个换行之后,
+    // 不把半行当整行展示。(整段里一个换行都没有 = 只剩一条超长行的中间,保留。)
+    let read_from = if truncated { start - 1 } else { 0 };
+    file.seek(SeekFrom::Start(read_from))?;
+    let mut buf = Vec::with_capacity(budget as usize + 1);
+    file.take(budget + 1).read_to_end(&mut buf)?;
+    if truncated {
+        let at_line_start = buf.first() == Some(&b'\n');
+        buf.drain(..1);
+        if !at_line_start && let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            buf.drain(..=nl);
+        }
+    }
     Ok(Some((buf, truncated)))
 }
 
@@ -221,6 +231,45 @@ mod tests {
         assert!(tail.truncated);
         // 整体是合法 UTF-8(已按有损解码)。
         assert!(std::str::from_utf8(tail.text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn a_cut_never_shows_a_half_line_as_a_whole_one() {
+        let dir = tempfile::tempdir().unwrap();
+        // 每行 "line{i:05}" + 600 个 x(609 字节)+ 换行:500 行 ≈ 305 KB > 256 KiB,字节上限先生效,
+        // 截点落在某行中间。
+        let pad = "x".repeat(600);
+        let mut f = fs::File::create(dir.path().join("app.log")).unwrap();
+        for i in 0..2000 {
+            writeln!(f, "line{i:05}{pad}").unwrap();
+        }
+        drop(f);
+        let tail = read_tail(dir.path(), MAX_LINES).unwrap();
+        assert!(tail.truncated);
+        assert!(tail.text.lines().count() < MAX_LINES, "应由字节上限截断");
+        for line in tail.text.lines() {
+            assert!(
+                line.len() == 609 && line.starts_with("line"),
+                "出现半行:{:?}",
+                &line[..line.len().min(20)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_cut_exactly_on_a_line_start_keeps_that_line() {
+        let dir = tempfile::tempdir().unwrap();
+        // 每行 1024 字节(含换行),共 300 行;预算 256 KiB = 恰好 256 行,截点正落在第 44 行行首。
+        let mut f = fs::File::create(dir.path().join("app.log")).unwrap();
+        for i in 0..300 {
+            writeln!(f, "{:0>1023}", i).unwrap();
+        }
+        drop(f);
+        let tail = read_tail(dir.path(), MAX_LINES).unwrap();
+        assert!(tail.truncated);
+        let lines: Vec<&str> = tail.text.lines().collect();
+        assert_eq!(lines.len(), 256);
+        assert!(lines[0].ends_with("44"), "{:?}", &lines[0][1000..]);
     }
 
     #[test]
