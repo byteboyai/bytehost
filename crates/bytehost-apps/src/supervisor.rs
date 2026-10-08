@@ -415,8 +415,8 @@ mod tests {
         format!(
             "python3 -c \"{prelude}import os,http.server,socketserver; \
              socketserver.TCPServer.allow_reuse_address=True; \
-             http.server.test(HandlerClass=http.server.SimpleHTTPRequestHandler, \
-             port=int(os.environ['APP_PORT']), bind='127.0.0.1')\""
+             socketserver.ThreadingTCPServer(('127.0.0.1',int(os.environ['APP_PORT'])), \
+             http.server.SimpleHTTPRequestHandler).serve_forever()\""
         )
     }
 
@@ -449,7 +449,7 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 open(r'{pidfile}', 'w').write(str(os.getpid()))
 socketserver.TCPServer.allow_reuse_address = True
-http.server.test(HandlerClass=H, port=int(os.environ['APP_PORT']), bind='127.0.0.1')
+socketserver.ThreadingTCPServer(('127.0.0.1', int(os.environ['APP_PORT'])), H).serve_forever()
 "#,
             healthy_probes = healthy_probes,
             fail_ms = fail_ms,
@@ -563,7 +563,7 @@ http.server.test(HandlerClass=H, port=int(os.environ['APP_PORT']), bind='127.0.0
              \x20     time.sleep(0.4);self.send_response(200);self.end_headers()\n\
              \x20 def log_message(self,*a): pass\n\
              socketserver.TCPServer.allow_reuse_address=True\n\
-             http.server.test(HandlerClass=H,port=int(os.environ['APP_PORT']),bind='127.0.0.1')\n\"";
+             socketserver.ThreadingTCPServer(('127.0.0.1',int(os.environ['APP_PORT'])),H).serve_forever()\n\"";
         let (r, cancel) = rec();
         let l = monitoring_launch(dir.path(), script, 3);
         let handle = std::thread::spawn({

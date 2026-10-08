@@ -57,7 +57,7 @@ mod e2e {
                 "-c".into(),
                 "import os,http.server,socketserver; \
                  socketserver.TCPServer.allow_reuse_address=True; \
-                 http.server.test(HandlerClass=http.server.SimpleHTTPRequestHandler, port=int(os.environ['APP_PORT']), bind='127.0.0.1')"
+                 socketserver.ThreadingTCPServer(('127.0.0.1',int(os.environ['APP_PORT'])),http.server.SimpleHTTPRequestHandler).serve_forever()"
                     .into(),
             ],
             cwd: dir.path().to_path_buf(),

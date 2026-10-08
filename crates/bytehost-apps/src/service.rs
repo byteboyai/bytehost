@@ -1079,9 +1079,9 @@ port_env = "APP_PORT"
         .unwrap();
         std::fs::write(
             dir.join("server.py"),
-            "import os, http.server\n\
+            "import os, http.server, socketserver\n\
              print(\"listening on\", os.environ[\"APP_PORT\"], flush=True)\n\
-             http.server.test(HandlerClass=http.server.SimpleHTTPRequestHandler, port=int(os.environ[\"APP_PORT\"]), bind=\"127.0.0.1\")\n",
+             socketserver.ThreadingTCPServer((\"127.0.0.1\", int(os.environ[\"APP_PORT\"])), http.server.SimpleHTTPRequestHandler).serve_forever()\n",
         )
         .unwrap();
         AppSource::LocalDir {

@@ -4462,8 +4462,8 @@ source = "web/"
         }
     }
 
-    const PY_SERVER: &str = "import os, http.server\n\
-        http.server.test(HandlerClass=http.server.SimpleHTTPRequestHandler, port=int(os.environ[\"APP_PORT\"]), bind=\"127.0.0.1\")\n";
+    const PY_SERVER: &str = "import os, http.server, socketserver\n\
+        socketserver.ThreadingTCPServer((\"127.0.0.1\", int(os.environ[\"APP_PORT\"])), http.server.SimpleHTTPRequestHandler).serve_forever()\n";
 
     #[cfg(unix)]
     fn observed_of(rig: &Rig, id: &AppId) -> Option<ObservedState> {
@@ -5246,8 +5246,8 @@ source = "web/"
         }
         let rig = rig().await;
         let a = id("slow");
-        let slow = "import os, time, http.server\ntime.sleep(3)\n\
-            http.server.test(HandlerClass=http.server.SimpleHTTPRequestHandler, port=int(os.environ[\"APP_PORT\"]), bind=\"127.0.0.1\")\n";
+        let slow = "import os, time, http.server, socketserver\ntime.sleep(3)\n\
+            socketserver.ThreadingTCPServer((\"127.0.0.1\", int(os.environ[\"APP_PORT\"])), http.server.SimpleHTTPRequestHandler).serve_forever()\n";
         let src = write_py_app(&rig.src_dir("a"), "slow", "1.0.0", slow);
         rig.install(&src).unwrap();
         rig.manager.start(&a).unwrap();

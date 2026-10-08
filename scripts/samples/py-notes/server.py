@@ -16,11 +16,19 @@ import base64
 import hashlib
 import json
 import os
+import socketserver
 import struct
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+
+
+class Server(socketserver.ThreadingTCPServer):
+    # `ThreadingHTTPServer.server_bind` 会调用 `socket.getfqdn`,在没有反向 DNS 的主机上
+    # (如 CI runner)会卡住几十秒才 serve_forever;这里跳过它,其余语义与前者一致。
+    allow_reuse_address = True
+    daemon_threads = True
 
 DATA_DIR = os.environ["BYTEHOST_DATA_DIR"]
 PORT = int(os.environ["PORT"])
@@ -182,8 +190,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     print("listening on", PORT, flush=True)
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    server.daemon_threads = True
+    server = Server(("127.0.0.1", PORT), Handler)
     server.serve_forever()
 
 
