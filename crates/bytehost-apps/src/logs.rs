@@ -207,6 +207,38 @@ mod tests {
     }
 
     #[test]
+    fn rotation_mid_read_shows_the_rotated_content_without_error() {
+        // 轮转瞬间:app.log 被改名成 app.log.1,新的 app.log 还是空的。
+        let dir = tempfile::tempdir().unwrap();
+        write_lines(&dir.path().join("app.log.1"), "rot", 3);
+        fs::write(dir.path().join("app.log"), "").unwrap();
+        let tail = read_tail(dir.path(), 10).unwrap();
+        assert_eq!(
+            tail.text.lines().collect::<Vec<_>>(),
+            vec!["rot0", "rot1", "rot2"]
+        );
+
+        // app.log 整个消失、只有 .1:同样从 .1 读回,不报错。
+        fs::remove_file(dir.path().join("app.log")).unwrap();
+        let tail = read_tail(dir.path(), 10).unwrap();
+        assert!(tail.text.contains("rot2"));
+    }
+
+    #[test]
+    fn an_ansi_progress_line_and_an_overlong_line_are_cleaned_and_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "z".repeat(6000);
+        let content = format!("\u{1b}[32m  33%\u{1b}[0m...\n{long}\n");
+        fs::write(dir.path().join("app.log"), content).unwrap();
+        let tail = read_tail(dir.path(), 10).unwrap();
+        assert!(!tail.text.contains('\u{1b}'), "{:?}", tail.text);
+        assert!(tail.text.contains("33%"));
+        let long_line = tail.text.lines().nth(1).unwrap();
+        assert_eq!(long_line.chars().count(), MAX_LINE_CHARS + 1);
+        assert!(long_line.ends_with('…'));
+    }
+
+    #[test]
     fn max_lines_is_clamped() {
         let dir = tempfile::tempdir().unwrap();
         write_lines(&dir.path().join("app.log"), "l", 1000);
