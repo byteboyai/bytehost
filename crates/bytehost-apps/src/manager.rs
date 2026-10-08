@@ -36,12 +36,13 @@ use crate::runtime::{
     ResolveError, Resolved, RuntimeResolver, SystemResolver, SystemVersionProbe, VersionProbe,
     enforcement_for,
 };
+use crate::source::{self, StageError};
 use crate::state::{
     Action, DesiredState, ObservedState, next_action, recover_after_supervisor_restart,
 };
 use crate::supervisor::{self, Launch, Phase, Transitions};
 
-pub use crate::proto::{AppIssue, AppSource, AppSummary};
+pub use crate::proto::{AppIssue, AppSource, AppSummary, SourceInfo};
 
 #[derive(Debug)]
 pub enum ManagerError {
@@ -78,6 +79,12 @@ pub enum ManagerError {
     RollbackEscalates,
     /// 没有可回滚的上一版。
     NoPreviousVersion(AppId),
+    /// 来源策略不允许这种应用(如网络来源只允许静态应用)。
+    SourceNotAllowed(String),
+    /// 来源本身不合法/尚未启用/URL 校验失败。
+    Source(crate::source::SourceError),
+    /// 压缩包解压失败(不安全条目、损坏、超限……)。
+    Archive(crate::archive::ArchiveError),
 }
 
 impl std::fmt::Display for ManagerError {
@@ -108,6 +115,9 @@ impl std::fmt::Display for ManagerError {
                 write!(f, "回滚会提升权限,请重新安装该版本并审批")
             }
             Self::NoPreviousVersion(id) => write!(f, "应用 {id} 没有可回滚的上一版"),
+            Self::SourceNotAllowed(why) => write!(f, "{why}"),
+            Self::Source(e) => write!(f, "{e}"),
+            Self::Archive(e) => write!(f, "{e}"),
         }
     }
 }
@@ -129,6 +139,16 @@ impl ManagerError {
             Self::RuntimeVersion { .. } => K::Unavailable,
             Self::RollbackEscalates => K::Conflict,
             Self::NoPreviousVersion(_) => K::NotFound,
+            // 用户可修正的输入问题 → Rejected;I/O 类 → Internal(不新增 wire 变体)。
+            Self::SourceNotAllowed(_) => K::Rejected,
+            Self::Source(e) => match e {
+                crate::source::SourceError::Io(_) => K::Internal,
+                _ => K::Rejected,
+            },
+            Self::Archive(e) => match e {
+                crate::archive::ArchiveError::Io(_) => K::Internal,
+                _ => K::Rejected,
+            },
         }
     }
 }
@@ -517,8 +537,21 @@ fn sweep_staging(apps_dir: &Path) {
     }
 }
 
-/// `LocalDir` 必须是绝对路径:相对路径会按 dozerd 的工作目录解析,调用方并不知道那是哪里。
-fn ensure_absolute(path: &Path) -> Result<(), ManagerError> {
+/// 把 `stage_source` 的错误映射成 `ManagerError`(分类见 `ManagerError::kind`)。
+fn manager_from_stage(e: StageError) -> ManagerError {
+    match e {
+        StageError::Source(e) => ManagerError::Source(e),
+        StageError::Archive(e) => ManagerError::Archive(e),
+        StageError::Io(e) => ManagerError::Io(e),
+    }
+}
+
+/// `LocalDir`/`Archive` 必须是绝对路径:相对路径会按 dozerd 的工作目录解析,调用方并不知道那是哪里。
+fn ensure_absolute(source: &AppSource) -> Result<(), ManagerError> {
+    let path = match source {
+        AppSource::LocalDir { path } | AppSource::Archive { path } => path,
+        AppSource::Url { .. } => return Ok(()),
+    };
     if path.is_absolute() {
         Ok(())
     } else {
@@ -527,27 +560,6 @@ fn ensure_absolute(path: &Path) -> Result<(), ManagerError> {
             path.display()
         )))
     }
-}
-
-/// 递归拷贝目录。只拷普通文件和目录:符号链接/FIFO/设备一律拒绝(与 `digest_tree` 同口径)。
-fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let to = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_tree(&entry.path(), &to)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), &to)?;
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("应用包里只允许普通文件和目录: {}", entry.path().display()),
-            ));
-        }
-    }
-    Ok(())
 }
 
 impl AppManager {
@@ -805,10 +817,26 @@ impl Core {
         provenance: Provenance,
         trust: TrustLevel,
     ) -> Result<InstallPlan, ManagerError> {
-        let AppSource::LocalDir { path: dir } = source;
-        ensure_absolute(dir)?;
-        let package = read_package(dir, &self.host_version)?;
-        self.plan_for(&package, dir, provenance, trust)
+        let policy = source::policy_for(source);
+        let (provenance, trust) = source::effective((provenance, trust), &policy);
+        ensure_absolute(source)?;
+        // 出计划也要把来源落地一次(压缩包要解出来才能读 manifest);解到一个临时 staging,
+        // 算完计划就删,不留任何东西。真正的安装会重新落地并核对两个摘要。
+        let staging = self
+            .registry
+            .paths()
+            .apps_dir()
+            .join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
+        let result = source::stage_source(source, &staging, &source::default_limits())
+            .map_err(manager_from_stage)
+            .and_then(|staged| {
+                let package = read_package(&staging, &self.host_version)?;
+                self.plan_for(&package, &staging, provenance, trust, staged.info)
+            });
+        if staging.exists() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        result
     }
 
     fn plan_for(
@@ -817,6 +845,7 @@ impl Core {
         package_dir: &Path,
         provenance: Provenance,
         trust: TrustLevel,
+        source_info: SourceInfo,
     ) -> Result<InstallPlan, ManagerError> {
         check_supported(&package.manifest.runtime, package_dir)?;
         let record = self.registry.load(&package.manifest.id)?;
@@ -832,39 +861,40 @@ impl Core {
             trust,
             enforcement: enforcement_for(&package.manifest.runtime),
             installed,
+            source_info,
         }))
     }
 
-    /// 安装一份**已批准**的计划。**一切决定都只基于 staging 里的副本**:源目录只被"拷贝"这一个动作读取,
-    /// 拷完之后它再怎么变都与本次安装无关;对 staging 副本重新计算并 `verify`,通过才落位。
+    /// 安装一份**已批准**的计划。**一切决定都只基于 staging 里的副本**:源只被"落地"这一个动作读取,
+    /// 落地完之后它再怎么变都与本次安装无关;对 staging 副本重新计算并 `verify`,通过才落位。
     pub(crate) fn install(
         &self,
         approved: &ApprovedInstallPlan,
         source: &AppSource,
         now_ms: u64,
     ) -> Result<(), ManagerError> {
-        let AppSource::LocalDir { path: dir } = source;
-        ensure_absolute(dir)?;
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ManagerError::ShuttingDown);
         }
+        ensure_absolute(source)?;
         let staging = self
             .registry
             .paths()
             .apps_dir()
             .join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
-        // 拷贝是慢的(可能是带 node_modules 的大目录):**不持锁**做,否则 `suspend_all`(dozerd 退出收尾)要一直
-        // 等到它结束;拷完之后才拿锁做决定、核对、落位
-        let result = copy_tree(dir, &staging)
-            .map_err(ManagerError::from)
-            // 对整棵 staging 树读 manifest、算摘要同样是慢的(macOS 上拷贝是 clone,哈希才是大头):也在锁外做
-            .and_then(|()| read_package(&staging, &self.host_version))
-            .and_then(|package| {
+        // 落地(拷贝/解压/下载)是慢的:在锁外做,拷完之后才拿锁做决定、核对、落位。
+        let result = source::stage_source(source, &staging, &source::default_limits())
+            .map_err(manager_from_stage)
+            .and_then(|staged| {
+                let package = read_package(&staging, &self.host_version)?;
+                Ok((package, staged.info))
+            })
+            .and_then(|(package, info)| {
                 #[cfg(test)]
                 self.prepared
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let _guard = self.guard();
-                self.install_staged(approved, &staging, package, now_ms)
+                self.install_staged(approved, &staging, package, info, source, now_ms)
             });
         // 成功时 staging 已经改名走了,这里是空操作;失败时清掉
         if staging.exists() {
@@ -878,6 +908,8 @@ impl Core {
         approved: &ApprovedInstallPlan,
         staging: &Path,
         package: Package,
+        source_info: SourceInfo,
+        source: &AppSource,
         now_ms: u64,
     ) -> Result<(), ManagerError> {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -885,11 +917,18 @@ impl Core {
         }
         let id = package.manifest.id.clone();
         let version = package.manifest.version;
+        let policy = source::policy_for(source);
+        if policy.static_only && !matches!(package.manifest.runtime, Runtime::StaticWeb { .. }) {
+            return Err(ManagerError::SourceNotAllowed(
+                "网络来源只能安装静态应用".into(),
+            ));
+        }
         let plan = self.plan_for(
             &package,
             staging,
             approved.plan().provenance,
             approved.plan().trust,
+            source_info,
         )?;
         let verified = approved.verify(plan).map_err(ManagerError::Verify)?;
 
@@ -3546,6 +3585,142 @@ source = "web/"
         assert!(matches!(
             rig.manager.install(&approved, &relative, 1),
             Err(ManagerError::BadSource(_))
+        ));
+        assert_no_leftovers(&rig);
+    }
+
+    /// 造一个 `.zip`(无可选压缩,便于稳定比对)。条目名就是相对路径。
+    fn make_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let file = fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in entries {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(body).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    /// 本机压缩包来源:整棵目录解出来、按归档 sha256 披露、正常安装、能取到内容。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_archive_source_installs_and_discloses_its_hash() {
+        let rig = rig().await;
+        let dir = rig.tmp.path().join("pkg");
+        write_files(
+            &dir,
+            &[
+                ("manifest.toml", &manifest_toml("alpha", "1.0.0", "")),
+                ("web/index.html", "A"),
+            ],
+        );
+        let zip_path = rig.tmp.path().join("alpha.zip");
+        make_zip(
+            &zip_path,
+            &[
+                (
+                    "manifest.toml",
+                    manifest_toml("alpha", "1.0.0", "").as_bytes(),
+                ),
+                ("web/index.html", b"A"),
+            ],
+        );
+        let source = AppSource::Archive {
+            path: zip_path.clone(),
+        };
+        let plan = rig
+            .manager
+            .install_plan(&source, Provenance::Local, TrustLevel::Trusted)
+            .unwrap();
+        assert_eq!(plan.source_info.kind, "archive");
+        let expected = crate::digest::sha256_file(&zip_path).unwrap();
+        assert_eq!(
+            plan.source_info.archive_sha256.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            plan.provenance,
+            Provenance::Local,
+            "本机压缩包 = 本机来源/受信(服务端推导)"
+        );
+        assert_eq!(plan.trust, TrustLevel::Trusted);
+        assert!(plan.runtime_kind == "static_web");
+        rig.install(&source).unwrap();
+        assert_eq!(rig.manager.list().unwrap().len(), 1);
+        let alpha = id("alpha");
+        rig.manager.start(&alpha).unwrap();
+        assert_eq!(rig.fetch(&alpha, "/index.html").status, 200);
+        assert_no_leftovers(&rig);
+    }
+
+    /// 归档被改动(sha 变)→ 审批过的计划核对失败,安装拒绝。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swapped_archive_is_refused_at_install_time() {
+        let rig = rig().await;
+        let zip_path = rig.tmp.path().join("alpha.zip");
+        make_zip(
+            &zip_path,
+            &[
+                (
+                    "manifest.toml",
+                    manifest_toml("alpha", "1.0.0", "").as_bytes(),
+                ),
+                ("web/index.html", b"A"),
+            ],
+        );
+        let source = AppSource::Archive {
+            path: zip_path.clone(),
+        };
+        let approved = rig.approve(&source);
+        // 审批之后换掉归档(内容不同、sha 不同)。
+        make_zip(
+            &zip_path,
+            &[
+                (
+                    "manifest.toml",
+                    manifest_toml("alpha", "1.0.0", "").as_bytes(),
+                ),
+                ("web/index.html", b"B"),
+            ],
+        );
+        assert!(matches!(
+            rig.manager.install(&approved, &source, 1),
+            Err(ManagerError::Verify(_))
+        ));
+        assert!(rig.manager.list().unwrap().is_empty());
+        assert_no_leftovers(&rig);
+    }
+
+    /// 不认识的压缩包扩展名在出计划时就被拒(不读内容)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unrecognized_archive_extension_is_refused() {
+        let rig = rig().await;
+        let source = AppSource::Archive {
+            path: rig.tmp.path().join("a.rar"),
+        };
+        assert!(matches!(
+            rig.manager
+                .install_plan(&source, Provenance::Local, TrustLevel::Trusted),
+            Err(ManagerError::Source(_))
+        ));
+        assert_no_leftovers(&rig);
+    }
+
+    /// 网络 URL 来源在 Task 2 阶段尚未启用:出计划即被拒(客户端自报 `Trusted` 也改不了)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_url_source_reports_not_enabled_and_cannot_report_its_own_trust() {
+        let rig = rig().await;
+        let source = AppSource::Url {
+            url: "https://example.com/a.zip".into(),
+            sha256: None,
+        };
+        assert!(matches!(
+            rig.manager
+                .install_plan(&source, Provenance::Local, TrustLevel::Trusted),
+            Err(ManagerError::Source(
+                crate::source::SourceError::NotEnabled(_)
+            ))
         ));
         assert_no_leftovers(&rig);
     }

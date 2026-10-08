@@ -8,6 +8,7 @@ use crate::manifest::{Manifest, Runtime};
 use crate::permissions::{
     Enforcement, PermissionChange, PermissionKey, Permissions, diff_permissions,
 };
+use crate::proto::SourceInfo;
 
 /// 应用从哪来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +57,9 @@ pub struct InstallPlan {
     pub permission_diff: Vec<PermissionChange>,
     /// 安装/运行时会执行什么——人类可读的描述,UI 原样展示。
     pub will_run: Vec<String>,
+    /// 来源披露(展示用,参与 `verify` 的逐字段核对)。旧形状 JSON(无此字段)解析为默认值。
+    #[serde(default)]
+    pub source_info: SourceInfo,
 }
 
 /// 当前已安装的版本与已授予的权限(升级时用来算差异)。
@@ -74,6 +78,7 @@ pub struct PlanInput<'a> {
     pub trust: TrustLevel,
     pub enforcement: Vec<EnforcementEntry>,
     pub installed: Option<Installed<'a>>,
+    pub source_info: SourceInfo,
 }
 
 impl InstallPlan {
@@ -94,6 +99,7 @@ impl InstallPlan {
             enforcement: input.enforcement,
             permission_diff: diff_permissions(&baseline, &m.permissions),
             will_run: will_run(&m.runtime),
+            source_info: input.source_info,
         }
     }
 
@@ -300,6 +306,7 @@ mod tests {
                 enforcement: Enforcement::Advisory,
             }],
             installed,
+            source_info: SourceInfo::default(),
         }
     }
 
@@ -536,6 +543,39 @@ mod tests {
         assert_eq!(
             approved.verify(fresh(&m, "m1", "s1")),
             Err(VerifyError::PlanChanged)
+        );
+    }
+
+    /// `source_info` 参与核对:审批时披露的来源与重新算出的不同 → 拒绝。
+    #[test]
+    fn source_info_participates_in_verification() {
+        let m = static_manifest();
+        let mut approved = InstallPlan::build(input(&m, None)).approve(approval());
+        approved.plan.source_info.kind = "url".into();
+        approved.plan.source_info.pinned = true;
+        assert_eq!(
+            approved.verify(fresh(&m, "m1", "s1")),
+            Err(VerifyError::PlanChanged)
+        );
+    }
+
+    /// 旧形状计划 JSON(无 `source_info`)仍可解析,且默认值下 `verify` 照常工作。
+    #[test]
+    fn an_old_plan_payload_without_source_info_still_parses_and_verifies() {
+        let m = static_manifest();
+        let approved = InstallPlan::build(input(&m, None)).approve(approval());
+        let mut value = serde_json::to_value(&approved).unwrap();
+        value
+            .get_mut("plan")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("source_info");
+        let parsed: ApprovedInstallPlan = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.plan().source_info, SourceInfo::default());
+        assert_eq!(
+            parsed.verify(fresh(&m, "m1", "s1")).unwrap(),
+            parsed.plan().clone()
         );
     }
 

@@ -11,11 +11,46 @@ use crate::plan::{ApprovedInstallPlan, InstallPlan, Provenance, TrustLevel};
 use crate::registry::{RollbackNote, UninstallMode};
 use crate::state::{DesiredState, ObservedState};
 
-/// 应用从哪来。一期只有本地目录(目录里要有 `manifest.toml`);压缩包/仓库以后再加。
+/// 应用从哪来。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppSource {
+    /// 本机目录(目录里要有 `manifest.toml`)。
     LocalDir { path: PathBuf },
+    /// 本机压缩包(`.zip`/`.tar.gz`/`.tgz`);类型按扩展名判断。路径必须是绝对路径。
+    Archive { path: PathBuf },
+    /// https URL 指向的压缩包。`sha256` 是用户期望的完整性值(十六进制;大小写/空白在
+    /// `source::normalize_sha256` 里处理),`None` 表示不钉死(审批卡会展示实际算出的哈希)。
+    Url {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+    },
+}
+
+/// 安装计划里的来源披露(展示用;**参与 `verify` 的逐字段核对**)。
+/// 旧形状 JSON(无此字段/缺字段)解析为默认值。
+#[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SourceInfo {
+    /// `"local_dir"` | `"archive"` | `"url"`。
+    pub kind: String,
+    /// 目录/文件路径;URL 为不含查询串的 `https://host/path`。
+    pub display: String,
+    /// 归档文件整体 sha256(archive/url 才有)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_bytes: Option<u64>,
+    /// url:下载后最终落到的主机(Task 3 填)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_host: Option<String>,
+    /// url:用户是否提供了期望 sha256 且已匹配。
+    #[serde(default)]
+    pub pinned: bool,
+    /// 若剥掉了唯一顶层目录,这里记它的名字。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stripped_top_dir: Option<String>,
 }
 
 /// 列表里的一项。
@@ -386,11 +421,59 @@ mod tests {
     #[test]
     fn unknown_ops_and_unknown_sources_are_rejected_not_ignored() {
         assert!(serde_json::from_value::<AppRequest>(json!({"op": "format_disk"})).is_err());
-        assert!(serde_json::from_value::<AppRequest>(json!({"op": "plan", "source": {"kind": "url", "url": "x"}, "provenance": "local", "trust": "trusted"})).is_err());
+        assert!(serde_json::from_value::<AppRequest>(json!({"op": "plan", "source": {"kind": "telepathy", "url": "x"}, "provenance": "local", "trust": "trusted"})).is_err());
         assert!(
             serde_json::from_value::<AppRequest>(json!({"op": "start", "id": "../etc"})).is_err(),
             "非法 app id 在反序列化时就被拒绝"
         );
+    }
+
+    #[test]
+    fn archive_and_url_sources_round_trip_and_old_shapes_still_parse() {
+        let arch = AppRequest::Plan {
+            source: AppSource::Archive {
+                path: "/tmp/app.zip".into(),
+            },
+            provenance: Provenance::Local,
+            trust: TrustLevel::Trusted,
+        };
+        assert_eq!(
+            round_trip(&arch),
+            json!({"op": "plan", "source": {"kind": "archive", "path": "/tmp/app.zip"}, "provenance": "local", "trust": "trusted"})
+        );
+        let url = AppRequest::Plan {
+            source: AppSource::Url {
+                url: "https://example.com/a.zip".into(),
+                sha256: Some("a".repeat(64)),
+            },
+            provenance: Provenance::ThirdParty,
+            trust: TrustLevel::Untrusted,
+        };
+        let json = round_trip(&url);
+        assert_eq!(json["source"]["kind"], "url");
+        assert_eq!(json["source"]["sha256"], "a".repeat(64));
+        // 旧形状(只有 local_dir)仍解析。
+        let old: AppRequest = serde_json::from_value(
+            json!({"op": "plan", "source": {"kind": "local_dir", "path": "/x"}, "provenance": "local", "trust": "trusted"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            AppRequest::Plan {
+                source: AppSource::LocalDir { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn source_info_defaults_for_an_old_plan_payload() {
+        // 旧计划 JSON 没有 source_info → 默认(空 kind)。
+        let info: SourceInfo = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(info, SourceInfo::default());
+        assert_eq!(info.kind, "");
+        assert!(info.archive_sha256.is_none());
+        assert!(!info.pinned);
     }
 
     #[test]
