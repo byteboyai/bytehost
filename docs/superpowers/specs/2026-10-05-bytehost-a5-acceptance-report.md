@@ -29,7 +29,7 @@
 | 5 | 伪造 `Host` 被拒 | `gateway::the_host_header_must_be_exactly_a_valid_app_dot_localhost_with_the_gateways_port` 通过 |
 | 6 | 未知权限字段 → 计划失败 | `manifest::…::unknown_fields_are_a_parse_error_at_the_top_level_and_in_nested_tables` 通过;随包清单 `the_shipped_excalidraw_manifest_parses_and_asks_for_nothing` 通过 |
 | 7 | dozerd 停止后应用 `Stopped`、重启按 `desired` 恢复;重启后沿用持久化端口 | `app_requests::a_shutdown_request_takes_the_apps_down_but_keeps_what_the_user_wanted`、`app_service::apps_wanted_running_come_back_after_a_dozerd_restart_and_stopped_ones_stay_stopped`、`start_uses_the_persisted_port_across_restarts` 通过 |
-| 8(重新表述) | 声明非 `static_web` 的应用在安装计划阶段被明确拒绝 | `manager::only_static_web_is_supported_in_phase_one` 通过 |
+| 8(重新表述) | 声明非 `static_web` 的应用在安装计划阶段被明确拒绝 | `manager::containers_are_still_unsupported` 通过 |
 
 ## 3. 待人工在真实 GUI 里完成(**未执行**)
 
