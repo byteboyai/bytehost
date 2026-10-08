@@ -32,6 +32,7 @@ use crate::plan::{
 use crate::registry::{
     AppRecord, RECORD_FORMAT_VERSION, Registry, RollbackNote, UninstallMode, VersionRecord,
 };
+use crate::runtime::managed::{CurlFetcher, Fetcher};
 use crate::runtime::{
     ResolveError, Resolved, RuntimeResolver, SystemResolver, SystemVersionProbe, VersionProbe,
     enforcement_for,
@@ -197,6 +198,9 @@ pub struct Core {
     policy: crate::process::restart::RestartPolicy,
     /// 运行中周期健康检查的参数(默认 `DEFAULT_MONITOR_*`;测试里调小以便观察)。
     monitor: MonitorConfig,
+    /// 下载 URL 来源的归档(默认 `CurlFetcher`;测试里注入假实现)。
+    #[allow(dead_code)]
+    fetcher: Arc<dyn Fetcher>,
     /// 每个应用当前那条监管线程(`cancel` 标志 + 句柄)。静态应用不登记。
     #[allow(dead_code)]
     supervisions: Mutex<HashMap<AppId, Supervision>>,
@@ -546,6 +550,43 @@ fn manager_from_stage(e: StageError) -> ManagerError {
     }
 }
 
+/// 清掉下载缓存目录里的半成品(`*.part`)与陈旧(`> 1h`)的 `*.bin`。
+/// 计划到安装之间的 `*.bin` 不能删:安装要复用;超过 1h 视为用户放弃了这次计划。
+fn sweep_downloads(downloads_dir: &Path) {
+    let Ok(entries) = fs::read_dir(downloads_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".part") {
+            let _ = fs::remove_file(entry.path());
+        } else if name.ends_with(".bin") {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .map(|d| d.as_secs() > 3600)
+                .unwrap_or(false);
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// 从计划披露的 `SourceInfo` 推断归档类型(URL 已落到缓存,名字里带扩展名)。
+fn archive_kind_from_info(info: &SourceInfo) -> crate::archive::ArchiveKind {
+    let d = info.display.to_ascii_lowercase();
+    if d.ends_with(".tar.gz") || d.ends_with(".tgz") {
+        crate::archive::ArchiveKind::TarGz
+    } else {
+        crate::archive::ArchiveKind::Zip
+    }
+}
+
 /// `LocalDir`/`Archive` 必须是绝对路径:相对路径会按 dozerd 的工作目录解析,调用方并不知道那是哪里。
 fn ensure_absolute(source: &AppSource) -> Result<(), ManagerError> {
     let path = match source {
@@ -562,13 +603,34 @@ fn ensure_absolute(source: &AppSource) -> Result<(), ManagerError> {
     }
 }
 
+/// `AppManager` 各依赖的组装配置。所有字段都有生产默认值,测试按需覆盖。
+pub struct ManagerConfig {
+    pub resolver: Arc<dyn RuntimeResolver>,
+    pub policy: crate::process::restart::RestartPolicy,
+    pub version_probe: Arc<dyn VersionProbe>,
+    pub monitor: MonitorConfig,
+    pub fetcher: Arc<dyn Fetcher>,
+}
+
+impl Default for ManagerConfig {
+    fn default() -> Self {
+        Self {
+            resolver: Arc::new(SystemResolver::new()),
+            policy: crate::process::restart::RestartPolicy::default(),
+            version_probe: Arc::new(SystemVersionProbe::new()),
+            monitor: MonitorConfig::default(),
+            fetcher: Arc::new(CurlFetcher),
+        }
+    }
+}
+
 impl AppManager {
     pub fn new(
         root: impl Into<PathBuf>,
         host_version: Version,
         gateway: Arc<Gateway>,
     ) -> io::Result<Self> {
-        Self::with_resolver(root, host_version, gateway, Arc::new(SystemResolver::new()))
+        Self::with_config(root, host_version, gateway, ManagerConfig::default())
     }
 
     pub fn with_resolver(
@@ -577,63 +639,30 @@ impl AppManager {
         gateway: Arc<Gateway>,
         resolver: Arc<dyn RuntimeResolver>,
     ) -> io::Result<Self> {
-        Self::with_resolver_and_policy(
-            root,
-            host_version,
-            gateway,
+        let config = ManagerConfig {
             resolver,
-            crate::process::restart::RestartPolicy::default(),
-        )
+            ..ManagerConfig::default()
+        };
+        Self::with_config(root, host_version, gateway, config)
     }
 
-    fn with_resolver_and_policy(
+    pub fn with_config(
         root: impl Into<PathBuf>,
         host_version: Version,
         gateway: Arc<Gateway>,
-        resolver: Arc<dyn RuntimeResolver>,
-        policy: crate::process::restart::RestartPolicy,
+        config: ManagerConfig,
     ) -> io::Result<Self> {
-        Self::with_parts(
-            root,
-            host_version,
-            gateway,
-            resolver,
-            policy,
-            Arc::new(SystemVersionProbe::new()),
-        )
-    }
-
-    fn with_parts(
-        root: impl Into<PathBuf>,
-        host_version: Version,
-        gateway: Arc<Gateway>,
-        resolver: Arc<dyn RuntimeResolver>,
-        policy: crate::process::restart::RestartPolicy,
-        version_probe: Arc<dyn VersionProbe>,
-    ) -> io::Result<Self> {
-        Self::with_parts_full(
-            root,
-            host_version,
-            gateway,
+        let ManagerConfig {
             resolver,
             policy,
             version_probe,
-            MonitorConfig::default(),
-        )
-    }
-
-    fn with_parts_full(
-        root: impl Into<PathBuf>,
-        host_version: Version,
-        gateway: Arc<Gateway>,
-        resolver: Arc<dyn RuntimeResolver>,
-        policy: crate::process::restart::RestartPolicy,
-        version_probe: Arc<dyn VersionProbe>,
-        monitor: MonitorConfig,
-    ) -> io::Result<Self> {
+            monitor,
+            fetcher,
+        } = config;
         let (events, _) = broadcast::channel(256);
         let registry = Registry::open(root)?;
         sweep_staging(&registry.paths().apps_dir());
+        sweep_downloads(&registry.paths().downloads_dir());
         let core = Arc::new_cyclic(|weak| {
             let core = Core {
                 registry,
@@ -648,6 +677,7 @@ impl AppManager {
                 issues: Mutex::new(HashMap::new()),
                 policy,
                 monitor,
+                fetcher,
                 supervisions: Mutex::new(HashMap::new()),
                 self_weak: std::sync::OnceLock::new(),
                 #[cfg(test)]
@@ -668,7 +698,12 @@ impl AppManager {
         resolver: Arc<dyn RuntimeResolver>,
         policy: crate::process::restart::RestartPolicy,
     ) -> io::Result<Self> {
-        Self::with_resolver_and_policy(root, host_version, gateway, resolver, policy)
+        let config = ManagerConfig {
+            resolver,
+            policy,
+            ..ManagerConfig::default()
+        };
+        Self::with_config(root, host_version, gateway, config)
     }
 
     /// (仅测试)注入假的 `VersionProbe`,并允许调小重启策略。
@@ -681,7 +716,28 @@ impl AppManager {
         policy: crate::process::restart::RestartPolicy,
         version_probe: Arc<dyn VersionProbe>,
     ) -> io::Result<Self> {
-        Self::with_parts(root, host_version, gateway, resolver, policy, version_probe)
+        let config = ManagerConfig {
+            resolver,
+            policy,
+            version_probe,
+            ..ManagerConfig::default()
+        };
+        Self::with_config(root, host_version, gateway, config)
+    }
+
+    /// (仅测试)注入假的 `Fetcher`,用于 URL 来源的下载/缓存/摘要用例(无网)。
+    #[cfg(test)]
+    pub(crate) fn with_fetcher_for_test(
+        root: impl Into<PathBuf>,
+        host_version: Version,
+        gateway: Arc<Gateway>,
+        fetcher: Arc<dyn Fetcher>,
+    ) -> io::Result<Self> {
+        let config = ManagerConfig {
+            fetcher,
+            ..ManagerConfig::default()
+        };
+        Self::with_config(root, host_version, gateway, config)
     }
 
     /// (仅测试)调小运行中健康检查的参数与重启退避;解释器版本用真实探测。
@@ -695,15 +751,13 @@ impl AppManager {
         policy: crate::process::restart::RestartPolicy,
         monitor: MonitorConfig,
     ) -> io::Result<Self> {
-        Self::with_parts_full(
-            root,
-            host_version,
-            gateway,
+        let config = ManagerConfig {
             resolver,
             policy,
-            Arc::new(SystemVersionProbe::new()),
             monitor,
-        )
+            ..ManagerConfig::default()
+        };
+        Self::with_config(root, host_version, gateway, config)
     }
 
     pub fn events(&self) -> broadcast::Receiver<AppEvent> {
@@ -820,6 +874,7 @@ impl Core {
         let policy = source::policy_for(source);
         let (provenance, trust) = source::effective((provenance, trust), &policy);
         ensure_absolute(source)?;
+        let downloads = self.registry.paths().downloads_dir();
         // 出计划也要把来源落地一次(压缩包要解出来才能读 manifest);解到一个临时 staging,
         // 算完计划就删,不留任何东西。真正的安装会重新落地并核对两个摘要。
         let staging = self
@@ -827,12 +882,28 @@ impl Core {
             .paths()
             .apps_dir()
             .join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
-        let result = source::stage_source(source, &staging, &source::default_limits())
-            .map_err(manager_from_stage)
-            .and_then(|staged| {
-                let package = read_package(&staging, &self.host_version)?;
-                self.plan_for(&package, &staging, provenance, trust, staged.info)
-            });
+        let result = source::stage_source(
+            source,
+            &staging,
+            &source::default_limits(),
+            &*self.fetcher,
+            &downloads,
+        )
+        .map_err(manager_from_stage)
+        .and_then(|staged| {
+            let package = read_package(&staging, &self.host_version)?;
+            // 网络来源只放行静态应用:出计划就拒,顺手清掉刚下的缓存。
+            if policy.static_only && !matches!(package.manifest.runtime, Runtime::StaticWeb { .. })
+            {
+                if let Some(sha) = staged.info.archive_sha256.as_deref() {
+                    source::discard_cached_archive(&downloads, sha);
+                }
+                return Err(ManagerError::SourceNotAllowed(
+                    "网络来源只能安装静态应用".into(),
+                ));
+            }
+            self.plan_for(&package, &staging, provenance, trust, staged.info)
+        });
         if staging.exists() {
             let _ = fs::remove_dir_all(&staging);
         }
@@ -877,17 +948,19 @@ impl Core {
             return Err(ManagerError::ShuttingDown);
         }
         ensure_absolute(source)?;
+        let downloads = self.registry.paths().downloads_dir();
         let staging = self
             .registry
             .paths()
             .apps_dir()
             .join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
         // 落地(拷贝/解压/下载)是慢的:在锁外做,拷完之后才拿锁做决定、核对、落位。
-        let result = source::stage_source(source, &staging, &source::default_limits())
+        let result = self
+            .stage_for_install(approved, source, &staging, &downloads)
             .map_err(manager_from_stage)
-            .and_then(|staged| {
+            .and_then(|info| {
                 let package = read_package(&staging, &self.host_version)?;
-                Ok((package, staged.info))
+                Ok((package, info))
             })
             .and_then(|(package, info)| {
                 #[cfg(test)]
@@ -900,7 +973,72 @@ impl Core {
         if staging.exists() {
             let _ = fs::remove_dir_all(&staging);
         }
+        // URL 来源:安装成功/失败后都删对应下载缓存(计划已消费,缓存无长期价值)。
+        if let (AppSource::Url { .. }, Some(sha)) = (
+            source,
+            approved.plan().source_info.archive_sha256.as_deref(),
+        ) {
+            source::discard_cached_archive(&downloads, sha);
+        }
         result
+    }
+
+    /// 安装阶段的"落地":非 URL 直接走 `stage_source`;URL 优先复用出计划时的下载缓存
+    /// (`downloads/<sha>.bin`),缺失或损坏才重新下载,且重下的 sha256 必须等于计划里披露的值。
+    fn stage_for_install(
+        &self,
+        approved: &ApprovedInstallPlan,
+        source: &AppSource,
+        staging: &Path,
+        downloads: &Path,
+    ) -> Result<SourceInfo, StageError> {
+        let AppSource::Url { url, .. } = source else {
+            return source::stage_source(
+                source,
+                staging,
+                &source::default_limits(),
+                &*self.fetcher,
+                downloads,
+            )
+            .map(|s| s.info);
+        };
+        let plan_info = &approved.plan().source_info;
+        let Some(want) = plan_info.archive_sha256.as_deref() else {
+            return Err(StageError::Source(source::SourceError::InvalidUrl(
+                "计划里缺少归档 sha256".into(),
+            )));
+        };
+        // 先试缓存。
+        if source::extract_cached_archive(
+            downloads,
+            want,
+            staging,
+            &source::default_limits(),
+            archive_kind_from_info(plan_info),
+        )?
+        .is_some()
+        {
+            return Ok(plan_info.clone());
+        }
+        // 缓存没有/坏了:重新下载并严格核对 sha256。
+        let got = source::download_to_cache(url, &*self.fetcher, downloads)?;
+        if got.sha256 != want {
+            source::discard_cached_archive(downloads, &got.sha256);
+            return Err(StageError::Source(source::SourceError::Sha256Mismatch {
+                expected: want.to_string(),
+                actual: got.sha256,
+            }));
+        }
+        source::extract_from_cache(
+            downloads,
+            want,
+            &got.display,
+            staging,
+            &source::default_limits(),
+        )?;
+        // 摘要一致,沿用计划里披露的 `SourceInfo`(含 effective_host/pinned),
+        // 否则 `plan_for` 会因来源变了判 `PlanChanged`。
+        Ok(plan_info.clone())
     }
 
     fn install_staged(
@@ -3707,10 +3845,289 @@ source = "web/"
         assert_no_leftovers(&rig);
     }
 
-    /// 网络 URL 来源在 Task 2 阶段尚未启用:出计划即被拒(客户端自报 `Trusted` 也改不了)。
+    /// 假 fetcher:从内存里"下载"准备字节;可配置最终 URL、第二次返回不同内容、读取调用次数。
+    struct FakeFetcher {
+        calls: std::sync::atomic::AtomicUsize,
+        bytes: Mutex<Vec<u8>>,
+        effective_url: String,
+        inner_error: Mutex<Option<io::ErrorKind>>,
+        swap_after_first: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl FakeFetcher {
+        fn ok(bytes: Vec<u8>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                bytes: Mutex::new(bytes),
+                effective_url: "https://example.com/a.zip".into(),
+                inner_error: Mutex::new(None),
+                swap_after_first: Mutex::new(None),
+            })
+        }
+
+        fn with_url(mut self: Arc<Self>, url: &str) -> Arc<Self> {
+            Arc::get_mut(&mut self)
+                .expect("构造后立刻调用,无其他引用")
+                .effective_url = url.into();
+            self
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Fetcher for FakeFetcher {
+        fn fetch(
+            &self,
+            url: &str,
+            dest: &Path,
+            on_progress: &mut dyn FnMut(u64, Option<u64>),
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> io::Result<()> {
+            self.fetch_meta(url, dest, 0, on_progress, cancel)
+                .map(|_| ())
+        }
+
+        fn fetch_meta(
+            &self,
+            _url: &str,
+            dest: &Path,
+            _max_bytes: u64,
+            _on_progress: &mut dyn FnMut(u64, Option<u64>),
+            _cancel: &std::sync::atomic::AtomicBool,
+        ) -> io::Result<crate::runtime::managed::fetch::FetchMeta> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(kind) = *self.inner_error.lock().unwrap() {
+                return Err(io::Error::new(kind, "假下载失败"));
+            }
+            if n == 1
+                && let Some(swapped) = self.swap_after_first.lock().unwrap().as_ref()
+            {
+                *self.bytes.lock().unwrap() = swapped.clone();
+            }
+            let bytes = self.bytes.lock().unwrap().clone();
+            fs::write(dest, &bytes)?;
+            Ok(crate::runtime::managed::fetch::FetchMeta {
+                effective_url: self.effective_url.clone(),
+                bytes: bytes.len() as u64,
+            })
+        }
+    }
+
+    async fn rig_with_fetcher(fetcher: Arc<FakeFetcher>) -> Rig {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let manager = AppManager::with_fetcher_for_test(
+            tmp.path().join("bytehost"),
+            HOST,
+            gateway.clone(),
+            fetcher,
+        )
+        .unwrap();
+        Rig {
+            tmp,
+            gateway,
+            manager,
+        }
+    }
+
+    fn static_app_zip(version: &str, body: &str) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("app.zip");
+        make_zip(
+            &zip_path,
+            &[
+                (
+                    "manifest.toml",
+                    manifest_toml("alpha", version, "").as_bytes(),
+                ),
+                ("web/index.html", body.as_bytes()),
+            ],
+        );
+        fs::read(&zip_path).unwrap()
+    }
+
+    fn downloads_of(rig: &Rig) -> PathBuf {
+        rig.manager.registry.paths().downloads_dir()
+    }
+
+    fn downloads_is_empty(rig: &Rig) -> bool {
+        !downloads_of(rig).exists() || fs::read_dir(downloads_of(rig)).unwrap().next().is_none()
+    }
+
+    /// `downloads/` 里没有半成品 `.part`。
+    fn no_part_files(rig: &Rig) -> bool {
+        if !downloads_of(rig).exists() {
+            return true;
+        }
+        fs::read_dir(downloads_of(rig))
+            .unwrap()
+            .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".part"))
+    }
+
+    /// URL 来源成功:出计划披露 url 来源、实际 sha、最终主机、`pinned=false`;安装复用缓存只下载一次;
+    /// 成功安装后缓存清空。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_url_source_reports_not_enabled_and_cannot_report_its_own_trust() {
-        let rig = rig().await;
+    async fn a_url_source_installs_from_a_single_download_and_cleans_up() {
+        let zip = static_app_zip("1.0.0", "A");
+        let fetcher = FakeFetcher::ok(zip.clone()).with_url("https://cdn.example.net/a.zip");
+        let rig = rig_with_fetcher(fetcher.clone()).await;
+        let source = AppSource::Url {
+            url: "https://example.com/a.zip".into(),
+            sha256: None,
+        };
+        let plan = rig
+            .manager
+            .install_plan(&source, Provenance::Local, TrustLevel::Trusted)
+            .unwrap();
+        assert_eq!(plan.source_info.kind, "url");
+        assert_eq!(
+            plan.source_info.archive_sha256.as_deref(),
+            Some(crate::digest::sha256_hex(&zip).as_str())
+        );
+        assert_eq!(
+            plan.source_info.effective_host.as_deref(),
+            Some("cdn.example.net"),
+            "重定向后的最终主机如实披露"
+        );
+        assert!(!plan.source_info.pinned);
+        assert_eq!(plan.provenance, Provenance::ThirdParty);
+        assert_eq!(plan.trust, TrustLevel::Untrusted);
+        assert_eq!(fetcher.calls(), 1, "出计划下载一次");
+
+        let approved = plan.approve(crate::plan::Approval {
+            approver: "test".into(),
+            approved_ms: 1,
+        });
+        rig.manager.install(&approved, &source, 100).unwrap();
+        assert_eq!(fetcher.calls(), 1, "安装应复用缓存,不再下载");
+        assert!(downloads_is_empty(&rig), "成功安装后清掉下载缓存");
+        assert_no_leftovers(&rig);
+        let alpha = id("alpha");
+        rig.manager.start(&alpha).unwrap();
+        assert_eq!(rig.fetch(&alpha, "/index.html").status, 200);
+    }
+
+    /// Review Focus 6:期望 sha256 大小写/空白容忍;错一位 → `Sha256Mismatch` 且无残留;
+    /// 格式错误(63/65/非十六进制)→ 未发起下载。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn url_sha256_pinning_is_case_insensitive_and_format_checked_before_download() {
+        let zip = static_app_zip("1.0.0", "A");
+        let hex = crate::digest::sha256_hex(&zip);
+        let fetcher = FakeFetcher::ok(zip.clone());
+        let rig = rig_with_fetcher(fetcher.clone()).await;
+        // 正确值,大写 + 前后空白 → 通过且 pinned。
+        let source = AppSource::Url {
+            url: "https://example.com/a.zip".into(),
+            sha256: Some(format!("  {}\n", hex.to_uppercase())),
+        };
+        let plan = rig
+            .manager
+            .install_plan(&source, Provenance::Local, TrustLevel::Trusted)
+            .unwrap();
+        assert!(plan.source_info.pinned);
+        assert_eq!(
+            plan.source_info.archive_sha256.as_deref(),
+            Some(hex.as_str())
+        );
+        assert!(downloads_of(&rig).join(format!("{hex}.bin")).is_file());
+        assert!(no_part_files(&rig));
+
+        // 错一位 → 不匹配、无残留。
+        let bad = format!("0{}", &hex[1..]);
+        let bad_source = AppSource::Url {
+            url: "https://example.com/a.zip".into(),
+            sha256: Some(bad),
+        };
+        assert!(matches!(
+            rig.manager
+                .install_plan(&bad_source, Provenance::Local, TrustLevel::Trusted),
+            Err(ManagerError::Source(
+                crate::source::SourceError::Sha256Mismatch { .. }
+            ))
+        ));
+        assert!(no_part_files(&rig));
+
+        // 格式错误(长度错/非十六进制)→ 未发起下载。
+        for bad in ["a".repeat(63), "a".repeat(65), "z".repeat(64)] {
+            let s = AppSource::Url {
+                url: "https://example.com/a.zip".into(),
+                sha256: Some(bad),
+            };
+            assert!(matches!(
+                rig.manager
+                    .install_plan(&s, Provenance::Local, TrustLevel::Trusted),
+                Err(ManagerError::Source(
+                    crate::source::SourceError::Sha256Format(_)
+                ))
+            ));
+        }
+        assert_eq!(
+            fetcher.calls(),
+            2,
+            "格式错误不应发起下载(只成功了 1 次 + 错一位那次)"
+        );
+    }
+
+    /// Review Focus 5:缓存被改一个字节 → **不使用**它(重新下载正确的字节后安装成功)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tampered_url_cache_is_not_used() {
+        let zip = static_app_zip("1.0.0", "A");
+        let fetcher = FakeFetcher::ok(zip.clone());
+        let rig = rig_with_fetcher(fetcher.clone()).await;
+        let source = AppSource::Url {
+            url: "https://example.com/a.zip".into(),
+            sha256: None,
+        };
+        let approved = rig.approve(&source);
+        // 缓存被改:直接改 .bin 一个字节。安装必须**不使用**它——重新下载正确字节后仍安装成功。
+        let sha = approved.plan().source_info.archive_sha256.clone().unwrap();
+        let cache = downloads_of(&rig).join(format!("{sha}.bin"));
+        let mut bytes = fs::read(&cache).unwrap();
+        bytes.push(0);
+        fs::write(&cache, &bytes).unwrap();
+        let calls_before = fetcher.calls();
+        rig.manager.install(&approved, &source, 1).unwrap();
+        assert_eq!(
+            fetcher.calls(),
+            calls_before + 1,
+            "被改的缓存不能用,必须重新下载"
+        );
+        assert!(downloads_is_empty(&rig), "安装后清缓存");
+        assert_no_leftovers(&rig);
+    }
+
+    /// 缓存删除后假 fetcher 返回不同字节 → 摘要与计划不符,拒绝、不落位。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_cache_that_redownloads_different_bytes_is_refused() {
+        let fetcher = FakeFetcher::ok(static_app_zip("1.0.0", "A"));
+        let rig = rig_with_fetcher(fetcher.clone()).await;
+        let source = AppSource::Url {
+            url: "https://example.com/a.zip".into(),
+            sha256: None,
+        };
+        let approved = rig.approve(&source);
+        let sha = approved.plan().source_info.archive_sha256.clone().unwrap();
+        fs::remove_file(downloads_of(&rig).join(format!("{sha}.bin"))).unwrap();
+        *fetcher.swap_after_first.lock().unwrap() = Some(static_app_zip("1.0.0", "DIFFERENT"));
+        assert!(matches!(
+            rig.manager.install(&approved, &source, 1),
+            Err(ManagerError::Source(
+                crate::source::SourceError::Sha256Mismatch { .. }
+            ))
+        ));
+        assert!(rig.manager.list().unwrap().is_empty());
+        assert!(no_part_files(&rig));
+        assert_no_leftovers(&rig);
+    }
+
+    /// 防御性:假 fetcher 报告最终 URL 是 http → 拒绝(即便 curl 参数被改也守住)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_http_effective_url_is_refused() {
+        let fetcher =
+            FakeFetcher::ok(static_app_zip("1.0.0", "A")).with_url("http://example.com/a.zip");
+        let rig = rig_with_fetcher(fetcher).await;
         let source = AppSource::Url {
             url: "https://example.com/a.zip".into(),
             sha256: None,
@@ -3719,10 +4136,88 @@ source = "web/"
             rig.manager
                 .install_plan(&source, Provenance::Local, TrustLevel::Trusted),
             Err(ManagerError::Source(
-                crate::source::SourceError::NotEnabled(_)
+                crate::source::SourceError::InvalidUrl(_)
             ))
         ));
+        assert!(downloads_is_empty(&rig));
+    }
+
+    /// Review Focus 7:带凭据的 URL 被拒,错误文案里不含口令;带查询串的 URL 成功但披露串不含查询串。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn url_credentials_and_query_strings_never_leak_into_errors() {
+        let fetcher = FakeFetcher::ok(static_app_zip("1.0.0", "A"));
+        let rig = rig_with_fetcher(fetcher).await;
+        let creds = AppSource::Url {
+            url: "https://user:pass@example.com/a.zip".into(),
+            sha256: None,
+        };
+        let err = rig
+            .manager
+            .install_plan(&creds, Provenance::Local, TrustLevel::Trusted)
+            .unwrap_err();
+        assert!(!err.to_string().contains("pass"), "{}", err);
+
+        let query = AppSource::Url {
+            url: "https://example.com/a.zip?token=SECRET".into(),
+            sha256: None,
+        };
+        let plan = rig
+            .manager
+            .install_plan(&query, Provenance::Local, TrustLevel::Trusted)
+            .unwrap();
+        assert!(!plan.source_info.display.contains("SECRET"));
+        assert_eq!(plan.source_info.display, "https://example.com/a.zip");
+    }
+
+    /// Review Focus 4(端到端):URL 来源的 python 应用出计划即 `SourceNotAllowed`;
+    /// 客户端自报 `Trusted` 也仍是 `Untrusted`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_url_source_cannot_install_a_process_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("app.zip");
+        let manifest = manifest_toml("pypkg", "1.0.0", "").replace(
+            "kind = \"static_web\"\nsource = \"web/\"",
+            "kind = \"python\"\ncommand = [\"python3\", \"server.py\"]\n[runtime.http]\nport_env = \"APP_PORT\"",
+        );
+        make_zip(
+            &zip_path,
+            &[
+                ("manifest.toml", manifest.as_bytes()),
+                ("server.py", b"print('hi')"),
+            ],
+        );
+        let bytes = fs::read(&zip_path).unwrap();
+        let fetcher = FakeFetcher::ok(bytes);
+        let rig = rig_with_fetcher(fetcher).await;
+        let source = AppSource::Url {
+            url: "https://example.com/a.zip".into(),
+            sha256: None,
+        };
+        assert!(matches!(
+            rig.manager
+                .install_plan(&source, Provenance::Local, TrustLevel::Trusted),
+            Err(ManagerError::SourceNotAllowed(_))
+        ));
+        assert!(downloads_is_empty(&rig));
         assert_no_leftovers(&rig);
+    }
+
+    /// Review Focus 8:下载失败/取消 → `downloads/` 无残留。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_download_leaves_no_part_files() {
+        let fetcher = FakeFetcher::ok(vec![]);
+        *fetcher.inner_error.lock().unwrap() = Some(io::ErrorKind::Interrupted);
+        let rig = rig_with_fetcher(fetcher).await;
+        let source = AppSource::Url {
+            url: "https://example.com/a.zip".into(),
+            sha256: None,
+        };
+        assert!(
+            rig.manager
+                .install_plan(&source, Provenance::Local, TrustLevel::Trusted)
+                .is_err()
+        );
+        assert!(downloads_is_empty(&rig), "失败下载不留 .part");
     }
 
     /// 崩溃时留下的 `.staging-*` 目录在 manager 启动时清掉(单写者:此刻没有别的安装在进行)。

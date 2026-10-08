@@ -63,6 +63,11 @@ impl AppPaths {
     pub fn run_dir(&self, id: &AppId) -> PathBuf {
         self.app_dir(id).join("run")
     }
+
+    /// URL 来源下载缓存(`<sha256>.bin` / `<uuid>.part`)。
+    pub fn downloads_dir(&self) -> PathBuf {
+        self.root.join("downloads")
+    }
 }
 
 /// 一次安装留下的版本记录。

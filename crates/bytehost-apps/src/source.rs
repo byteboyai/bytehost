@@ -13,11 +13,16 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use crate::archive::{self, ArchiveError, ArchiveKind, ExtractReport, Limits};
 use crate::digest::sha256_file;
 use crate::plan::{Provenance, TrustLevel};
 use crate::proto::{AppSource, SourceInfo};
+use crate::runtime::managed::Fetcher;
+
+/// 应用包(归档)的大小上限:200 MiB。也用作 curl 的 `--max-filesize`。
+pub const MAX_ARCHIVE_BYTES: u64 = 200 * 1024 * 1024;
 
 /// 解压硬限制(来源用生产口径)。
 pub fn default_limits() -> Limits {
@@ -164,7 +169,7 @@ pub fn validate_url(url: &str) -> Result<ParsedUrl, SourceError> {
         return Err(invalid("缺少主机"));
     }
     if authority.contains('@') {
-        return Err(invalid("不接受带凭据(user:pass@)的 URL"));
+        return Err(invalid("URL 不接受内嵌凭据"));
     }
     // 主机(去掉端口):IPv6 字面量 `[::1]:8443` 也允许。
     let host = if let Some(close) = authority.find(']') {
@@ -201,11 +206,14 @@ pub struct StagedSource {
 
 /// 把一个来源落地到 `staging`(必须不存在或为空目录),返回计划要披露的来源信息。
 ///
-/// `LocalDir` 走 [`copy_tree_dir`];`Archive` 走 [`crate::archive::extract`];`Url` 见 Task 3。
+/// `LocalDir` 走 [`copy_tree_dir`];`Archive` 走 [`crate::archive::extract`];`Url` 先下载到
+/// `downloads/` 里的缓存、按期望 sha256 钉死,再走压缩包路径。
 pub fn stage_source(
     source: &AppSource,
     staging: &Path,
     limits: &Limits,
+    fetcher: &dyn Fetcher,
+    downloads: &Path,
 ) -> Result<StagedSource, StageError> {
     match source {
         AppSource::LocalDir { path } => {
@@ -221,12 +229,7 @@ pub fn stage_source(
         }
         AppSource::Archive { path } => {
             ensure_absolute(path).map_err(StageError::Source)?;
-            let kind = ArchiveKind::from_path(path).ok_or_else(|| {
-                StageError::Source(SourceError::InvalidUrl(format!(
-                    "不认识的压缩包扩展名:{}",
-                    path.display()
-                )))
-            })?;
+            let kind = kind_of(path)?;
             let report =
                 archive::extract(path, kind, staging, limits).map_err(StageError::Archive)?;
             let sha = sha256_file(path).map_err(StageError::Io)?;
@@ -241,10 +244,211 @@ pub fn stage_source(
                 ),
             })
         }
-        AppSource::Url { .. } => Err(StageError::Source(SourceError::NotEnabled(
-            "URL 来源尚未启用".into(),
-        ))),
+        AppSource::Url { url, sha256 } => {
+            stage_url(url, sha256.as_deref(), staging, limits, fetcher, downloads)
+        }
     }
+}
+
+fn kind_of(path: &Path) -> Result<ArchiveKind, StageError> {
+    ArchiveKind::from_path(path).ok_or_else(|| {
+        StageError::Source(SourceError::InvalidUrl(format!(
+            "不认识的压缩包扩展名:{}",
+            path.display()
+        )))
+    })
+}
+
+/// 下载一个 https URL 压缩包、钉死 sha256、解压到 `staging`。
+///
+/// 缓存布局:`downloads/<uuid>.part` 是下载中的临时文件;完成后改名 `downloads/<sha256>.bin`。
+/// 计划里披露的 `archive_sha256` 就是缓存文件名。
+fn stage_url(
+    url: &str,
+    expected: Option<&str>,
+    staging: &Path,
+    limits: &Limits,
+    fetcher: &dyn Fetcher,
+    downloads: &Path,
+) -> Result<StagedSource, StageError> {
+    let parsed = validate_url(url).map_err(StageError::Source)?;
+    // 期望 sha256 格式先校验——格式错误时**不发起下载**(省一次网络往返)。
+    let expected = expected
+        .map(normalize_sha256)
+        .transpose()
+        .map_err(StageError::Source)?;
+
+    fs::create_dir_all(downloads).map_err(StageError::Io)?;
+    let part = downloads.join(format!("{}.part", uuid::Uuid::new_v4().simple()));
+    let cancel = AtomicBool::new(false);
+    let mut no_progress = |_: u64, _: Option<u64>| {};
+    let fetched = fetcher
+        .fetch_meta(url, &part, MAX_ARCHIVE_BYTES, &mut no_progress, &cancel)
+        .map_err(|e| {
+            // 失败/取消:不留半成品。
+            let _ = fs::remove_file(&part);
+            StageError::Io(e)
+        })?;
+
+    // 防御性:即便 curl 参数被改,最终 URL 也必须仍是 https。
+    let final_url = validate_url(&fetched.effective_url).map_err(|_| {
+        let _ = fs::remove_file(&part);
+        StageError::Source(SourceError::InvalidUrl(
+            "下载重定向到了非 https 地址".into(),
+        ))
+    })?;
+
+    let sha = sha256_file(&part).map_err(|e| {
+        let _ = fs::remove_file(&part);
+        StageError::Io(e)
+    })?;
+    let bytes = fs::metadata(&part).map_err(StageError::Io)?.len();
+
+    let pinned = match &expected {
+        Some(want) if *want != sha => {
+            let _ = fs::remove_file(&part);
+            return Err(StageError::Source(SourceError::Sha256Mismatch {
+                expected: want.clone(),
+                actual: sha,
+            }));
+        }
+        Some(_) => true,
+        None => false,
+    };
+
+    // 改名进缓存(以实际 sha256 命名),再从缓存解压。
+    let cached = downloads.join(format!("{sha}.bin"));
+    let _ = fs::remove_file(&cached);
+    fs::rename(&part, &cached).map_err(|e| {
+        let _ = fs::remove_file(&part);
+        StageError::Io(e)
+    })?;
+
+    let kind = kind_from_url(&final_url.display);
+    let report = archive::extract(&cached, kind, staging, limits).map_err(|e| {
+        let _ = fs::remove_file(&cached);
+        StageError::Archive(e)
+    })?;
+
+    Ok(StagedSource {
+        info: SourceInfo {
+            kind: "url".into(),
+            display: parsed.display,
+            archive_sha256: Some(sha),
+            archive_bytes: Some(bytes),
+            effective_host: Some(final_url.host),
+            pinned,
+            stripped_top_dir: report.stripped_top_dir,
+        },
+    })
+}
+
+/// URL 结尾定压缩类型:`.tgz`/`.tar.gz` → tar.gz,其余按 `.zip`。查询串已在显示串里剥掉。
+fn kind_from_url(display: &str) -> ArchiveKind {
+    let lower = display.to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        ArchiveKind::TarGz
+    } else {
+        ArchiveKind::Zip
+    }
+}
+
+/// 已缓存的归档(按计划里的 sha256 找 `downloads/<sha>.bin`),读出重算 sha256 校验后解压。
+/// 缓存缺失或损坏时返回 `Ok(None)`,由调用方决定是否重新下载。
+pub fn extract_cached_archive(
+    downloads: &Path,
+    archive_sha256: &str,
+    staging: &Path,
+    limits: &Limits,
+    kind: ArchiveKind,
+) -> Result<Option<ExtractReport>, StageError> {
+    let cached = downloads.join(format!("{archive_sha256}.bin"));
+    if !cached.is_file() {
+        return Ok(None);
+    }
+    let actual = sha256_file(&cached).map_err(StageError::Io)?;
+    if actual != archive_sha256 {
+        // 缓存被改过:当作没有,交给调用方重新下载。
+        return Ok(None);
+    }
+    let report = archive::extract(&cached, kind, staging, limits).map_err(StageError::Archive)?;
+    Ok(Some(report))
+}
+
+/// 删除某个归档的下载缓存(安装成功/失败、或计划作废时调用)。
+pub fn discard_cached_archive(downloads: &Path, archive_sha256: &str) {
+    let _ = fs::remove_file(downloads.join(format!("{archive_sha256}.bin")));
+}
+
+/// 把一次下载结果写进缓存,返回实际 sha256 与字节数(供 `install` 复用)。
+pub struct Downloaded {
+    pub sha256: String,
+    pub bytes: u64,
+    pub effective_host: String,
+    pub display: String,
+}
+
+/// 仅下载(不落地):`install` 若发现缓存缺失,按计划里的 sha256 重新下载并核对。
+pub fn download_to_cache(
+    url: &str,
+    fetcher: &dyn Fetcher,
+    downloads: &Path,
+) -> Result<Downloaded, StageError> {
+    let parsed = validate_url(url).map_err(StageError::Source)?;
+    fs::create_dir_all(downloads).map_err(StageError::Io)?;
+    let part = downloads.join(format!("{}.part", uuid::Uuid::new_v4().simple()));
+    let cancel = AtomicBool::new(false);
+    let mut no_progress = |_: u64, _: Option<u64>| {};
+    let fetched = fetcher
+        .fetch_meta(url, &part, MAX_ARCHIVE_BYTES, &mut no_progress, &cancel)
+        .map_err(|e| {
+            let _ = fs::remove_file(&part);
+            StageError::Io(e)
+        })?;
+    let final_url = validate_url(&fetched.effective_url).map_err(|_| {
+        let _ = fs::remove_file(&part);
+        StageError::Source(SourceError::InvalidUrl(
+            "下载重定向到了非 https 地址".into(),
+        ))
+    })?;
+    let sha = sha256_file(&part).map_err(|e| {
+        let _ = fs::remove_file(&part);
+        StageError::Io(e)
+    })?;
+    let bytes = fs::metadata(&part).map_err(StageError::Io)?.len();
+    let cached = downloads.join(format!("{sha}.bin"));
+    let _ = fs::remove_file(&cached);
+    fs::rename(&part, &cached).map_err(|e| {
+        let _ = fs::remove_file(&part);
+        StageError::Io(e)
+    })?;
+    Ok(Downloaded {
+        sha256: sha,
+        bytes,
+        effective_host: final_url.host,
+        display: parsed.display,
+    })
+}
+
+/// 从已下载并落缓存的归档解压到 `staging`(安装阶段用;调用方先确认缓存 sha 匹配)。
+pub fn extract_from_cache(
+    downloads: &Path,
+    archive_sha256: &str,
+    display: &str,
+    staging: &Path,
+    limits: &Limits,
+) -> Result<SourceInfo, StageError> {
+    let kind = kind_from_url(display);
+    let cached = downloads.join(format!("{archive_sha256}.bin"));
+    let report = archive::extract(&cached, kind, staging, limits).map_err(StageError::Archive)?;
+    let bytes = fs::metadata(&cached).map_err(StageError::Io)?.len();
+    Ok(archive_info(
+        "url",
+        display.to_string(),
+        archive_sha256.to_string(),
+        bytes,
+        report,
+    ))
 }
 
 fn archive_info(
