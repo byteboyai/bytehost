@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::AppId;
+use crate::id::{AppId, Version};
 use crate::manifest::Manifest;
 use crate::permissions::PermissionChange;
 use crate::state::ObservedState;
@@ -68,6 +68,21 @@ pub enum AppEvent {
         app: AppId,
         reason: RuntimeReason,
     },
+    /// 应用升级成功(包已换、`current_version` 已写);`from` 是上一版。
+    Upgraded {
+        app: AppId,
+        from: Version,
+        to: Version,
+    },
+    /// 回滚到上一版(手动或试用期失败自动);`from` 是被换下的版本,`to` 是回滚到的版本。
+    /// 自动回滚被跳过(会提升权限)时不发这条,原因写进 `last_rollback`。
+    RolledBack {
+        app: AppId,
+        from: Version,
+        to: Version,
+        reason: String,
+        automatic: bool,
+    },
 }
 
 impl AppEvent {
@@ -80,7 +95,9 @@ impl AppEvent {
             | Self::ManifestChanged { app, .. }
             | Self::Progress { app, .. }
             | Self::LogAvailable { app }
-            | Self::RuntimeUnavailable { app, .. } => app,
+            | Self::RuntimeUnavailable { app, .. }
+            | Self::Upgraded { app, .. }
+            | Self::RolledBack { app, .. } => app,
         }
     }
 }
@@ -165,6 +182,18 @@ mod tests {
                 reason: RuntimeReason::NotInstalled {
                     runtime: "docker".into(),
                 },
+            },
+            AppEvent::Upgraded {
+                app: id(),
+                from: Version::new(1, 0, 0),
+                to: Version::new(1, 1, 0),
+            },
+            AppEvent::RolledBack {
+                app: id(),
+                from: Version::new(1, 1, 0),
+                to: Version::new(1, 0, 0),
+                reason: "起不来".into(),
+                automatic: true,
             },
         ];
         for e in &events {

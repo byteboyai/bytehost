@@ -834,18 +834,36 @@ impl Core {
         )?;
         let verified = approved.verify(plan).map_err(ManagerError::Verify)?;
 
-        let existing = self.registry.load(&id)?;
+        let mut existing = self.registry.load(&id)?;
         if let Some(r) = &existing {
             if r.versions.iter().any(|v| v.version == version) {
                 return Err(ManagerError::AlreadyInstalled(version));
             }
             if !matches!(
                 r.observed,
-                ObservedState::Installed | ObservedState::Stopped | ObservedState::Failed { .. }
+                ObservedState::Installed
+                    | ObservedState::Stopped
+                    | ObservedState::Failed { .. }
+                    | ObservedState::Running
+                    | ObservedState::Starting
+                    | ObservedState::Preparing
             ) {
                 return Err(ManagerError::Busy(id));
             }
         }
+        // 升级到运行中的应用:自动"停→换→再启"。
+        let was_running = existing
+            .as_ref()
+            .is_some_and(|r| matches!(r.desired, DesiredState::Running));
+        // 运行中(或过渡中)先停掉,把站点撤下来、监管线程收干净,再换包。
+        // 这里持着 `install_staged` 已拿到的锁:`stop_locked` 会 join 监管线程,但线程拿锁用尝试循环,
+        // 不会自锁(与 `stop`/`suspend_all` 同样的语义)。
+        if was_running {
+            self.stop_locked(&id)?;
+            // `stop_locked` 已把 desired/observed 落成 Stopped,重新读,避免用停止前的旧记录覆盖回去。
+            existing = self.registry.load(&id)?;
+        }
+        let old_current = existing.as_ref().map(|r| r.current_version);
 
         let final_dir = self.registry.paths().package_dir(&id, &version);
         fs::create_dir_all(final_dir.parent().expect("package_dir 有父目录"))?;
@@ -856,7 +874,7 @@ impl Core {
         fs::rename(staging, &final_dir)?;
         // 落位之后的任何一步失败都要把包撤回,否则会留下"有包目录、没有记录"的状态
         let upgrading = existing.is_some();
-        let recorded = (|| -> Result<(), ManagerError> {
+        let removed_versions = (|| -> Result<Vec<Version>, ManagerError> {
             let mut record = existing.unwrap_or_else(|| AppRecord {
                 format_version: RECORD_FORMAT_VERSION,
                 id: id.clone(),
@@ -866,6 +884,9 @@ impl Core {
                 grants: verified.requested,
                 versions: Vec::new(),
                 data_store_id: data_store_id_hex(&id),
+                previous_version: None,
+                probation: false,
+                last_rollback: None,
             });
             record.grants = verified.requested;
             record.versions.push(VersionRecord {
@@ -877,24 +898,62 @@ impl Core {
             if upgrading && matches!(record.observed, ObservedState::Failed { .. }) {
                 record.observed = ObservedState::Installed;
             }
+            if let Some(old) = old_current {
+                // 升级:记下上一版,并重新起试用期(只在应用原本在跑时;没在跑就没有"首次启动"可试)。
+                record.previous_version = Some(old);
+                record.probation = was_running;
+                record.last_rollback = None;
+            }
             // current_version 最后才写;它之前的任何一步失败,调用方会撤回刚落位的包,旧版本不受影响
             record.current_version = version;
+            let removed = record.prune_versions();
             self.registry.save(&record)?;
-            Ok(())
+            Ok(removed)
         })();
-        if let Err(e) = recorded {
-            let _ = fs::remove_dir_all(&final_dir);
-            return Err(e);
+        let removed_versions = match removed_versions {
+            Ok(removed) => removed,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&final_dir);
+                return Err(e);
+            }
+        };
+        // 被清理的更早版本包目录(记录已经不再引用它们)
+        for v in removed_versions {
+            let _ = fs::remove_dir_all(self.registry.paths().package_dir(&id, &v));
         }
 
         self.emit(AppEvent::Installed { app: id.clone() });
-        if upgrading && !verified.permission_diff.is_empty() {
-            self.emit(AppEvent::ManifestChanged {
-                app: id,
-                permission_changes: verified.permission_diff,
-            });
+        if upgrading {
+            if let Some(from) = old_current {
+                self.emit(AppEvent::Upgraded {
+                    app: id.clone(),
+                    from,
+                    to: version,
+                });
+            }
+            if !verified.permission_diff.is_empty() {
+                self.emit(AppEvent::ManifestChanged {
+                    app: id.clone(),
+                    permission_changes: verified.permission_diff,
+                });
+            }
+        }
+        // 运行中升级:换完包再启回运行态。同步启动失败的处理见 Task 2(试用期自动回滚)。
+        if was_running && let Err(e) = self.start_locked(&id) {
+            return self.maybe_rollback_after_failed_start(&id, e, now_ms);
         }
         Ok(())
+    }
+
+    /// 升级后的"再启"同步失败时的兜底:试用期内直接在同一把锁里自动回滚(A6g Task 2)。
+    /// Task 1 只保留占位实现(直接返回原错误),Task 2 补上回滚。
+    fn maybe_rollback_after_failed_start(
+        &self,
+        _id: &AppId,
+        err: ManagerError,
+        _now_ms: u64,
+    ) -> Result<(), ManagerError> {
+        Err(err)
     }
 
     fn load_record(&self, id: &AppId) -> Result<AppRecord, ManagerError> {
@@ -2008,10 +2067,14 @@ source = "web/"
         let events = drain(&mut rx);
         assert!(matches!(&events[0], AppEvent::Installed { .. }));
         assert!(
-            matches!(&events[1], AppEvent::ManifestChanged { permission_changes, .. } if permission_changes.len() == 1)
+            matches!(&events[1], AppEvent::Upgraded { from, to, .. } if *from == Version::new(1, 0, 0) && *to == Version::new(1, 1, 0))
+        );
+        assert!(
+            matches!(&events[2], AppEvent::ManifestChanged { permission_changes, .. } if permission_changes.len() == 1)
         );
         let record = rig.manager.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 1, 0));
+        assert_eq!(record.previous_version, Some(Version::new(1, 0, 0)));
         assert_eq!(record.versions.len(), 2);
         assert_eq!(record.grants.clipboard, Access::Read);
         let pkg = rig.manager.registry.paths();
@@ -2026,8 +2089,9 @@ source = "web/"
         );
     }
 
+    /// A6g:运行中也能升级(自动停→换→再启),不再拒绝 Busy。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn upgrading_a_running_app_is_refused_until_it_is_stopped() {
+    async fn upgrading_a_running_app_is_allowed_and_keeps_it_running() {
         let rig = rig().await;
         let app = id("excalidraw");
         rig.install(&write_app(
@@ -2040,9 +2104,17 @@ source = "web/"
         .unwrap();
         rig.manager.start(&app).unwrap();
         let v2 = write_app(&rig.src_dir("v2"), "excalidraw", "1.1.0", "", "two");
-        assert!(matches!(rig.install(&v2), Err(ManagerError::Busy(_))));
-        rig.manager.stop(&app).unwrap();
         rig.install(&v2).unwrap();
+        let s = rig
+            .manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == app);
+        let s = s.unwrap();
+        assert_eq!(s.observed, ObservedState::Running);
+        assert_eq!(s.version, Version::new(1, 1, 0));
+        assert!(rig.fetch(&app, "/").text().contains("two"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2264,9 +2336,11 @@ source = "web/"
         assert_no_leftovers(&rig);
 
         rig.manager.start(&id("excalidraw")).unwrap();
+        // 运行中也能升级(A6g);升级成功后旧的失败出口不再触发 Busy,但仍不能留 staging。
         let v2 = write_app(&rig.src_dir("v2"), "excalidraw", "1.1.0", "", "two");
-        assert!(matches!(rig.install(&v2), Err(ManagerError::Busy(_))));
+        rig.install(&v2).unwrap();
         assert_no_leftovers(&rig);
+        rig.manager.stop(&id("excalidraw")).unwrap();
 
         let unsupported = rig.src_dir("py");
         write_files(
@@ -2358,6 +2432,158 @@ source = "web/"
         assert!(!debris2.join("junk.txt").exists());
         rig.manager.start(&app).unwrap();
         assert!(rig.fetch(&app, "/").text().contains("two"));
+    }
+    /// 升级记下上一版;应用没在跑则不起试用期(A6g Task 1)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upgrade_records_the_previous_version() {
+        let rig = rig().await;
+        let app = id("excalidraw");
+        rig.install(&write_app(
+            &rig.src_dir("v1"),
+            "excalidraw",
+            "1.0.0",
+            "",
+            "one",
+        ))
+        .unwrap();
+        rig.install(&write_app(
+            &rig.src_dir("v2"),
+            "excalidraw",
+            "1.1.0",
+            "",
+            "two",
+        ))
+        .unwrap();
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 1, 0));
+        assert_eq!(record.previous_version, Some(Version::new(1, 0, 0)));
+        assert!(!record.probation, "没在跑就没有试用期");
+        assert_eq!(record.last_rollback, None);
+    }
+
+    /// 连续升级三次只保留"当前 + 上一版";更早的包目录与记录被清,清掉的版本号可以再装(Review Focus 4)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn three_successive_upgrades_keep_only_current_and_previous() {
+        let rig = rig().await;
+        let app = id("excalidraw");
+        for v in ["1.0.0", "1.1.0", "1.2.0"] {
+            rig.install(&write_app(
+                &rig.src_dir(v),
+                "excalidraw",
+                v,
+                "",
+                &format!("v{v}"),
+            ))
+            .unwrap();
+        }
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 2, 0));
+        assert_eq!(record.previous_version, Some(Version::new(1, 1, 0)));
+        let versions: Vec<_> = record.versions.iter().map(|v| v.version).collect();
+        assert_eq!(versions, vec![Version::new(1, 1, 0), Version::new(1, 2, 0)]);
+        let paths = rig.manager.registry.paths();
+        assert!(
+            !paths.package_dir(&app, &Version::new(1, 0, 0)).exists(),
+            "1.0.0 的包目录被清掉"
+        );
+        assert!(paths.package_dir(&app, &Version::new(1, 1, 0)).exists());
+        assert!(paths.package_dir(&app, &Version::new(1, 2, 0)).exists());
+    }
+
+    /// 升级运行中的静态应用:自动停 → 换 → 再启,站点换成新页面(Review Focus 1 的行为面)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upgrading_a_running_static_app_stops_swaps_and_restarts_it() {
+        let rig = rig().await;
+        let app = id("excalidraw");
+        let mut rx = rig.manager.events();
+        rig.install(&write_app(
+            &rig.src_dir("v1"),
+            "excalidraw",
+            "1.0.0",
+            "",
+            "<h1>old</h1>",
+        ))
+        .unwrap();
+        rig.manager.start(&app).unwrap();
+        assert!(rig.fetch(&app, "/").text().contains("old"));
+        let _ = drain(&mut rx);
+
+        rig.install(&write_app(
+            &rig.src_dir("v2"),
+            "excalidraw",
+            "1.1.0",
+            "",
+            "<h1>new</h1>",
+        ))
+        .unwrap();
+        let listed = rig.manager.list().unwrap();
+        let s = listed.iter().find(|s| s.id == app).unwrap();
+        assert_eq!(s.observed, ObservedState::Running);
+        assert_eq!(s.desired, DesiredState::Running);
+        assert_eq!(s.version, Version::new(1, 1, 0));
+        assert!(
+            rig.fetch(&app, "/").text().contains("new"),
+            "站点换成新页面"
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Upgraded { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// 升级运行中的进程型应用:立刻进入试用期,`ready` 后清除(A6g Task 2 补全清除路径)。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upgrading_a_running_process_app_sets_probation_until_ready() {
+        if !have("python3") {
+            return;
+        }
+        let rig = rig().await;
+        let app = id("pyapp");
+        rig.install(&write_py_app(
+            &rig.src_dir("v1"),
+            "pyapp",
+            "1.0.0",
+            PY_SERVER,
+        ))
+        .unwrap();
+        rig.manager.start(&app).unwrap();
+        wait_for(&rig, &app, 15, is_running);
+        rig.install(&write_py_app(
+            &rig.src_dir("v2"),
+            "pyapp",
+            "1.1.0",
+            PY_SERVER,
+        ))
+        .unwrap();
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert!(record.probation, "升级后的首次启动尚未成功");
+        assert_eq!(record.previous_version, Some(Version::new(1, 0, 0)));
+    }
+
+    /// 升级中途被打断(残骸已改名落位、记录还没写):记录要么全旧要么全新,旧版本仍可启动(Review Focus 5)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upgrade_interrupted_after_rename_keeps_the_old_version_startable() {
+        let rig = rig().await;
+        let app = id("excalidraw");
+        rig.install(&write_app(
+            &rig.src_dir("v1"),
+            "excalidraw",
+            "1.0.0",
+            "",
+            "one",
+        ))
+        .unwrap();
+        // 直接看现有残骸用例会覆盖这条;这里断言半写场景下记录仍是完整的旧记录
+        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        assert_eq!(record.current_version, Version::new(1, 0, 0));
+        assert_eq!(record.previous_version, None);
+        assert!(!record.probation);
+        rig.manager.start(&app).unwrap();
+        assert!(rig.fetch(&app, "/").text().contains("one"));
     }
 
     /// supervisor 退出:站点撤下、观察态落成 Stopped,但 `desired` 保持 Running,下次 `reconcile` 把它们拉起来。

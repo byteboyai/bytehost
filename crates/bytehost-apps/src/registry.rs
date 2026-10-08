@@ -74,6 +74,20 @@ pub struct VersionRecord {
     pub installed_ms: u64,
 }
 
+/// 一次回滚的记录(A6g)。落进 `state.json`,供 GUI 持久展示"已回滚到 X"。
+/// `to == from` 表示自动回滚被跳过(目标版本会提升权限),`reason` 说明原因。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackNote {
+    /// 被换下的版本。
+    pub from: Version,
+    /// 回滚到的版本(跳过时与 `from` 相同)。
+    pub to: Version,
+    pub reason: String,
+    /// 由试用期失败自动触发(相对用户手动回滚)。
+    pub automatic: bool,
+    pub at_ms: u64,
+}
+
 /// 持久化的应用记录(`state.json`)。**不含密钥**——密钥只存引用,由宿主的凭据服务注入。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppRecord {
@@ -90,6 +104,38 @@ pub struct AppRecord {
     pub versions: Vec<VersionRecord>,
     /// 每应用 WebView 数据存储标识(32 位十六进制),跨重启、跨卸载重装稳定。
     pub data_store_id: String,
+    /// 升级前的 `current_version`(手动回滚的目标);首次安装 / 回滚后为 `None`。
+    /// 旧 `state.json` 无此字段读出为 `None`(不升 [`RECORD_FORMAT_VERSION`])。
+    #[serde(default)]
+    pub previous_version: Option<Version>,
+    /// 升级后的首次启动尚未成功(= 处于"试用期")。试用期内进入 `Failed` 会触发自动回滚。
+    /// 旧 `state.json` 无此字段读出为 `false`。
+    #[serde(default)]
+    pub probation: bool,
+    /// 最近一次回滚(自动或手动)的记录;没有回滚过为 `None`。
+    #[serde(default)]
+    pub last_rollback: Option<RollbackNote>,
+}
+
+impl AppRecord {
+    /// 只保留"当前 + 上一版"两个版本记录,返回被移除的版本号(包目录由调用方删)。
+    /// `previous_version` 为 `None` 时只留 `current_version`。
+    pub fn prune_versions(&mut self) -> Vec<Version> {
+        let keep: Vec<Version> = match self.previous_version {
+            Some(prev) => vec![prev, self.current_version],
+            None => vec![self.current_version],
+        };
+        let mut removed = Vec::new();
+        self.versions.retain(|v| {
+            if keep.contains(&v.version) {
+                true
+            } else {
+                removed.push(v.version);
+                false
+            }
+        });
+        removed
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +325,9 @@ mod tests {
             data_store_id: "0123456789abcdef0123456789abcdef".into(),
             format_version: RECORD_FORMAT_VERSION,
             observed: ObservedState::Stopped,
+            previous_version: None,
+            probation: false,
+            last_rollback: None,
         }
     }
 
@@ -359,7 +408,10 @@ mod tests {
                 "format_version",
                 "grants",
                 "id",
+                "last_rollback",
                 "observed",
+                "previous_version",
+                "probation",
                 "versions"
             ]
         );
@@ -517,5 +569,98 @@ mod tests {
         let listing = reg.list().unwrap();
         assert_eq!(listing.apps.len(), 1);
         assert!(listing.problems.is_empty(), "{:?}", listing.problems);
+    }
+
+    /// 旧 `state.json`(没有 A6g 的三个新字段)必须照常读出,新字段取默认(A6g Task 1)。
+    #[test]
+    fn an_old_state_json_without_the_upgrade_fields_reads_with_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path()).unwrap();
+        let old = r#"{
+            "format_version": 1,
+            "id": "excalidraw",
+            "desired": "stopped",
+            "observed": {"state": "stopped"},
+            "current_version": "0.17.0",
+            "grants": {"clipboard": "none"},
+            "versions": [],
+            "data_store_id": "0123456789abcdef0123456789abcdef"
+        }"#;
+        let dir = reg.paths().app_dir(&id("excalidraw"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("state.json"), old).unwrap();
+        let r = reg.load(&id("excalidraw")).unwrap().unwrap();
+        assert_eq!(r.previous_version, None);
+        assert!(!r.probation);
+        assert_eq!(r.last_rollback, None);
+    }
+
+    /// 三个新字段要能 round-trip(含 `RollbackNote`)。
+    #[test]
+    fn the_upgrade_fields_round_trip_through_state_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path()).unwrap();
+        let mut r = record("excalidraw");
+        r.previous_version = Some(Version::new(0, 16, 0));
+        r.probation = true;
+        r.last_rollback = Some(RollbackNote {
+            from: Version::new(0, 17, 0),
+            to: Version::new(0, 16, 0),
+            reason: "起不来".into(),
+            automatic: true,
+            at_ms: 42,
+        });
+        reg.save(&r).unwrap();
+        assert_eq!(reg.load(&r.id).unwrap(), Some(r));
+    }
+
+    /// `prune_versions` 只留当前与上一版;没有上一版就只留当前;返回被移除的版本且不含保留的。
+    #[test]
+    fn prune_versions_keeps_current_and_previous_only() {
+        let mut r = record("excalidraw");
+        r.current_version = Version::new(1, 2, 0);
+        r.versions = vec![
+            VersionRecord {
+                version: Version::new(1, 0, 0),
+                manifest_digest: "a".into(),
+                source_digest: "a".into(),
+                installed_ms: 1,
+            },
+            VersionRecord {
+                version: Version::new(1, 1, 0),
+                manifest_digest: "b".into(),
+                source_digest: "b".into(),
+                installed_ms: 2,
+            },
+            VersionRecord {
+                version: Version::new(1, 2, 0),
+                manifest_digest: "c".into(),
+                source_digest: "c".into(),
+                installed_ms: 3,
+            },
+        ];
+        // 有上一版:留 1.1.0 与 1.2.0,移除 1.0.0
+        r.previous_version = Some(Version::new(1, 1, 0));
+        assert_eq!(r.prune_versions(), vec![Version::new(1, 0, 0)]);
+        let kept: Vec<_> = r.versions.iter().map(|v| v.version).collect();
+        assert_eq!(kept, vec![Version::new(1, 1, 0), Version::new(1, 2, 0)]);
+
+        // 没有上一版:只留当前,移除其余
+        r.previous_version = None;
+        r.versions.insert(
+            0,
+            VersionRecord {
+                version: Version::new(0, 9, 0),
+                manifest_digest: "z".into(),
+                source_digest: "z".into(),
+                installed_ms: 0,
+            },
+        );
+        assert_eq!(
+            r.prune_versions(),
+            vec![Version::new(0, 9, 0), Version::new(1, 1, 0)]
+        );
+        let kept: Vec<_> = r.versions.iter().map(|v| v.version).collect();
+        assert_eq!(kept, vec![Version::new(1, 2, 0)]);
     }
 }
