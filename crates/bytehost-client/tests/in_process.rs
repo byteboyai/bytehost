@@ -45,3 +45,47 @@ async fn an_unavailable_host_reports_unavailable_not_transport() {
         "{err:?}"
     );
 }
+
+/// 接收端被丢弃后,转发任务必须随之退出(不能等到下一个事件才发现),
+/// 否则嵌入方反复订阅又丢弃会积累空闲任务和广播接收端。
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_subscription_stops_the_forwarding_task() {
+    let root = tempfile::tempdir().unwrap();
+    let svc = AppService::start_with(root.path(), GatewayConfig { port: 0 }).await;
+    let host = InProcess::new(svc.clone());
+    let metrics = tokio::runtime::Handle::current().metrics();
+
+    let before = metrics.num_alive_tasks();
+    let subs: Vec<_> = subscribe_n(&host, 5).await;
+    assert!(
+        metrics.num_alive_tasks() >= before + 5,
+        "订阅应各起一个转发任务"
+    );
+    drop(subs);
+
+    let mut alive = metrics.num_alive_tasks();
+    for _ in 0..50 {
+        if alive <= before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        alive = metrics.num_alive_tasks();
+    }
+    assert!(
+        alive <= before,
+        "丢弃订阅后转发任务应退出:之前 {before},现在 {alive}"
+    );
+    svc.shutdown().await;
+}
+
+async fn subscribe_n(
+    host: &InProcess,
+    n: usize,
+) -> Vec<tokio::sync::mpsc::UnboundedReceiver<bytehost_client::AppChange>> {
+    use bytehost_client::AppHostApi;
+    let mut v = Vec::new();
+    for _ in 0..n {
+        v.push(host.subscribe().await.unwrap());
+    }
+    v
+}

@@ -66,7 +66,12 @@ impl AppHostApi for InProcess {
         let (tx, out) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             loop {
-                match change_reply(rx.recv().await) {
+                // 接收端被丢弃就立刻退出(与 UDS 实现的 `tx.closed()` 一致),不等下一个事件。
+                let event = tokio::select! {
+                    _ = tx.closed() => break,
+                    event = rx.recv() => event,
+                };
+                match change_reply(event) {
                     Some(AppReply::Changed { app }) => {
                         if tx.send(AppChange::Changed(app)).is_err() {
                             break;
