@@ -8,6 +8,8 @@
 //! - `digest`:`digest` 模块(SHA-256、源码目录摘要、数据存储标识)
 //! - `server`:`gateway`、`runtime`、`manager`、`port`、`process`(只有 dozerd 打开;隐含 `digest` 与 `manifest-toml`)
 
+#[cfg(feature = "server")]
+pub mod archive;
 #[cfg(feature = "digest")]
 pub mod digest;
 pub mod event;
