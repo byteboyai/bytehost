@@ -7,6 +7,7 @@
 //! **没有网络时失败而不是跳过**——它本来就只有被显式 `--ignored` 才会跑。
 
 #![cfg(unix)]
+#![cfg(feature = "server")]
 
 use std::path::PathBuf;
 use std::process::Command;

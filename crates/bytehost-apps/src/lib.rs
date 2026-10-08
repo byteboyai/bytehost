@@ -29,6 +29,7 @@ pub mod proto;
 pub mod registry;
 #[cfg(feature = "server")]
 pub mod runtime;
+pub mod runtime_version;
 pub mod state;
 #[cfg(all(feature = "server", unix))]
 pub mod supervisor;

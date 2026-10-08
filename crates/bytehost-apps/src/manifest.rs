@@ -228,14 +228,14 @@ impl Manifest {
             Runtime::Node {
                 command,
                 lockfile,
+                node,
                 http,
-                ..
             }
             | Runtime::Python {
                 command,
                 lockfile,
+                python: node,
                 http,
-                ..
             } => {
                 if command.is_empty() || command[0].trim().is_empty() {
                     problems.push("runtime.command 不能为空".to_string());
@@ -245,6 +245,15 @@ impl Manifest {
                 }
                 if let Some(lock) = lockfile {
                     check_relative("runtime.lockfile", lock, problems);
+                }
+                let field = match &self.runtime {
+                    Runtime::Node { .. } => "runtime.node",
+                    _ => "runtime.python",
+                };
+                if let Some(req) = node
+                    && let Err(e) = crate::runtime_version::VersionReq::parse(req)
+                {
+                    problems.push(format!("{field}: {e}"));
                 }
                 if !is_env_name(&http.port_env) {
                     problems.push(
@@ -501,6 +510,52 @@ mod tests {
             http: ContainerHttp { container_port: 0 },
         };
         assert_eq!(problems(&m).len(), 1);
+    }
+
+    #[test]
+    fn runtime_version_requirements_are_validated() {
+        let mut m = valid();
+        m.runtime = Runtime::Node {
+            command: vec!["node".into(), "server.js".into()],
+            lockfile: None,
+            node: Some(">=22".into()),
+            http: ProcessHttp {
+                port_env: "PORT".into(),
+            },
+        };
+        assert_eq!(m.validate(&HOST), Ok(()));
+
+        m.runtime = Runtime::Python {
+            command: vec!["python3".into(), "server.py".into()],
+            lockfile: None,
+            python: Some(">=3.12, <4".into()),
+            http: ProcessHttp {
+                port_env: "PORT".into(),
+            },
+        };
+        assert_eq!(m.validate(&HOST), Ok(()));
+
+        m.runtime = Runtime::Python {
+            command: vec!["python3".into(), "server.py".into()],
+            lockfile: None,
+            python: Some("3.12".into()),
+            http: ProcessHttp {
+                port_env: "PORT".into(),
+            },
+        };
+        let p = problems(&m);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains("runtime.python"), "{p:?}");
+
+        m.runtime = Runtime::Node {
+            command: vec!["node".into()],
+            lockfile: None,
+            node: Some(String::new()),
+            http: ProcessHttp {
+                port_env: "PORT".into(),
+            },
+        };
+        assert!(problems(&m)[0].contains("runtime.node"));
     }
 
     #[test]

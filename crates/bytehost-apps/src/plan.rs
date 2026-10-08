@@ -131,6 +131,7 @@ fn will_run(runtime: &Runtime) -> Vec<String> {
                     .collect::<Vec<_>>()
                     .join(" ")
             ));
+            out.extend(runtime_version_note(runtime));
             out
         }
         Runtime::Container { image, .. } => {
@@ -139,7 +140,31 @@ fn will_run(runtime: &Runtime) -> Vec<String> {
     }
 }
 
-/// 命令行参数的展示用引用(shell 风格):只含 `[A-Za-z0-9_@%+=:,./-]` 的原样输出,其余加单引号,
+/// 声明了版本要求时,`will_run` 里如实写一行。
+///
+/// `uv` 开头的 Python 应用由 uv 在运行时挑解释器,宿主拿不到,所以如实说明检查不适用。
+fn runtime_version_note(runtime: &Runtime) -> Option<String> {
+    match runtime {
+        Runtime::Node {
+            node: Some(req), ..
+        } => Some(format!("需要 node {req}")),
+        Runtime::Python {
+            command,
+            python: Some(req),
+            ..
+        } => {
+            if command.first().map(String::as_str) == Some("uv") {
+                Some(format!(
+                    "需要 python {req};但命令由 uv 启动,版本要求不适用于 uv 管理的解释器"
+                ))
+            } else {
+                Some(format!("需要 python {req}"))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// 内部的 `'` 写成 `'\''`;控制字符与双向控制字符转义成 `\u{..}`——批准界面逐字展示这些文本,
 /// 不能让 `["python","-m app"]` 与 `["python","-m","app"]` 看起来一样,也不能靠换行伪造多行。
 fn shell_quote(arg: &str) -> String {
@@ -350,6 +375,56 @@ mod tests {
             "剪贴板已授予,不再出现在差异里"
         );
         assert_eq!(plan.permission_diff[0].key, PermissionKey::Popups);
+    }
+
+    #[test]
+    fn will_run_states_the_declared_runtime_version_requirement() {
+        let node = Runtime::Node {
+            command: vec!["node".into(), "server.js".into()],
+            lockfile: None,
+            node: Some(">=22".into()),
+            http: ProcessHttp {
+                port_env: "PORT".into(),
+            },
+        };
+        let plan = InstallPlan::build(input(&manifest(node, Permissions::default()), None));
+        assert!(
+            plan.will_run.iter().any(|l| l.contains("需要 node >=22")),
+            "{:?}",
+            plan.will_run
+        );
+
+        let uv = Runtime::Python {
+            command: vec!["uv".into(), "run".into(), "a.py".into()],
+            lockfile: None,
+            python: Some(">=3.12".into()),
+            http: ProcessHttp {
+                port_env: "PORT".into(),
+            },
+        };
+        let plan = InstallPlan::build(input(&manifest(uv, Permissions::default()), None));
+        assert!(
+            plan.will_run
+                .iter()
+                .any(|l| l.contains("版本要求不适用于 uv 管理的解释器")),
+            "{:?}",
+            plan.will_run
+        );
+
+        let no_req = Runtime::Node {
+            command: vec!["node".into()],
+            lockfile: None,
+            node: None,
+            http: ProcessHttp {
+                port_env: "PORT".into(),
+            },
+        };
+        let plan = InstallPlan::build(input(&manifest(no_req, Permissions::default()), None));
+        assert!(
+            plan.will_run.iter().all(|l| !l.contains("需要 node")),
+            "{:?}",
+            plan.will_run
+        );
     }
 
     #[test]
