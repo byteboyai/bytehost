@@ -153,8 +153,10 @@ pub struct Core {
     #[allow(dead_code)]
     resolver: Arc<dyn RuntimeResolver>,
     /// 探解释器版本(进程型应用的版本要求校验)。
-    #[allow(dead_code)]
     version_probe: Arc<dyn VersionProbe>,
+    /// `start` 在拿锁**之前**预探的解释器版本输出(`--version` 最多阻塞 3s,不能占着单写者锁)。
+    /// 按应用登记 `(解释器路径, 输出)`,启动检查取走即删;`start` 返回时一律清掉,避免陈旧结果被下次启动复用。
+    prefetched_versions: Mutex<HashMap<AppId, (PathBuf, Option<String>)>>,
     /// 每个应用当前"看得懂的问题"(运行时缺失/版本不符);只存内存,只在应用 `Failed` 时经 `list` 带出。
     #[allow(dead_code)]
     issues: Mutex<HashMap<AppId, AppIssue>>,
@@ -175,10 +177,10 @@ pub struct Core {
 
 /// 运行中周期健康检查的参数;默认取 `supervisor::DEFAULT_MONITOR_*`。
 #[derive(Debug, Clone, Copy)]
-struct MonitorConfig {
-    interval: std::time::Duration,
-    timeout: std::time::Duration,
-    failures: u32,
+pub struct MonitorConfig {
+    pub interval: std::time::Duration,
+    pub timeout: std::time::Duration,
+    pub failures: u32,
 }
 
 impl Default for MonitorConfig {
@@ -189,6 +191,21 @@ impl Default for MonitorConfig {
             failures: supervisor::DEFAULT_MONITOR_FAILURES,
         }
     }
+}
+
+/// `version_target` 的结论。
+enum VersionTarget {
+    /// 不需要检查。
+    Skip,
+    /// Node 应用但解析不到 `node`。
+    NodeMissing,
+    /// 探 `program` 的 `--version` 并与 `req` 比对。
+    Probe {
+        runtime: String,
+        req_text: String,
+        req: crate::runtime_version::VersionReq,
+        program: PathBuf,
+    },
 }
 
 /// 一条监管线程的取消标志与句柄。
@@ -506,7 +523,6 @@ impl AppManager {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn with_parts_full(
         root: impl Into<PathBuf>,
         host_version: Version,
@@ -529,6 +545,7 @@ impl AppManager {
                 closed: std::sync::atomic::AtomicBool::new(false),
                 resolver,
                 version_probe,
+                prefetched_versions: Mutex::new(HashMap::new()),
                 issues: Mutex::new(HashMap::new()),
                 policy,
                 monitor,
@@ -568,9 +585,8 @@ impl AppManager {
         Self::with_parts(root, host_version, gateway, resolver, policy, version_probe)
     }
 
-    /// (仅测试)在 `with_parts_for_test` 基础上调小运行中健康检查的间隔/超时。
+    /// (仅测试)调小运行中健康检查的参数与重启退避;解释器版本用真实探测。
     /// 跨 crate 集成测试要用,所以不做 `#[cfg(test)]`,而是 `#[doc(hidden)]` 的不稳定钩子。
-    #[allow(clippy::too_many_arguments)]
     #[doc(hidden)]
     pub fn with_monitor_for_test(
         root: impl Into<PathBuf>,
@@ -578,10 +594,7 @@ impl AppManager {
         gateway: Arc<Gateway>,
         resolver: Arc<dyn RuntimeResolver>,
         policy: crate::process::restart::RestartPolicy,
-        version_probe: Arc<dyn VersionProbe>,
-        monitor_interval: std::time::Duration,
-        monitor_timeout: std::time::Duration,
-        monitor_failures: u32,
+        monitor: MonitorConfig,
     ) -> io::Result<Self> {
         Self::with_parts_full(
             root,
@@ -589,12 +602,8 @@ impl AppManager {
             gateway,
             resolver,
             policy,
-            version_probe,
-            MonitorConfig {
-                interval: monitor_interval,
-                timeout: monitor_timeout,
-                failures: monitor_failures,
-            },
+            Arc::new(SystemVersionProbe::new()),
+            monitor,
         )
     }
 
@@ -878,8 +887,14 @@ impl Core {
 
     /// 启动:把应用的静态站点注册进 gateway。返回不含令牌的站点地址。
     pub(crate) fn start(&self, id: &AppId) -> Result<String, ManagerError> {
-        let _guard = self.guard();
-        self.start_locked(id)
+        // 版本探测可能阻塞数秒,放在锁外做;结果在锁内的检查里取用。
+        self.prefetch_version_output(id);
+        let result = {
+            let _guard = self.guard();
+            self.start_locked(id)
+        };
+        self.take_prefetched_version(id);
+        result
     }
 
     fn start_locked(&self, id: &AppId) -> Result<String, ManagerError> {
@@ -1081,50 +1096,30 @@ impl Core {
         argv: &[String],
         resolved: &Resolved,
     ) -> Result<(), ManagerError> {
-        let (runtime_name, req_text, interpreter): (String, Option<&str>, Option<Resolved>) =
-            match &manifest.runtime {
-                Runtime::Node { node, .. } => {
-                    let req = node.as_deref();
-                    if req.is_none() {
-                        return Ok(());
-                    }
-                    // npm/npx 也是 node 应用,版本以 node 为准
-                    let node = match self.resolver.resolve("node") {
-                        Ok(r) => r,
-                        Err(ResolveError::NotInstalled(name)) => {
-                            return self
-                                .fail_runtime_missing(record, &[String::from("node")], {
-                                    let _ = name;
-                                    ManagerError::RuntimeUnavailable("node".into())
-                                })
-                                .map(|_| ());
-                        }
-                    };
-                    ("node".to_string(), req, Some(node))
+        let (runtime_name, req_text, req, program) =
+            match self.version_target(manifest, argv, resolved) {
+                VersionTarget::Skip => return Ok(()),
+                VersionTarget::NodeMissing => {
+                    return self
+                        .fail_runtime_missing(
+                            record,
+                            &[String::from("node")],
+                            ManagerError::RuntimeUnavailable("node".into()),
+                        )
+                        .map(|_| ());
                 }
-                Runtime::Python { python, .. } => {
-                    let req = python.as_deref();
-                    if req.is_none() {
-                        return Ok(());
-                    }
-                    if argv.first().map(String::as_str) == Some("uv") {
-                        return Ok(());
-                    }
-                    let name = argv.first().cloned().unwrap_or_default();
-                    (name, req, Some(resolved.clone()))
-                }
-                _ => return Ok(()),
+                VersionTarget::Probe {
+                    runtime,
+                    req_text,
+                    req,
+                    program,
+                } => (runtime, req_text, req, program),
             };
-
-        let req_text = req_text.expect("上面已确认 Some");
-        let req = match crate::runtime_version::VersionReq::parse(req_text) {
-            Ok(r) => r,
-            Err(_) => return Ok(()), // 清单校验已拒绝畸形要求;这里不再重复报错
+        // 优先用锁外预探的结果;没有(如启动对账走的 `start_locked`)才在这里现探。
+        let output = match self.take_prefetched_version_for(&record.id, &program) {
+            Some(out) => out,
+            None => self.version_probe.version_output(&program),
         };
-        let Some(interpreter) = interpreter else {
-            return Ok(());
-        };
-        let output = self.version_probe.version_output(&interpreter.program);
         let found = match output
             .as_deref()
             .and_then(crate::runtime_version::parse_version_output)
@@ -1141,14 +1136,110 @@ impl Core {
                     .take(80)
                     .collect::<String>();
                 let found = format!("无法识别: {first_line}");
-                return self.fail_runtime_version(record, &runtime_name, req_text, found);
+                return self.fail_runtime_version(record, &runtime_name, &req_text, found);
             }
         };
         if req.matches(found) {
             return Ok(());
         }
         let found = format!("{}.{}.{}", found.0, found.1, found.2);
-        self.fail_runtime_version(record, &runtime_name, req_text, found)
+        self.fail_runtime_version(record, &runtime_name, &req_text, found)
+    }
+
+    /// 决定这次启动要不要、以及探哪个解释器。
+    ///
+    /// - Node 应用:即使 `argv[0]` 是 `npm`/`npx`,也解析 `node` 来检查。
+    /// - Python 应用:`argv[0]` 是 `uv` 时不检查。
+    /// - 清单校验已拒绝畸形要求;这里解析不了也按不检查处理。
+    fn version_target(
+        &self,
+        manifest: &Manifest,
+        argv: &[String],
+        resolved: &Resolved,
+    ) -> VersionTarget {
+        let (runtime, req_text, program) = match &manifest.runtime {
+            Runtime::Node {
+                node: Some(req), ..
+            } => match self.resolver.resolve("node") {
+                Ok(r) => ("node".to_string(), req.clone(), r.program),
+                Err(ResolveError::NotInstalled(_)) => return VersionTarget::NodeMissing,
+            },
+            Runtime::Python {
+                python: Some(req), ..
+            } => {
+                if argv.first().map(String::as_str) == Some("uv") {
+                    return VersionTarget::Skip;
+                }
+                (
+                    argv.first().cloned().unwrap_or_default(),
+                    req.clone(),
+                    resolved.program.clone(),
+                )
+            }
+            _ => return VersionTarget::Skip,
+        };
+        match crate::runtime_version::VersionReq::parse(&req_text) {
+            Ok(req) => VersionTarget::Probe {
+                runtime,
+                req_text,
+                req,
+                program,
+            },
+            Err(_) => VersionTarget::Skip,
+        }
+    }
+
+    /// 拿锁前预探版本,结果登记到 `prefetched_versions`。任何一步不顺(没装、读不到清单……)就什么都不做,
+    /// 交给锁内的检查现探并报出正式的错误。
+    fn prefetch_version_output(&self, id: &AppId) {
+        self.take_prefetched_version(id);
+        let Ok(record) = self.load_record(id) else {
+            return;
+        };
+        let dir = self
+            .registry
+            .paths()
+            .package_dir(id, &record.current_version);
+        let Ok(text) = fs::read_to_string(dir.join("manifest.toml")) else {
+            return;
+        };
+        let Ok(manifest) = Manifest::from_toml(&text, &self.host_version) else {
+            return;
+        };
+        let argv = match &manifest.runtime {
+            Runtime::Node { command, .. } | Runtime::Python { command, .. } => command.clone(),
+            _ => return,
+        };
+        let Ok(resolved) = self.resolve_program(&argv) else {
+            return;
+        };
+        if let VersionTarget::Probe { program, .. } =
+            self.version_target(&manifest, &argv, &resolved)
+        {
+            let output = self.version_probe.version_output(&program);
+            self.prefetched_versions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.clone(), (program, output));
+        }
+    }
+
+    /// 丢掉某应用登记的预探结果。
+    fn take_prefetched_version(&self, id: &AppId) {
+        self.prefetched_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// 取走预探结果;解释器路径不一致(清单在预探后变了)视为没有。
+    fn take_prefetched_version_for(&self, id: &AppId, program: &Path) -> Option<Option<String>> {
+        let (probed, output) = self
+            .prefetched_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id)?;
+        (probed == program).then_some(output)
     }
 
     /// 版本不满足:记问题、发事件、把 `Failed{retryable:true}` 落盘,返回 `RuntimeVersion`。
@@ -2881,6 +2972,52 @@ source = "web/"
             .unwrap();
         assert!(summary.issue.is_none(), "{:?}", summary.issue);
         assert!(!probe.calls.lock().unwrap().is_empty(), "应真的探过版本");
+    }
+
+    /// `--version` 最多阻塞 3s,不能占着单写者锁(否则这期间停止/安装/卸载全被拖住)。
+    /// 测试线程先占住锁,另一线程调 `start`:探针应已被调用过(探测在拿锁之前),`start` 正卡在拿锁上。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_version_probe_runs_before_the_manager_lock_is_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let programs = dirs_for("python3");
+        if programs.is_empty() {
+            return;
+        }
+        let probe = FakeVersionProbe::new().expects(&programs[0].join("python3"), "3.12.4\n");
+        let rig = rig_with_probe(&tmp, gateway, programs, probe.clone());
+        let a = id("lockfree");
+        install_with(
+            &rig.manager,
+            &rig.src_dir("a"),
+            "lockfree",
+            write_py_app_with_req,
+            ">=3.12",
+        );
+        let guard = rig.manager.lock.lock().unwrap();
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| rig.manager.start(&a));
+            let started = std::time::Instant::now();
+            let mut probed = false;
+            while started.elapsed() < std::time::Duration::from_secs(5) {
+                if !probe.calls.lock().unwrap().is_empty() {
+                    probed = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!handle.is_finished(), "start 应卡在拿锁上");
+            drop(guard);
+            assert!(probed, "探测应发生在拿锁之前");
+            assert!(handle.join().unwrap().is_ok());
+        });
+        assert_eq!(
+            probe.calls.lock().unwrap().len(),
+            1,
+            "预探的结果应被锁内检查取用,不重复探"
+        );
+        assert!(rig.manager.prefetched_versions.lock().unwrap().is_empty());
     }
 
     #[cfg(unix)]
