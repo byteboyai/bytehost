@@ -215,6 +215,9 @@ pub enum AppRequest {
         id: AppId,
         max_lines: u32,
     },
+    /// 订阅应用变更。成功应答 `Subscribed` 之后,**同一连接**只会再收到 `Changed`/`Resync`,
+    /// 直到连接关闭;这些推送都只是"失效信号",收到后按 `List` 重拉即可。
+    Subscribe,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -247,6 +250,14 @@ pub enum AppReply {
         text: String,
         truncated: bool,
     },
+    /// 订阅成功;此后该连接只会收到 `Changed` / `Resync`。
+    Subscribed,
+    /// 某应用的状态/端点/问题变了。**只是失效信号**,不带状态——收到后重拉 `List`。
+    Changed {
+        app: AppId,
+    },
+    /// 广播落后丢了事件,或服务刚恢复:整体重拉。
+    Resync,
     /// 请求失败(带类别)。
     Failed {
         #[serde(flatten)]
@@ -510,5 +521,40 @@ mod tests {
         assert!(probe.managed.is_empty());
         assert!(!probe.installable);
         assert!(probe.job.is_none());
+    }
+
+    #[test]
+    fn subscribe_and_push_variants_have_a_stable_wire_shape() {
+        assert_eq!(
+            round_trip(&AppRequest::Subscribe),
+            json!({"op": "subscribe"})
+        );
+        assert_eq!(
+            round_trip(&AppReply::Subscribed),
+            json!({"reply": "subscribed"})
+        );
+        assert_eq!(round_trip(&AppReply::Resync), json!({"reply": "resync"}));
+        assert_eq!(
+            round_trip(&AppReply::Changed { app: id() }),
+            json!({"reply": "changed", "app": "excalidraw"})
+        );
+    }
+
+    #[test]
+    fn old_reply_shapes_still_parse_after_adding_push_variants() {
+        assert_eq!(
+            serde_json::from_value::<AppReply>(json!({"reply": "done"})).unwrap(),
+            AppReply::Done
+        );
+        assert_eq!(
+            serde_json::from_value::<AppReply>(
+                json!({"reply": "logs", "text": "hi", "truncated": false})
+            )
+            .unwrap(),
+            AppReply::Logs {
+                text: "hi".into(),
+                truncated: false,
+            }
+        );
     }
 }
