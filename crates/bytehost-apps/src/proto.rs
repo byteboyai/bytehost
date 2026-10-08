@@ -28,6 +28,24 @@ pub struct AppSummary {
     pub observed: ObservedState,
     /// 运行中才有:不含令牌的站点地址。
     pub url: Option<String>,
+    /// 当前有一个"看得懂的问题"(运行时缺失/版本不符……);只在 `observed` 是 `Failed` 时带出。
+    /// 只存内存,不持久化。旧形状 JSON(无此字段)解析为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<AppIssue>,
+}
+
+/// 应用当前的问题(供 GUI 画提示页,见规格 §6.3)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "issue", rename_all = "snake_case")]
+pub enum AppIssue {
+    /// 系统里没有这个运行时(解释器名,如 `node`/`python3`/`uv`)。
+    RuntimeMissing { runtime: String },
+    /// 装了但版本不满足清单声明的要求。
+    RuntimeVersion {
+        runtime: String,
+        required: String,
+        found: String,
+    },
 }
 
 /// 可由 bytehost **安装到自己的目录**的运行时(规格 A9)。
@@ -354,11 +372,20 @@ mod tests {
                 desired: DesiredState::Running,
                 observed: ObservedState::Running,
                 url: Some("http://excalidraw.localhost:20001/".into()),
+                issue: Some(AppIssue::RuntimeVersion {
+                    runtime: "python3".into(),
+                    required: ">=3.12".into(),
+                    found: "3.9.1".into(),
+                }),
             }],
         };
         let json = round_trip(&apps);
         assert_eq!(json["apps"][0]["version"], "0.17.0");
         assert_eq!(json["apps"][0]["observed"], json!({"state": "running"}));
+        assert_eq!(
+            json["apps"][0]["issue"],
+            json!({"issue": "runtime_version", "runtime": "python3", "required": ">=3.12", "found": "3.9.1"})
+        );
 
         let runtimes = AppReply::Runtimes {
             runtimes: vec![

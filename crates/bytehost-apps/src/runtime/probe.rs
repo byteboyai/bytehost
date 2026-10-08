@@ -93,6 +93,47 @@ impl CommandRunner for SystemRunner {
     }
 }
 
+/// 探一个解释器的版本输出(如 `node --version` 的 `v24.21.0`)。测试里换成假的,不真跑进程。
+pub trait VersionProbe: Send + Sync {
+    /// 成功返回版本输出(取 stdout,为空再取 stderr——老 python 打到 stderr);失败/超时返回 `None`。
+    fn version_output(&self, program: &std::path::Path) -> Option<String>;
+}
+
+/// 真正执行 `<program> --version`,超时 3s。
+pub struct SystemVersionProbe {
+    runner: SystemRunner,
+}
+
+impl SystemVersionProbe {
+    pub fn new() -> Self {
+        Self {
+            runner: SystemRunner {
+                timeout: Duration::from_secs(3),
+            },
+        }
+    }
+}
+
+impl Default for SystemVersionProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VersionProbe for SystemVersionProbe {
+    fn version_output(&self, program: &std::path::Path) -> Option<String> {
+        let program = program.to_string_lossy();
+        let out = self.runner.run(&program, &["--version"]).ok()?;
+        if !out.stdout.trim().is_empty() {
+            Some(out.stdout)
+        } else if !out.stderr.trim().is_empty() {
+            Some(out.stderr)
+        } else {
+            None
+        }
+    }
+}
+
 type SharedBuf = Arc<Mutex<Vec<u8>>>;
 
 /// 起一个线程把 `pipe` 读到底(EOF 时通过 `done` 通知)。

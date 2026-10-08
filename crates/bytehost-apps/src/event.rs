@@ -28,6 +28,12 @@ pub enum RuntimeReason {
     NotInstalled { runtime: String },
     /// 装了但当前用不了(如 Colima 没启动)。
     Unavailable { runtime: String, detail: String },
+    /// 装了,但版本不满足清单声明的要求。
+    Unsatisfied {
+        runtime: String,
+        required: String,
+        found: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

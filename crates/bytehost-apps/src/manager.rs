@@ -29,13 +29,16 @@ use crate::plan::{
     ApprovedInstallPlan, InstallPlan, Installed, PlanInput, Provenance, TrustLevel, VerifyError,
 };
 use crate::registry::{AppRecord, RECORD_FORMAT_VERSION, Registry, UninstallMode, VersionRecord};
-use crate::runtime::{ResolveError, Resolved, RuntimeResolver, SystemResolver, enforcement_for};
+use crate::runtime::{
+    ResolveError, Resolved, RuntimeResolver, SystemResolver, SystemVersionProbe, VersionProbe,
+    enforcement_for,
+};
 use crate::state::{
     Action, DesiredState, ObservedState, next_action, recover_after_supervisor_restart,
 };
 use crate::supervisor::{self, Launch, Phase, Transitions};
 
-pub use crate::proto::{AppSource, AppSummary};
+pub use crate::proto::{AppIssue, AppSource, AppSummary};
 
 #[derive(Debug)]
 pub enum ManagerError {
@@ -62,6 +65,12 @@ pub enum ManagerError {
     BadSource(String),
     /// 进程型应用所需的运行时没装(如没装 `python3`/`node`)。
     RuntimeUnavailable(String),
+    /// 运行时装了,但版本不满足清单声明的要求。
+    RuntimeVersion {
+        runtime: String,
+        required: String,
+        found: String,
+    },
 }
 
 impl std::fmt::Display for ManagerError {
@@ -82,6 +91,11 @@ impl std::fmt::Display for ManagerError {
             Self::BadSource(why) => write!(f, "应用来源不合法: {why}"),
             Self::ShuttingDown => write!(f, "dozerd 正在停止,暂不接受安装/启动"),
             Self::RuntimeUnavailable(name) => write!(f, "运行时 {name} 不可用:未找到"),
+            Self::RuntimeVersion {
+                runtime,
+                required,
+                found,
+            } => write!(f, "需要 {runtime} {required},当前 {found}"),
             Self::MissingSource(p) => write!(f, "应用包里缺少站点目录: {}", p.display()),
         }
     }
@@ -101,6 +115,7 @@ impl ManagerError {
             Self::NotInstalled(_) => K::NotFound,
             Self::ShuttingDown => K::Unavailable,
             Self::RuntimeUnavailable(_) => K::Unavailable,
+            Self::RuntimeVersion { .. } => K::Unavailable,
         }
     }
 }
@@ -137,6 +152,12 @@ pub struct Core {
     /// 把解释器名解析成绝对路径(进程型应用)。
     #[allow(dead_code)]
     resolver: Arc<dyn RuntimeResolver>,
+    /// 探解释器版本(进程型应用的版本要求校验)。
+    #[allow(dead_code)]
+    version_probe: Arc<dyn VersionProbe>,
+    /// 每个应用当前"看得懂的问题"(运行时缺失/版本不符);只存内存,只在应用 `Failed` 时经 `list` 带出。
+    #[allow(dead_code)]
+    issues: Mutex<HashMap<AppId, AppIssue>>,
     /// 进程型应用崩溃后的重启策略(默认 `RestartPolicy::default()`;测试里注入小退避)。
     policy: crate::process::restart::RestartPolicy,
     /// 每个应用当前那条监管线程(`cancel` 标志 + 句柄)。静态应用不登记。
@@ -223,6 +244,7 @@ impl Transitions for AppTransitions {
             app: self.id.clone(),
             url: Some(url),
         });
+        self.core.clear_issue(&self.id);
         true
     }
 
@@ -435,6 +457,24 @@ impl AppManager {
         resolver: Arc<dyn RuntimeResolver>,
         policy: crate::process::restart::RestartPolicy,
     ) -> io::Result<Self> {
+        Self::with_parts(
+            root,
+            host_version,
+            gateway,
+            resolver,
+            policy,
+            Arc::new(SystemVersionProbe::new()),
+        )
+    }
+
+    fn with_parts(
+        root: impl Into<PathBuf>,
+        host_version: Version,
+        gateway: Arc<Gateway>,
+        resolver: Arc<dyn RuntimeResolver>,
+        policy: crate::process::restart::RestartPolicy,
+        version_probe: Arc<dyn VersionProbe>,
+    ) -> io::Result<Self> {
         let (events, _) = broadcast::channel(256);
         let registry = Registry::open(root)?;
         sweep_staging(&registry.paths().apps_dir());
@@ -447,6 +487,8 @@ impl AppManager {
                 lock: Mutex::new(()),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 resolver,
+                version_probe,
+                issues: Mutex::new(HashMap::new()),
                 policy,
                 supervisions: Mutex::new(HashMap::new()),
                 self_weak: std::sync::OnceLock::new(),
@@ -469,6 +511,19 @@ impl AppManager {
         policy: crate::process::restart::RestartPolicy,
     ) -> io::Result<Self> {
         Self::with_resolver_and_policy(root, host_version, gateway, resolver, policy)
+    }
+
+    /// (仅测试)注入假的 `VersionProbe`,并允许调小重启策略。
+    #[cfg(test)]
+    pub(crate) fn with_parts_for_test(
+        root: impl Into<PathBuf>,
+        host_version: Version,
+        gateway: Arc<Gateway>,
+        resolver: Arc<dyn RuntimeResolver>,
+        policy: crate::process::restart::RestartPolicy,
+        version_probe: Arc<dyn VersionProbe>,
+    ) -> io::Result<Self> {
+        Self::with_parts(root, host_version, gateway, resolver, policy, version_probe)
     }
 
     pub fn events(&self) -> broadcast::Receiver<AppEvent> {
@@ -818,6 +873,7 @@ impl Core {
         let id = record.id.clone();
         // 收掉上一条已结束的监管线程(崩溃后重试、或 Failed 复位后再启动)
         let _ = self.cancel_supervision(&id);
+        self.clear_issue(&id);
 
         let (argv, port_env) = match &manifest.runtime {
             Runtime::Node { command, http, .. } | Runtime::Python { command, http, .. } => {
@@ -837,6 +893,7 @@ impl Core {
             },
             None => None,
         };
+        self.check_version_requirement(record, manifest, &argv, &resolved)?;
 
         let cache_dir = self.registry.paths().cache_dir(&id);
         let data_dir = self.registry.paths().data_dir(&id);
@@ -930,6 +987,144 @@ impl Core {
         }
     }
 
+    /// 校验清单声明的运行时版本要求(只对能确定解释器的情况做)。
+    ///
+    /// - Node 应用:即使 `argv[0]` 是 `npm`/`npx`,也解析 `node` 来检查;解析不到 `node` 走 `RuntimeUnavailable`。
+    /// - Python 应用:`argv[0]` 是 `uv` 时**不检查**(解释器由 uv 在运行时挑,宿主拿不到)。
+    ///
+    /// 不满足 → `Failed{retryable:true}` + `emit(RuntimeUnavailable{Unsatisfied})` + 记 `AppIssue` +
+    /// 返回 `RuntimeVersion`。解析不出输出按"不满足"处理。
+    fn check_version_requirement(
+        &self,
+        record: &mut AppRecord,
+        manifest: &Manifest,
+        argv: &[String],
+        resolved: &Resolved,
+    ) -> Result<(), ManagerError> {
+        let (runtime_name, req_text, interpreter): (String, Option<&str>, Option<Resolved>) =
+            match &manifest.runtime {
+                Runtime::Node { node, .. } => {
+                    let req = node.as_deref();
+                    if req.is_none() {
+                        return Ok(());
+                    }
+                    // npm/npx 也是 node 应用,版本以 node 为准
+                    let node = match self.resolver.resolve("node") {
+                        Ok(r) => r,
+                        Err(ResolveError::NotInstalled(name)) => {
+                            return self
+                                .fail_runtime_missing(record, &[String::from("node")], {
+                                    let _ = name;
+                                    ManagerError::RuntimeUnavailable("node".into())
+                                })
+                                .map(|_| ());
+                        }
+                    };
+                    ("node".to_string(), req, Some(node))
+                }
+                Runtime::Python { python, .. } => {
+                    let req = python.as_deref();
+                    if req.is_none() {
+                        return Ok(());
+                    }
+                    if argv.first().map(String::as_str) == Some("uv") {
+                        return Ok(());
+                    }
+                    let name = argv.first().cloned().unwrap_or_default();
+                    (name, req, Some(resolved.clone()))
+                }
+                _ => return Ok(()),
+            };
+
+        let req_text = req_text.expect("上面已确认 Some");
+        let req = match crate::runtime_version::VersionReq::parse(req_text) {
+            Ok(r) => r,
+            Err(_) => return Ok(()), // 清单校验已拒绝畸形要求;这里不再重复报错
+        };
+        let Some(interpreter) = interpreter else {
+            return Ok(());
+        };
+        let output = self.version_probe.version_output(&interpreter.program);
+        let found = match output
+            .as_deref()
+            .and_then(crate::runtime_version::parse_version_output)
+        {
+            Some(v) => v,
+            None => {
+                let first_line = output
+                    .as_deref()
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect::<String>();
+                let found = format!("无法识别: {first_line}");
+                return self.fail_runtime_version(record, &runtime_name, req_text, found);
+            }
+        };
+        if req.matches(found) {
+            return Ok(());
+        }
+        let found = format!("{}.{}.{}", found.0, found.1, found.2);
+        self.fail_runtime_version(record, &runtime_name, req_text, found)
+    }
+
+    /// 版本不满足:记问题、发事件、把 `Failed{retryable:true}` 落盘,返回 `RuntimeVersion`。
+    fn fail_runtime_version(
+        &self,
+        record: &mut AppRecord,
+        runtime: &str,
+        required: &str,
+        found: String,
+    ) -> Result<(), ManagerError> {
+        let reason = format!("需要 {runtime} {required},当前 {found}");
+        let _ = self.set_observed(
+            record,
+            ObservedState::Failed {
+                reason,
+                retryable: true,
+            },
+        );
+        self.set_issue(
+            &record.id,
+            AppIssue::RuntimeVersion {
+                runtime: runtime.to_string(),
+                required: required.to_string(),
+                found: found.clone(),
+            },
+        );
+        self.emit(AppEvent::RuntimeUnavailable {
+            app: record.id.clone(),
+            reason: RuntimeReason::Unsatisfied {
+                runtime: runtime.to_string(),
+                required: required.to_string(),
+                found: found.clone(),
+            },
+        });
+        Err(ManagerError::RuntimeVersion {
+            runtime: runtime.to_string(),
+            required: required.to_string(),
+            found,
+        })
+    }
+
+    /// 记下/清除某应用的当前问题。
+    fn set_issue(&self, id: &AppId, issue: AppIssue) {
+        self.issues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), issue);
+    }
+
+    fn clear_issue(&self, id: &AppId) {
+        self.issues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
     /// 运行时缺失:`set_observed(Failed{retryable:true})` + `emit(RuntimeUnavailable{NotInstalled})`,
     /// 然后把错误交回给调用方(线上类别 `Unavailable`,用户装好运行时可以重试)。
     fn fail_runtime_missing(
@@ -945,6 +1140,12 @@ impl Core {
             ObservedState::Failed {
                 reason,
                 retryable: true,
+            },
+        );
+        self.set_issue(
+            &record.id,
+            AppIssue::RuntimeMissing {
+                runtime: runtime.clone(),
             },
         );
         self.emit(AppEvent::RuntimeUnavailable {
@@ -977,6 +1178,7 @@ impl Core {
         if let Some(h) = self.cancel_supervision(id) {
             let _ = h.join();
         }
+        self.clear_issue(id);
         let mut record = self.load_record(id)?;
         let was_serving = self.gateway.remove_site(id);
         record.desired = DesiredState::Stopped;
@@ -1003,10 +1205,12 @@ impl Core {
         let _guard = self.guard();
         if self.registry.load(id)?.is_none() {
             self.registry.uninstall(id, mode)?;
+            self.clear_issue(id);
             return Ok(());
         }
         self.stop_locked(id)?;
         self.registry.uninstall(id, mode)?;
+        self.clear_issue(id);
         self.emit(AppEvent::StateChanged {
             app: id.clone(),
             state: ObservedState::NotInstalled,
@@ -1046,12 +1250,22 @@ impl Core {
                 .unwrap_or_else(|| r.id.to_string());
                 let url = matches!(r.observed, ObservedState::Running)
                     .then(|| self.gateway.site_url(&r.id));
+                let issue = matches!(r.observed, ObservedState::Failed { .. })
+                    .then(|| {
+                        self.issues
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get(&r.id)
+                            .cloned()
+                    })
+                    .flatten();
                 AppSummary {
                     name,
                     version: r.current_version,
                     desired: r.desired,
                     observed: r.observed,
                     url,
+                    issue,
                     id: r.id,
                 }
             })
@@ -2433,6 +2647,338 @@ source = "web/"
                 } if runtime == "python3"
             )),
             "{events:?}"
+        );
+    }
+
+    // ===== A6e Task 2:运行时版本要求 =====
+
+    #[cfg(unix)]
+    struct FakeVersionProbe {
+        output: Mutex<HashMap<PathBuf, String>>,
+        calls: Mutex<Vec<PathBuf>>,
+    }
+
+    #[cfg(unix)]
+    impl FakeVersionProbe {
+        fn new() -> Self {
+            Self {
+                output: Mutex::new(HashMap::new()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn expects(self, program: &Path, output: &str) -> Arc<Self> {
+            self.output
+                .lock()
+                .unwrap()
+                .insert(program.to_path_buf(), output.to_string());
+            Arc::new(self)
+        }
+    }
+
+    #[cfg(unix)]
+    impl VersionProbe for FakeVersionProbe {
+        fn version_output(&self, program: &Path) -> Option<String> {
+            self.calls.lock().unwrap().push(program.to_path_buf());
+            self.output.lock().unwrap().get(program).cloned()
+        }
+    }
+
+    #[cfg(unix)]
+    fn rig_with_probe(
+        tmp: &tempfile::TempDir,
+        gateway: Arc<Gateway>,
+        dirs: Vec<PathBuf>,
+        probe: Arc<dyn VersionProbe>,
+    ) -> Rig {
+        let manager = AppManager::with_parts_for_test(
+            tmp.path().join("bytehost"),
+            HOST,
+            gateway.clone(),
+            Arc::new(SystemResolver::with_dirs(dirs)),
+            crate::process::restart::RestartPolicy::default(),
+            probe,
+        )
+        .unwrap();
+        Rig {
+            tmp: tempfile::tempdir().unwrap(),
+            gateway,
+            manager,
+        }
+    }
+
+    /// 写一个带 `python = "<req>"` 要求的 python 应用。
+    #[cfg(unix)]
+    fn write_py_app_with_req(dir: &Path, id: &str, req: &str) -> AppSource {
+        let manifest = manifest_toml(id, "1.0.0", "").replace(
+            "kind = \"static_web\"\nsource = \"web/\"",
+            &format!(
+                "kind = \"python\"\npython = \"{req}\"\ncommand = [\"python3\", \"server.py\"]\n[runtime.http]\nport_env = \"APP_PORT\""
+            ),
+        );
+        write_files(
+            dir,
+            &[("manifest.toml", &manifest), ("server.py", PY_SERVER)],
+        );
+        AppSource::LocalDir {
+            path: dir.to_path_buf(),
+        }
+    }
+
+    /// 写一个带 `node = "<req>"` 要求的 node 应用(argv[0] 是 `node`)。
+    #[cfg(unix)]
+    fn write_node_app_with_req(dir: &Path, id: &str, req: &str) -> AppSource {
+        let manifest = manifest_toml(id, "1.0.0", "").replace(
+            "kind = \"static_web\"\nsource = \"web/\"",
+            &format!(
+                "kind = \"node\"\nnode = \"{req}\"\ncommand = [\"node\", \"server.js\"]\n[runtime.http]\nport_env = \"APP_PORT\""
+            ),
+        );
+        write_files(
+            dir,
+            &[("manifest.toml", &manifest), ("server.js", "// noop")],
+        );
+        AppSource::LocalDir {
+            path: dir.to_path_buf(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_with(
+        manager: &AppManager,
+        dir: &Path,
+        id: &str,
+        writer: fn(&Path, &str, &str) -> AppSource,
+        req: &str,
+    ) {
+        let src = writer(dir, id, req);
+        let approved = manager
+            .install_plan(&src, Provenance::Local, TrustLevel::Trusted)
+            .unwrap()
+            .approve(Approval {
+                approver: "test".into(),
+                approved_ms: 1,
+            });
+        manager.install(&approved, &src, 100).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_satisfied_python_version_requirement_lets_the_app_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let programs = dirs_for("python3");
+        if programs.is_empty() {
+            return;
+        }
+        let probe = FakeVersionProbe::new().expects(&programs[0].join("python3"), "3.12.4\n");
+        let rig = rig_with_probe(&tmp, gateway, programs, probe.clone());
+        let a = id("pyver");
+        install_with(
+            &rig.manager,
+            &rig.src_dir("a"),
+            "pyver",
+            write_py_app_with_req,
+            ">=3.12",
+        );
+        assert!(rig.manager.start(&a).is_ok());
+        let summary = rig
+            .manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == a)
+            .unwrap();
+        assert!(summary.issue.is_none(), "{:?}", summary.issue);
+        assert!(!probe.calls.lock().unwrap().is_empty(), "应真的探过版本");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_violated_python_version_requirement_fails_the_start_with_an_issue_and_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let programs = dirs_for("python3");
+        if programs.is_empty() {
+            return;
+        }
+        let probe = FakeVersionProbe::new().expects(&programs[0].join("python3"), "3.9.1\n");
+        let rig = rig_with_probe(&tmp, gateway, programs, probe);
+        let a = id("oldpy");
+        install_with(
+            &rig.manager,
+            &rig.src_dir("a"),
+            "oldpy",
+            write_py_app_with_req,
+            ">=3.12",
+        );
+        let mut rx = rig.manager.events();
+        let e = rig.manager.start(&a).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ManagerError::RuntimeVersion {
+                    ref runtime,
+                    ref required,
+                    ref found,
+                } if runtime == "python3" && required == ">=3.12" && found == "3.9.1"
+            ),
+            "{e:?}"
+        );
+        let summary = rig
+            .manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == a)
+            .unwrap();
+        assert!(
+            matches!(
+                summary.observed,
+                ObservedState::Failed {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            summary.observed
+        );
+        assert!(
+            matches!(
+                summary.issue,
+                Some(AppIssue::RuntimeVersion {
+                    ref runtime,
+                    ref required,
+                    ref found,
+                }) if runtime == "python3" && required == ">=3.12" && found == "3.9.1"
+            ),
+            "{:?}",
+            summary.issue
+        );
+        assert!(
+            drain(&mut rx).iter().any(|e| matches!(
+                e,
+                AppEvent::RuntimeUnavailable {
+                    reason: RuntimeReason::Unsatisfied { runtime, required, found },
+                    ..
+                } if runtime == "python3" && required == ">=3.12" && found == "3.9.1"
+            )),
+            "应发 Unsatisfied 事件"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unparsable_version_output_counts_as_unsatisfied_and_names_the_first_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let programs = dirs_for("python3");
+        if programs.is_empty() {
+            return;
+        }
+        let probe = FakeVersionProbe::new()
+            .expects(&programs[0].join("python3"), "command not found\nmore\n");
+        let rig = rig_with_probe(&tmp, gateway, programs, probe);
+        let a = id("weird");
+        install_with(
+            &rig.manager,
+            &rig.src_dir("a"),
+            "weird",
+            write_py_app_with_req,
+            ">=3.12",
+        );
+        let e = rig.manager.start(&a).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ManagerError::RuntimeVersion { ref found, .. } if found.starts_with("无法识别: command not found")
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_uv_managed_python_app_skips_the_version_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let programs = dirs_for("uv");
+        if programs.is_empty() {
+            return;
+        }
+        let probe = FakeVersionProbe::new().expects(&programs[0].join("uv"), "3.9.1\n");
+        let rig = rig_with_probe(&tmp, gateway, programs.clone(), probe.clone());
+        let a = id("uvapp");
+        let manifest = manifest_toml("uvapp", "1.0.0", "").replace(
+            "kind = \"static_web\"\nsource = \"web/\"",
+            "kind = \"python\"\npython = \">=3.12\"\ncommand = [\"uv\", \"run\", \"server.py\"]\n[runtime.http]\nport_env = \"APP_PORT\"",
+        );
+        write_files(
+            &rig.src_dir("a"),
+            &[("manifest.toml", &manifest), ("server.py", "")],
+        );
+        let src = AppSource::LocalDir {
+            path: rig.src_dir("a"),
+        };
+        let approved = rig
+            .manager
+            .install_plan(&src, Provenance::Local, TrustLevel::Trusted)
+            .unwrap()
+            .approve(Approval {
+                approver: "test".into(),
+                approved_ms: 1,
+            });
+        rig.manager.install(&approved, &src, 100).unwrap();
+        // uv 存在且版本"过低",但因为是 uv 启动,不做版本检查 → 不因版本报错
+        let err = rig.manager.start(&a).unwrap_err();
+        assert!(
+            !matches!(err, ManagerError::RuntimeVersion { .. }),
+            "uv 应用不该做版本检查:{err:?}"
+        );
+        assert!(probe.calls.lock().unwrap().is_empty(), "不该探版本");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_app_version_requirement_checks_the_node_interpreter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
+        let programs = dirs_for("node");
+        if programs.is_empty() {
+            return;
+        }
+        let probe = FakeVersionProbe::new().expects(&programs[0].join("node"), "v20.1.0\n");
+        let rig = rig_with_probe(&tmp, gateway, programs, probe);
+        let a = id("nodeapp");
+        install_with(
+            &rig.manager,
+            &rig.src_dir("a"),
+            "nodeapp",
+            write_node_app_with_req,
+            ">=22",
+        );
+        let e = rig.manager.start(&a).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ManagerError::RuntimeVersion { ref runtime, ref found, .. } if runtime == "node" && found == "20.1.0"
+            ),
+            "{e:?}"
+        );
+        let summary = rig
+            .manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == a)
+            .unwrap();
+        assert!(
+            matches!(
+                summary.issue,
+                Some(AppIssue::RuntimeVersion { ref runtime, .. }) if runtime == "node"
+            ),
+            "{:?}",
+            summary.issue
         );
     }
 

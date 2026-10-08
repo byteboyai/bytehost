@@ -8,8 +8,8 @@ mod resolve;
 pub mod managed;
 
 pub use probe::{
-    CommandError, CommandOutput, CommandRunner, RuntimeAvailability, SystemRunner, probe_all,
-    probe_docker, probe_node, probe_python,
+    CommandError, CommandOutput, CommandRunner, RuntimeAvailability, SystemRunner,
+    SystemVersionProbe, VersionProbe, probe_all, probe_docker, probe_node, probe_python,
 };
 pub use resolve::{ResolveError, Resolved, RuntimeResolver, SystemResolver};
 
