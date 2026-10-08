@@ -46,6 +46,9 @@ pub enum AppIssue {
         required: String,
         found: String,
     },
+    /// 依赖安装(npm ci / uv sync 等)失败;`summary` 是一行人类可读的原因
+    /// (不含安装输出,输出在应用日志里,经 `Logs` 读)。
+    DependencyInstall { summary: String },
 }
 
 /// 可由 bytehost **安装到自己的目录**的运行时(规格 A9)。
@@ -554,6 +557,24 @@ mod tests {
             AppReply::Logs {
                 text: "hi".into(),
                 truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn dependency_install_issue_has_a_stable_wire_shape() {
+        assert_eq!(
+            round_trip(&AppIssue::DependencyInstall {
+                summary: "npm ci 失败(退出码 1)".into(),
+            }),
+            json!({"issue": "dependency_install", "summary": "npm ci 失败(退出码 1)"})
+        );
+        // 旧形状 JSON(无 `issue` 字段的 summary)不受影响。
+        let old = json!({"issue": "runtime_missing", "runtime": "node"});
+        assert_eq!(
+            serde_json::from_value::<AppIssue>(old).unwrap(),
+            AppIssue::RuntimeMissing {
+                runtime: "node".into()
             }
         );
     }

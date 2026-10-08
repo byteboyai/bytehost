@@ -47,8 +47,11 @@ pub trait Transitions: Send + Sync + 'static {
     fn ready(&self, port: u16) -> bool;
     /// 进程没了/不健康;`restart_in = Some(d)`:`d` 后重启(观察态回 `Starting`),`None`:放弃(`Failed{retryable:false}`)。
     fn down(&self, reason: String, restart_in: Option<Duration>) -> bool;
-    /// 起不来且不该重试(装依赖失败、拿不到端口):`Failed`。
+    /// 起不来且不该重试(拿不到端口等):`Failed`。
     fn failed(&self, reason: String, retryable: bool) -> bool;
+    /// 依赖安装(npm ci / uv sync 等)失败,起不来且可重试:`Failed{retryable:true}`
+    /// 并记住 `AppIssue::DependencyInstall`,让 GUI 画专门的问题页。
+    fn install_failed(&self, summary: String) -> bool;
 }
 
 /// 一次监管要起的东西。
@@ -103,7 +106,7 @@ pub fn run(launch: Launch, cancel: Arc<AtomicBool>, tr: Arc<dyn Transitions>) {
             InstallOutcome::Done => {}
             InstallOutcome::Cancelled => return,
             InstallOutcome::Failed(why) => {
-                tr.failed(why, true);
+                tr.install_failed(why);
                 return;
             }
         }
@@ -338,6 +341,9 @@ mod tests {
         }
         fn failed(&self, why: String, retryable: bool) -> bool {
             self.push(format!("failed {why} {retryable}"))
+        }
+        fn install_failed(&self, summary: String) -> bool {
+            self.push(format!("install_failed {summary}"))
         }
     }
 
@@ -730,7 +736,7 @@ http.server.test(HandlerClass=H, port=int(os.environ['APP_PORT']), bind='127.0.0
             r2.names()
         );
 
-        // 安装失败:failed(retryable=true),且不起进程(没有 Starting)
+        // 安装失败:install_failed(不是 failed),且不起进程(没有 Starting)
         let marker2 = dir.path().join("cache/fail.ok");
         let (r3, cancel3) = rec();
         let mut l3 = launch(dir.path(), "exit 0");
@@ -741,8 +747,112 @@ http.server.test(HandlerClass=H, port=int(os.environ['APP_PORT']), bind='127.0.0
         });
         run(l3, cancel3, r3.clone());
         let names = r3.names();
-        assert_eq!(names, vec!["Preparing", "failed"], "{names:?}");
-        assert!(r3.log.lock().unwrap()[1].contains("true"), "{:?}", r3.log);
+        assert_eq!(names, vec!["Preparing", "install_failed"], "{names:?}");
+        assert!(
+            r3.log.lock().unwrap()[1].contains("安装依赖失败"),
+            "{:?}",
+            r3.log
+        );
+    }
+
+    /// 依赖安装失败的四个分支(退出码非 0 / 超时 / 起不来 / 写标记失败)都必须走
+    /// `install_failed`,而不是泛化的 `failed`;`summary` 里不含安装输出本身。
+    #[test]
+    fn every_install_failure_branch_reports_install_failed() {
+        if !have_python3() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+
+        // 退出码非 0
+        let (r, cancel) = rec();
+        let mut l = launch(dir.path(), "exit 0");
+        l.install = Some(Install {
+            argv: vec![
+                "python3".into(),
+                "-c".into(),
+                "import sys; sys.exit(3)".into(),
+            ],
+            marker: dir.path().join("m1.ok"),
+            timeout: Duration::from_secs(5),
+        });
+        run(l, cancel, r.clone());
+        assert_eq!(
+            r.names(),
+            vec!["Preparing", "install_failed"],
+            "{:?}",
+            r.names()
+        );
+        assert!(
+            r.log.lock().unwrap()[1].contains("安装依赖失败"),
+            "{:?}",
+            r.log
+        );
+
+        // 超时
+        let (r, cancel) = rec();
+        let mut l = launch(dir.path(), "exit 0");
+        l.install = Some(Install {
+            argv: vec![
+                "python3".into(),
+                "-c".into(),
+                "import time; time.sleep(30)".into(),
+            ],
+            marker: dir.path().join("m2.ok"),
+            timeout: Duration::from_millis(200),
+        });
+        run(l, cancel, r.clone());
+        assert_eq!(
+            r.names(),
+            vec!["Preparing", "install_failed"],
+            "{:?}",
+            r.names()
+        );
+        assert!(r.log.lock().unwrap()[1].contains("超时"), "{:?}", r.log);
+
+        // 起不来(解释器路径不存在)
+        let (r, cancel) = rec();
+        let mut l = launch(dir.path(), "exit 0");
+        l.install = Some(Install {
+            argv: vec!["/definitely/not/here".into()],
+            marker: dir.path().join("m3.ok"),
+            timeout: Duration::from_secs(5),
+        });
+        run(l, cancel, r.clone());
+        assert_eq!(
+            r.names(),
+            vec!["Preparing", "install_failed"],
+            "{:?}",
+            r.names()
+        );
+        assert!(r.log.lock().unwrap()[1].contains("起不来"), "{:?}", r.log);
+
+        // 写标记失败(marker 的父目录不可写)
+        let readonly = dir.path().join("ro");
+        std::fs::create_dir_all(&readonly).unwrap();
+        let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(&readonly, perms).unwrap();
+        let (r, cancel) = rec();
+        let mut l = launch(dir.path(), "exit 0");
+        l.install = Some(Install {
+            argv: vec!["python3".into(), "-c".into(), "pass".into()],
+            // 父目录只读 → 写 marker 失败
+            marker: readonly.join("m4.ok"),
+            timeout: Duration::from_secs(5),
+        });
+        run(l, cancel, r.clone());
+        let names = r.names();
+        assert_eq!(names, vec!["Preparing", "install_failed"], "{names:?}");
+        assert!(
+            r.log.lock().unwrap()[1].contains("写标记失败"),
+            "{:?}",
+            r.log
+        );
+        // 恢复权限让 tempdir 能清理。
+        let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(&readonly, perms).unwrap();
     }
 
     #[test]

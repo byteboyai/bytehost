@@ -327,6 +327,38 @@ impl Transitions for AppTransitions {
             .set_observed(&mut record, ObservedState::Failed { reason, retryable })
             .is_ok()
     }
+
+    fn install_failed(&self, summary: String) -> bool {
+        let Some(_g) = self.acquire() else {
+            return false;
+        };
+        let Ok(mut record) = self.core.load_record(&self.id) else {
+            return false;
+        };
+        let was_serving = self.core.gateway.remove_site(&self.id);
+        if was_serving {
+            self.core.emit(AppEvent::EndpointChanged {
+                app: self.id.clone(),
+                url: None,
+            });
+        }
+        // 先记 issue 再改状态:GUI 因 Changed 重拉时一定看得到问题(推送与 issue 的竞态)。
+        self.core.set_issue(
+            &self.id,
+            AppIssue::DependencyInstall {
+                summary: summary.clone(),
+            },
+        );
+        self.core
+            .set_observed(
+                &mut record,
+                ObservedState::Failed {
+                    reason: summary,
+                    retryable: true,
+                },
+            )
+            .is_ok()
+    }
 }
 
 pub struct AppManager {
@@ -3207,6 +3239,101 @@ source = "web/"
             "{:?}",
             summary.issue
         );
+    }
+
+    // ===== A6f Task 3:依赖安装失败的问题页 =====
+
+    /// 依赖安装失败:`install_failed` 先记 issue 再置 `Failed{retryable:true}`,
+    /// `list()` 里因此一定同时看得到两者;装配成功(`ready`)后 issue 清除。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_failed_records_the_issue_and_a_later_success_clears_it() {
+        let rig = rig().await;
+        let mut rx = rig.manager.events();
+        let src = write_app(&rig.src_dir("a"), "excalidraw", "0.17.0", "", "<h1>x</h1>");
+        rig.install(&src).unwrap();
+        let a = id("excalidraw");
+
+        let tr = AppTransitions {
+            core: rig.manager.core.clone(),
+            id: a.clone(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        assert!(tr.install_failed("npm ci 失败(退出码 1)".into()));
+
+        let summary = rig
+            .manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == a)
+            .unwrap();
+        assert_eq!(
+            summary.observed,
+            ObservedState::Failed {
+                reason: "npm ci 失败(退出码 1)".into(),
+                retryable: true,
+            }
+        );
+        assert_eq!(
+            summary.issue,
+            Some(AppIssue::DependencyInstall {
+                summary: "npm ci 失败(退出码 1)".into(),
+            })
+        );
+        // 记 issue 先于置状态:重拉时事件里 already 有 Failed。
+        assert!(drain(&mut rx).contains(&AppEvent::StateChanged {
+            app: a.clone(),
+            state: ObservedState::Failed {
+                reason: "npm ci 失败(退出码 1)".into(),
+                retryable: true,
+            },
+        }));
+
+        // 重试成功(装配好):issue 清除,状态回到 Running。
+        assert!(tr.ready(3000));
+        let summary = rig
+            .manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == a)
+            .unwrap();
+        assert_eq!(summary.observed, ObservedState::Running);
+        assert!(summary.issue.is_none(), "{:?}", summary.issue);
+    }
+
+    /// issue 只在 `Failed` 时带出:装依赖失败后即使还没重试,只要不是 `Failed`(这里用
+    /// `set_observed(Stopped)` 模拟)就不带 issue。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_dependency_install_issue_is_only_exposed_while_failed() {
+        let rig = rig().await;
+        let src = write_app(&rig.src_dir("a"), "excalidraw", "0.17.0", "", "<h1>x</h1>");
+        rig.install(&src).unwrap();
+        let a = id("excalidraw");
+        let tr = AppTransitions {
+            core: rig.manager.core.clone(),
+            id: a.clone(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        assert!(tr.install_failed("uv sync 失败".into()));
+
+        let stopped = ObservedState::Stopped;
+        {
+            let _g = rig.manager.guard();
+            let mut record = rig.manager.load_record(&a).unwrap();
+            rig.manager
+                .set_observed(&mut record, stopped.clone())
+                .unwrap();
+        }
+        let summary = rig
+            .manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == a)
+            .unwrap();
+        assert_eq!(summary.observed, stopped);
+        assert!(summary.issue.is_none(), "{:?}", summary.issue);
     }
 
     // ===== A6e Task 3:日志末尾 =====
