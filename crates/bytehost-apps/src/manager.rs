@@ -925,54 +925,68 @@ impl Core {
         let old_current = existing.as_ref().map(|r| r.current_version);
 
         let final_dir = self.registry.paths().package_dir(&id, &version);
-        fs::create_dir_all(final_dir.parent().expect("package_dir 有父目录"))?;
-        // 没有版本记录却已经存在的版本目录,是上一次崩溃留下的残骸:清掉,不能让它挡住重试
-        if final_dir.exists() {
-            fs::remove_dir_all(&final_dir)?;
-        }
-        fs::rename(staging, &final_dir)?;
-        // 落位之后的任何一步失败都要把包撤回,否则会留下"有包目录、没有记录"的状态
         let upgrading = existing.is_some();
-        let removed_versions = (|| -> Result<Vec<Version>, ManagerError> {
-            let mut record = existing.unwrap_or_else(|| AppRecord {
-                format_version: RECORD_FORMAT_VERSION,
-                id: id.clone(),
-                desired: DesiredState::Stopped,
-                observed: ObservedState::Installed,
-                current_version: version,
-                grants: verified.requested,
-                versions: Vec::new(),
-                data_store_id: data_store_id_hex(&id),
-                previous_version: None,
-                probation: false,
-                last_rollback: None,
-            });
-            record.grants = verified.requested;
-            record.versions.push(VersionRecord {
-                version,
-                manifest_digest: verified.manifest_digest.clone(),
-                source_digest: verified.source_digest.clone(),
-                installed_ms: now_ms,
-            });
-            if upgrading && matches!(record.observed, ObservedState::Failed { .. }) {
-                record.observed = ObservedState::Installed;
+        // 停掉之后到记录写完之前的任何失败,都要把原本在跑的旧版本拉回来(见下)。
+        let placement = (|| -> Result<Vec<Version>, ManagerError> {
+            fs::create_dir_all(final_dir.parent().expect("package_dir 有父目录"))?;
+            // 没有版本记录却已经存在的版本目录,是上一次崩溃留下的残骸:清掉,不能让它挡住重试
+            if final_dir.exists() {
+                fs::remove_dir_all(&final_dir)?;
             }
-            if let Some(old) = old_current {
-                // 升级:记下上一版,并重新起试用期(只在应用原本在跑时;没在跑就没有"首次启动"可试)。
-                record.previous_version = Some(old);
-                record.probation = was_running;
-                record.last_rollback = None;
+            fs::rename(staging, &final_dir)?;
+            // 落位之后的任何一步失败都要把包撤回,否则会留下"有包目录、没有记录"的状态
+            let removed_versions = (|| -> Result<Vec<Version>, ManagerError> {
+                let mut record = existing.unwrap_or_else(|| AppRecord {
+                    format_version: RECORD_FORMAT_VERSION,
+                    id: id.clone(),
+                    desired: DesiredState::Stopped,
+                    observed: ObservedState::Installed,
+                    current_version: version,
+                    grants: verified.requested,
+                    versions: Vec::new(),
+                    data_store_id: data_store_id_hex(&id),
+                    previous_version: None,
+                    probation: false,
+                    last_rollback: None,
+                });
+                record.grants = verified.requested;
+                record.versions.push(VersionRecord {
+                    version,
+                    manifest_digest: verified.manifest_digest.clone(),
+                    source_digest: verified.source_digest.clone(),
+                    installed_ms: now_ms,
+                });
+                if upgrading && matches!(record.observed, ObservedState::Failed { .. }) {
+                    record.observed = ObservedState::Installed;
+                }
+                if let Some(old) = old_current {
+                    // 升级:记下上一版,并重新起试用期(只在应用原本在跑时;没在跑就没有"首次启动"可试)。
+                    record.previous_version = Some(old);
+                    record.probation = was_running;
+                    record.last_rollback = None;
+                }
+                // current_version 最后才写;它之前的任何一步失败,调用方会撤回刚落位的包,旧版本不受影响
+                record.current_version = version;
+                let removed = record.prune_versions();
+                self.registry.save(&record)?;
+                Ok(removed)
+            })();
+            match removed_versions {
+                Ok(removed) => Ok(removed),
+                Err(e) => {
+                    let _ = fs::remove_dir_all(&final_dir);
+                    Err(e)
+                }
             }
-            // current_version 最后才写;它之前的任何一步失败,调用方会撤回刚落位的包,旧版本不受影响
-            record.current_version = version;
-            let removed = record.prune_versions();
-            self.registry.save(&record)?;
-            Ok(removed)
         })();
-        let removed_versions = match removed_versions {
+        let removed_versions = match placement {
             Ok(removed) => removed,
             Err(e) => {
-                let _ = fs::remove_dir_all(&final_dir);
+                // 升级动作没有完成,旧版本仍是 current:原本在跑的就让它继续跑,
+                // 不能因为一次失败的升级把用户的应用悄悄停在那里。
+                if was_running {
+                    let _ = self.start_locked(&id);
+                }
                 return Err(e);
             }
         };
@@ -2891,14 +2905,18 @@ source = "web/"
         assert_eq!(note.from, Version::new(1, 1, 0));
         assert_eq!(note.to, Version::new(1, 0, 0));
         assert_eq!(record.versions.len(), 1);
-        assert!(
-            !rig.manager
-                .registry
-                .paths()
-                .package_dir(&app, &Version::new(1, 1, 0))
-                .exists(),
-            "被换下的 1.1.0 包目录已清"
-        );
+        // 回滚先落记录、后删被换下版本的包目录(崩溃安全的顺序),所以读到记录时目录可能还在:
+        // 轮询等它消失,不能立刻断言(否则并行负载下偶发失败)。
+        let replaced = rig
+            .manager
+            .registry
+            .paths()
+            .package_dir(&app, &Version::new(1, 1, 0));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while replaced.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!replaced.exists(), "被换下的 1.1.0 包目录已清");
         wait_for(&rig, &app, 15, is_running);
         let events = drain(&mut rx);
         assert!(
@@ -3023,6 +3041,124 @@ source = "web/"
         assert!(note.automatic);
         assert!(note.reason.contains("更高权限"), "{}", note.reason);
         assert!(matches!(record.observed, ObservedState::Failed { .. }));
+    }
+
+    /// 升级在"停掉旧版本之后"失败(这里用只读的包目录让 rename 失败):原本在跑的旧版本必须被拉回来,
+    /// 不能让一次失败的升级把应用悄悄停在那里。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_upgrade_leaves_a_running_app_running() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = rig().await;
+        let a = id("excalidraw");
+        let v1 = write_app(
+            &rig.src_dir("v1"),
+            "excalidraw",
+            "1.0.0",
+            "",
+            "<h1>old</h1>",
+        );
+        rig.install(&v1).unwrap();
+        rig.manager.start(&a).unwrap();
+        let package_root = rig
+            .manager
+            .registry
+            .paths()
+            .package_dir(&a, &Version::new(1, 0, 0))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let restore = |mode| {
+            let mut perms = fs::metadata(&package_root).unwrap().permissions();
+            perms.set_mode(mode);
+            fs::set_permissions(&package_root, perms).unwrap();
+        };
+        restore(0o500);
+        let v2 = write_app(
+            &rig.src_dir("v2"),
+            "excalidraw",
+            "1.1.0",
+            "",
+            "<h1>new</h1>",
+        );
+        let result = rig.install(&v2);
+        restore(0o700);
+        assert!(result.is_err(), "rename 进只读目录应当失败");
+        let record = rig.manager.registry.load(&a).unwrap().unwrap();
+        assert_eq!(
+            record.current_version,
+            Version::new(1, 0, 0),
+            "旧版本仍是 current"
+        );
+        assert_eq!(record.desired, DesiredState::Running);
+        assert_eq!(record.observed, ObservedState::Running, "旧版本被拉回来了");
+        assert_eq!(record.previous_version, None);
+    }
+
+    /// 自动回滚线程拿到锁之后必须**重新核对**再动手(Review Focus 2)。确定性地制造"线程已阻塞在 `guard()`、
+    /// 持锁方改了状态"的窗口:测试线程先占住锁,调用 `spawn_auto_rollback`,占锁期间把应用改成 `Stopped`
+    /// (用户先动手),放锁后线程必须放弃。对照组:占锁期间什么都不改 → 线程照常回滚(证明线程本身有效)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_auto_rollback_thread_rechecks_after_it_gets_the_lock() {
+        for user_acted_first in [true, false] {
+            let rig = rig().await;
+            let a = id("excalidraw");
+            rig.install(&write_app(
+                &rig.src_dir("v1"),
+                "excalidraw",
+                "1.0.0",
+                "",
+                "<h1>1</h1>",
+            ))
+            .unwrap();
+            rig.install(&write_app(
+                &rig.src_dir("v2"),
+                "excalidraw",
+                "1.1.0",
+                "",
+                "<h1>2</h1>",
+            ))
+            .unwrap();
+            let failed_version = Version::new(1, 1, 0);
+            // 构造"升级后试用期内、新版本已 Failed"。
+            let mut record = rig.manager.registry.load(&a).unwrap().unwrap();
+            record.probation = true;
+            record.observed = ObservedState::Failed {
+                reason: "起不来".into(),
+                retryable: false,
+            };
+            rig.manager.registry.save(&record).unwrap();
+
+            let guard = rig.manager.core.guard();
+            rig.manager
+                .core
+                .spawn_auto_rollback(a.clone(), failed_version);
+            std::thread::sleep(Duration::from_millis(300)); // 线程此刻阻塞在 guard() 上
+            if user_acted_first {
+                let mut record = rig.manager.registry.load(&a).unwrap().unwrap();
+                record.observed = ObservedState::Stopped;
+                rig.manager.registry.save(&record).unwrap();
+            }
+            drop(guard);
+            std::thread::sleep(Duration::from_millis(600));
+
+            let record = rig.manager.registry.load(&a).unwrap().unwrap();
+            if user_acted_first {
+                assert_eq!(
+                    record.current_version, failed_version,
+                    "用户先动手 → 放弃回滚"
+                );
+                assert_eq!(record.last_rollback, None);
+                assert!(record.probation, "放弃时不动记录");
+            } else {
+                assert_eq!(
+                    record.current_version,
+                    Version::new(1, 0, 0),
+                    "对照组:线程应当回滚"
+                );
+                assert!(record.last_rollback.is_some_and(|n| n.automatic));
+            }
+        }
     }
 
     /// Review Focus 2:用户先动手(stop)后,自动回滚线程核对发现状态变了 → 放弃。
