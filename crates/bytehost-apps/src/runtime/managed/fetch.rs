@@ -77,6 +77,15 @@ pub fn curl_args(url: &str, dest: &Path, max_bytes: u64) -> Vec<OsString> {
         "--show-error".into(),
         "--max-filesize".into(),
         max_bytes.to_string().into(),
+        // 卡住的服务器不能把调用方永远挂住:连不上 20s 放弃;持续低于 1 KiB/s 达 30s 放弃;整体上限 1h。
+        "--connect-timeout".into(),
+        "20".into(),
+        "--speed-limit".into(),
+        "1024".into(),
+        "--speed-time".into(),
+        "30".into(),
+        "--max-time".into(),
+        "3600".into(),
         "-w".into(),
         "%{url_effective}".into(),
         "-o".into(),
@@ -183,6 +192,10 @@ fn curl_content_length(url: &str) -> Option<u64> {
             "--location",
             "--silent",
             "--head",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "20",
         ])
         .arg(url)
         .output()
@@ -284,6 +297,11 @@ mod tests {
         assert!(s.iter().any(|a| a == "--location"));
         assert!(s.windows(2).any(|w| w == ["--max-filesize", "209715200"]));
         assert!(s.windows(2).any(|w| w == ["-w", "%{url_effective}"]));
+        // 卡住的服务器必须有超时/低速中止,否则下载会永远挂住。
+        assert!(s.windows(2).any(|w| w == ["--connect-timeout", "20"]));
+        assert!(s.windows(2).any(|w| w == ["--speed-limit", "1024"]));
+        assert!(s.windows(2).any(|w| w == ["--speed-time", "30"]));
+        assert!(s.windows(2).any(|w| w == ["--max-time", "3600"]));
         assert!(s.windows(2).any(|w| w == ["-o", "/tmp/out.bin"]));
         // URL 不在参数里,由调用方单独 .arg(url) 追加。
         assert!(!s.iter().any(|a| a.contains("example.com")));

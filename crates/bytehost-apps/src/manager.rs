@@ -888,6 +888,8 @@ impl Core {
             &source::default_limits(),
             &*self.fetcher,
             &downloads,
+            // 宿主关闭(dozerd 退出)时中断进行中的下载,不让一次卡住的下载拖住退出。
+            &self.closed,
         )
         .map_err(manager_from_stage)
         .and_then(|staged| {
@@ -999,6 +1001,7 @@ impl Core {
                 &source::default_limits(),
                 &*self.fetcher,
                 downloads,
+                &self.closed,
             )
             .map(|s| s.info);
         };
@@ -1021,7 +1024,7 @@ impl Core {
             return Ok(plan_info.clone());
         }
         // 缓存没有/坏了:重新下载并严格核对 sha256。
-        let got = source::download_to_cache(url, &*self.fetcher, downloads)?;
+        let got = source::download_to_cache(url, &*self.fetcher, downloads, &self.closed)?;
         if got.sha256 != want {
             source::discard_cached_archive(downloads, &got.sha256);
             return Err(StageError::Source(source::SourceError::Sha256Mismatch {
@@ -1056,6 +1059,14 @@ impl Core {
         let id = package.manifest.id.clone();
         let version = package.manifest.version;
         let policy = source::policy_for(source);
+        // 服务端按来源推导信任:批准的计划若声称比该来源允许的更宽松(手工构造的请求),拒绝。
+        // 只在出计划时套 `effective` 不够——`verify` 比的是同一份值,自说自话的计划会自己通过。
+        let claimed = (approved.plan().provenance, approved.plan().trust);
+        if source::effective(claimed, &policy) != claimed {
+            return Err(ManagerError::SourceNotAllowed(
+                "批准的计划声称的来源/信任级别比该来源允许的更宽松".into(),
+            ));
+        }
         if policy.static_only && !matches!(package.manifest.runtime, Runtime::StaticWeb { .. }) {
             return Err(ManagerError::SourceNotAllowed(
                 "网络来源只能安装静态应用".into(),
@@ -4199,6 +4210,95 @@ source = "web/"
             Err(ManagerError::SourceNotAllowed(_))
         ));
         assert!(downloads_is_empty(&rig));
+        assert_no_leftovers(&rig);
+    }
+
+    /// 手工构造的 `Install`(跳过 `Plan`):批准的计划把 URL 来源自称成 `Local`/`Trusted`。
+    /// `verify` 比的是同一份自称值,不挡它——必须由安装阶段按来源重新推导后拒绝。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_install_cannot_claim_more_trust_than_its_source_allows() {
+        let zip = static_app_zip("1.0.0", "A");
+        let fetcher = FakeFetcher::ok(zip);
+        let rig = rig_with_fetcher(fetcher).await;
+        let source = AppSource::Url {
+            url: "https://example.com/a.zip".into(),
+            sha256: None,
+        };
+        let mut plan = rig
+            .manager
+            .install_plan(&source, Provenance::Local, TrustLevel::Trusted)
+            .unwrap();
+        assert_eq!(plan.trust, TrustLevel::Untrusted, "出计划时已被收紧");
+        plan.provenance = Provenance::Local;
+        plan.trust = TrustLevel::Trusted;
+        let approved = plan.approve(crate::plan::Approval {
+            approver: "forged".into(),
+            approved_ms: 1,
+        });
+        let err = rig.manager.install(&approved, &source, 100).unwrap_err();
+        assert!(matches!(err, ManagerError::SourceNotAllowed(_)), "{err:?}");
+        assert!(rig.manager.list().unwrap().is_empty(), "什么都没装上");
+        assert_no_leftovers(&rig);
+    }
+
+    /// 手工构造的 `Install` 绕过 `Plan` 阶段的静态限制:拿一份进程型应用的本机计划,把来源披露改成 URL。
+    /// 安装阶段自己必须再挡一次(深度防御)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_install_phase_enforces_static_only_for_url_sources_too() {
+        let rig_tmp = tempfile::tempdir().unwrap();
+        let py_src = write_py_app(
+            &rig_tmp.path().join("py"),
+            "pypkg",
+            "1.0.0",
+            "print('hi')\n",
+        );
+        let AppSource::LocalDir { path: py_dir } = &py_src else {
+            panic!("write_py_app 应给本机目录")
+        };
+        let zip_path = rig_tmp.path().join("p.zip");
+        let manifest = fs::read(py_dir.join("manifest.toml")).unwrap();
+        let server = fs::read(py_dir.join("server.py")).unwrap();
+        make_zip(
+            &zip_path,
+            &[("manifest.toml", &manifest), ("server.py", &server)],
+        );
+        let zip = fs::read(&zip_path).unwrap();
+        let fetcher = FakeFetcher::ok(zip.clone());
+        let rig = rig_with_fetcher(fetcher).await;
+
+        // 本机目录能给出进程型应用的合法计划;把它的来源披露伪造成 URL 并标成网络来源。
+        let mut plan = rig
+            .manager
+            .install_plan(&py_src, Provenance::Local, TrustLevel::Trusted)
+            .unwrap();
+        plan.provenance = Provenance::ThirdParty;
+        plan.trust = TrustLevel::Untrusted;
+        plan.source_info = SourceInfo {
+            kind: "url".into(),
+            display: "https://example.com/p.zip".into(),
+            archive_sha256: Some(crate::digest::sha256_hex(&zip)),
+            archive_bytes: Some(zip.len() as u64),
+            effective_host: Some("example.com".into()),
+            pinned: false,
+            stripped_top_dir: None,
+        };
+        let approved = plan.approve(crate::plan::Approval {
+            approver: "forged".into(),
+            approved_ms: 1,
+        });
+        let url_source = AppSource::Url {
+            url: "https://example.com/p.zip".into(),
+            sha256: None,
+        };
+        let err = rig
+            .manager
+            .install(&approved, &url_source, 100)
+            .unwrap_err();
+        assert!(matches!(err, ManagerError::SourceNotAllowed(_)), "{err:?}");
+        assert!(
+            rig.manager.list().unwrap().is_empty(),
+            "进程型应用不得经 URL 装上"
+        );
         assert_no_leftovers(&rig);
     }
 

@@ -202,6 +202,7 @@ fn fold(segs: &[String]) -> String {
 }
 
 /// 收集到的原始条目(名字 + 类型 + 声明的未压缩大小)。
+#[derive(Debug)]
 struct RawEntry {
     name: String,
     kind: EntryKind,
@@ -493,59 +494,77 @@ fn extract_zip(
     })
 }
 
+/// tar 的第一遍:只读条目头,**每读到一个头就立刻按限制拒绝**(条目数、单文件声明大小、累计声明大小)。
+/// 扫描 tar 必须把前一个条目的数据流"读过去"才能到下一个头(gzip 流没法 seek),所以不能等扫完再检查:
+/// 压缩比极高的炸弹会让这一遍白白解压几十 GB。声明大小可以说谎,但说谎只会让扫描**更短**
+/// (按声明大小跳过),不会更长。
+fn scan_tar_entries<R: Read>(reader: R, limits: &Limits) -> Result<Vec<RawEntry>, ArchiveError> {
+    let mut tar = tar::Archive::new(reader);
+    let mut raws = Vec::new();
+    let mut declared_total = 0u64;
+    let entries = tar
+        .entries()
+        .map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
+        let header = entry.header();
+        let ty = header.entry_type();
+        let raw = entry
+            .path()
+            .map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
+        let name = match raw.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                return Err(ArchiveError::UnsafeEntry {
+                    name: raw.to_string_lossy().into_owned(),
+                    why: "非 UTF-8 文件名",
+                });
+            }
+        };
+        if ty.is_symlink() || ty.is_hard_link() {
+            return Err(ArchiveError::UnsafeEntry {
+                name,
+                why: "链接条目",
+            });
+        }
+        let (kind, declared) = if ty.is_dir() {
+            (EntryKind::Dir, 0)
+        } else if ty.is_file() {
+            (EntryKind::File, header.size().unwrap_or(0))
+        } else {
+            return Err(ArchiveError::UnsafeEntry {
+                name,
+                why: "非常规文件类型(设备/FIFO/其它)",
+            });
+        };
+        if raws.len() >= limits.max_entries {
+            return Err(ArchiveError::TooLarge("entries"));
+        }
+        if declared > limits.max_file {
+            return Err(ArchiveError::TooLarge("file"));
+        }
+        declared_total = declared_total.saturating_add(declared);
+        if declared_total > limits.max_total {
+            return Err(ArchiveError::TooLarge("total"));
+        }
+        raws.push(RawEntry {
+            name,
+            kind,
+            declared,
+        });
+    }
+    Ok(raws)
+}
+
 fn extract_targz(
     archive: &Path,
     into: &Path,
     limits: &Limits,
 ) -> Result<ExtractReport, ArchiveError> {
-    // 第一遍:收集元数据并做全部静态校验。
+    // 第一遍:收集元数据并做全部静态校验(逐头提前拒绝,见 `scan_tar_entries`)。
     let raws = {
         let file = fs::File::open(archive)?;
-        let gz = flate2::read::GzDecoder::new(file);
-        let mut tar = tar::Archive::new(gz);
-        let mut raws = Vec::new();
-        let entries = tar
-            .entries()
-            .map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
-            let header = entry.header();
-            let ty = header.entry_type();
-            let raw = entry
-                .path()
-                .map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
-            let name = match raw.to_str() {
-                Some(s) => s.to_string(),
-                None => {
-                    return Err(ArchiveError::UnsafeEntry {
-                        name: raw.to_string_lossy().into_owned(),
-                        why: "非 UTF-8 文件名",
-                    });
-                }
-            };
-            if ty.is_symlink() || ty.is_hard_link() {
-                return Err(ArchiveError::UnsafeEntry {
-                    name,
-                    why: "链接条目",
-                });
-            }
-            let (kind, declared) = if ty.is_dir() {
-                (EntryKind::Dir, 0)
-            } else if ty.is_file() {
-                (EntryKind::File, header.size().unwrap_or(0))
-            } else {
-                return Err(ArchiveError::UnsafeEntry {
-                    name,
-                    why: "非常规文件类型(设备/FIFO/其它)",
-                });
-            };
-            raws.push(RawEntry {
-                name,
-                kind,
-                declared,
-            });
-        }
-        raws
+        scan_tar_entries(flate2::read::GzDecoder::new(file), limits)?
     };
     let (planned, stripped) = plan_entries(&raws, limits)?;
 
@@ -887,6 +906,83 @@ mod tests {
                 "{kind:?}: {err:?}"
             );
         }
+    }
+
+    /// 计数读取器:记下上游被读走了多少字节。
+    struct Counting<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    /// tar 炸弹必须在条目头处就被拒绝,而不是把声明的几十 GB 数据读过去之后才拒绝。
+    /// 用一个"头声明 100 MiB、后面真有 100 MiB 零"的流,上限设 1 MiB:扫描应当只读走头那几百字节。
+    #[test]
+    fn a_tar_bomb_is_refused_at_its_header_without_reading_the_body() {
+        for (label, limits) in [
+            (
+                "file",
+                Limits {
+                    max_file: 1 << 20,
+                    ..Limits::default()
+                },
+            ),
+            (
+                "total",
+                Limits {
+                    max_total: 1 << 20,
+                    ..Limits::default()
+                },
+            ),
+        ] {
+            let size: u64 = 100 << 20;
+            let mut h = tar::Header::new_gnu();
+            h.set_path("manifest.toml").unwrap();
+            h.set_size(size);
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_cksum();
+            let read = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let stream = Counting {
+                inner: io::Cursor::new(h.as_bytes().to_vec())
+                    .chain(io::repeat(0).take(size + 1024)),
+                read: read.clone(),
+            };
+            let err = scan_tar_entries(stream, &limits).unwrap_err();
+            assert!(matches!(err, ArchiveError::TooLarge(_)), "{label}: {err:?}");
+            assert!(
+                read.get() < 64 * 1024,
+                "{label}: 拒绝前读走了 {} 字节(应只读头)",
+                read.get()
+            );
+        }
+    }
+
+    #[test]
+    fn a_tar_with_too_many_entries_is_refused_while_scanning_headers() {
+        let mut builder = tar::Builder::new(Vec::new());
+        for i in 0..10 {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(format!("f{i}")).unwrap();
+            h.set_size(0);
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_cksum();
+            builder.append(&h, io::empty()).unwrap();
+        }
+        let bytes = builder.into_inner().unwrap();
+        let limits = Limits {
+            max_entries: 3,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            scan_tar_entries(io::Cursor::new(bytes), &limits),
+            Err(ArchiveError::TooLarge("entries"))
+        ));
     }
 
     #[test]

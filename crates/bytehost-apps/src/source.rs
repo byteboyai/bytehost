@@ -214,6 +214,7 @@ pub fn stage_source(
     limits: &Limits,
     fetcher: &dyn Fetcher,
     downloads: &Path,
+    cancel: &AtomicBool,
 ) -> Result<StagedSource, StageError> {
     match source {
         AppSource::LocalDir { path } => {
@@ -244,9 +245,15 @@ pub fn stage_source(
                 ),
             })
         }
-        AppSource::Url { url, sha256 } => {
-            stage_url(url, sha256.as_deref(), staging, limits, fetcher, downloads)
-        }
+        AppSource::Url { url, sha256 } => stage_url(
+            url,
+            sha256.as_deref(),
+            staging,
+            limits,
+            fetcher,
+            downloads,
+            cancel,
+        ),
     }
 }
 
@@ -270,6 +277,7 @@ fn stage_url(
     limits: &Limits,
     fetcher: &dyn Fetcher,
     downloads: &Path,
+    cancel: &AtomicBool,
 ) -> Result<StagedSource, StageError> {
     let parsed = validate_url(url).map_err(StageError::Source)?;
     // 期望 sha256 格式先校验——格式错误时**不发起下载**(省一次网络往返)。
@@ -280,10 +288,9 @@ fn stage_url(
 
     fs::create_dir_all(downloads).map_err(StageError::Io)?;
     let part = downloads.join(format!("{}.part", uuid::Uuid::new_v4().simple()));
-    let cancel = AtomicBool::new(false);
     let mut no_progress = |_: u64, _: Option<u64>| {};
     let fetched = fetcher
-        .fetch_meta(url, &part, MAX_ARCHIVE_BYTES, &mut no_progress, &cancel)
+        .fetch_meta(url, &part, MAX_ARCHIVE_BYTES, &mut no_progress, cancel)
         .map_err(|e| {
             // 失败/取消:不留半成品。
             let _ = fs::remove_file(&part);
@@ -393,14 +400,14 @@ pub fn download_to_cache(
     url: &str,
     fetcher: &dyn Fetcher,
     downloads: &Path,
+    cancel: &AtomicBool,
 ) -> Result<Downloaded, StageError> {
     let parsed = validate_url(url).map_err(StageError::Source)?;
     fs::create_dir_all(downloads).map_err(StageError::Io)?;
     let part = downloads.join(format!("{}.part", uuid::Uuid::new_v4().simple()));
-    let cancel = AtomicBool::new(false);
     let mut no_progress = |_: u64, _: Option<u64>| {};
     let fetched = fetcher
-        .fetch_meta(url, &part, MAX_ARCHIVE_BYTES, &mut no_progress, &cancel)
+        .fetch_meta(url, &part, MAX_ARCHIVE_BYTES, &mut no_progress, cancel)
         .map_err(|e| {
             let _ = fs::remove_file(&part);
             StageError::Io(e)
@@ -619,5 +626,61 @@ mod tests {
             effective((Provenance::Local, TrustLevel::Trusted), &dir),
             (Provenance::Local, TrustLevel::Trusted)
         );
+    }
+
+    /// 卡住的服务器:`fetch_meta` 一直不返回,直到 `cancel` 被置位。
+    struct StalledFetcher;
+    impl Fetcher for StalledFetcher {
+        fn fetch(
+            &self,
+            _url: &str,
+            _dest: &Path,
+            _on_progress: &mut dyn FnMut(u64, Option<u64>),
+            cancel: &AtomicBool,
+        ) -> io::Result<()> {
+            while !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(io::Error::new(io::ErrorKind::Interrupted, "下载已取消"))
+        }
+    }
+
+    /// 取消标志必须一路传到下载器:宿主关闭时卡住的下载能被打断,且不留 `.part`。
+    #[test]
+    fn a_stalled_download_is_interrupted_by_the_cancel_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloads = tmp.path().join("downloads");
+        let staging = tmp.path().join("staging");
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let setter = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let started = std::time::Instant::now();
+        let err = stage_source(
+            &AppSource::Url {
+                url: "https://example.com/a.zip".into(),
+                sha256: None,
+            },
+            &staging,
+            &Limits::default(),
+            &StalledFetcher,
+            &downloads,
+            &cancel,
+        )
+        .unwrap_err();
+        setter.join().unwrap();
+        assert!(
+            matches!(&err, StageError::Io(e) if e.kind() == io::ErrorKind::Interrupted),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let leftovers: Vec<_> = fs::read_dir(&downloads)
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "不该留下半成品: {leftovers:?}");
     }
 }
