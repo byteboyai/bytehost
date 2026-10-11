@@ -9,7 +9,12 @@
 pub mod id;
 pub mod layout;
 pub mod registry;
+pub mod request;
 
 pub use id::{PanelId, PanelIdError, PanelInstanceId, ScopeId, ScopeIdError, SurfaceSlot};
 pub use layout::{LAYOUT_SCHEMA_VERSION, Layout, LayoutError, Rail};
 pub use registry::{CatalogError, PanelCatalog, PanelMeta};
+pub use request::{
+    BackgroundExecutor, Emitter, Generation, RequestKey, RequestToken, RequestTracker,
+    ResultEnvelope, run_scoped,
+};
