@@ -68,6 +68,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytehost-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bytehost-panel"
 version = "0.1.0"
 dependencies = [

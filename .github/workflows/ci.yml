@@ -34,3 +34,6 @@ jobs:
 
       - name: 依赖门禁(去产品 / 去界面框架 / 去平台 webview 库)
         run: bash scripts/check-deps.sh
+
+      - name: 依赖门禁变异测试(注入产品依赖/界面框架必须失败)
+        run: bash scripts/check-deps.sh --self-test
