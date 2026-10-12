@@ -36,6 +36,8 @@ pub mod runtime;
 pub mod runtime_version;
 #[cfg(feature = "server")]
 pub mod service;
+#[cfg(all(feature = "server", unix))]
+pub mod service_lock;
 #[cfg(feature = "server")]
 pub mod source;
 pub mod state;

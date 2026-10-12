@@ -30,6 +30,7 @@ use bytehost_apps::registry::UninstallMode;
 use bytehost_apps::runtime::managed::fetch::FetchMeta;
 use bytehost_apps::runtime::managed::{Fetcher, RuntimeManager};
 use bytehost_apps::service::AppService;
+use bytehost_apps::service_lock::ServiceLock;
 use bytehost_apps::state::ObservedState;
 
 fn id(s: &str) -> AppId {
@@ -1222,7 +1223,8 @@ impl Fetcher for TestFetcher {
 async fn start_with_fetcher(root: &Path, fetcher: Arc<dyn Fetcher>) -> Arc<AppService> {
     let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
     let rm = Arc::new(RuntimeManager::new(root.join("runtimes")));
-    AppService::finish_start_with_sources(root, gateway, rm, None, Some(fetcher)).await
+    let lock = ServiceLock::acquire(root).unwrap();
+    AppService::finish_start_with_sources(root, lock, gateway, rm, None, Some(fetcher)).await
 }
 
 /// 用给定来源安装一个应用(受理与安装都与是否压缩包/URL 无关)。

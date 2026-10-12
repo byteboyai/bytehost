@@ -21,6 +21,7 @@ use crate::runtime::managed::{
     ChainResolver, Fetcher, ManagedResolver, RtError, RuntimeManager, RuntimeStore,
 };
 use crate::runtime::{SystemResolver, SystemRunner, probe_all};
+use crate::service_lock::{LockError, ServiceLock};
 
 enum State {
     Ready {
@@ -33,6 +34,9 @@ enum State {
 
 pub struct AppService {
     state: State,
+    /// 同一数据根的服务所有者锁,`Ready` 期间一直持有;`unavailable` 或 `shutdown` 后取走释放
+    /// (取出而非仅 drop,是为了让同一进程内"停服务 → 再起服务"这类重启路径能重新拿到锁)。
+    lock: std::sync::Mutex<Option<ServiceLock>>,
 }
 
 impl AppService {
@@ -40,15 +44,20 @@ impl AppService {
     pub fn unavailable(reason: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
             state: State::Unavailable(reason.into()),
+            lock: std::sync::Mutex::new(None),
         })
     }
 
     /// 用**持久化的端口**启动。首次运行(没有 `<root>/gateway.json`)随机选端口、**绑定成功之后**才写盘;
     /// 选中的端口恰好被占就换一个再试(此时还没有任何应用数据绑定在旧端口上)。永不失败。
     pub async fn start(root: &Path) -> Arc<Self> {
+        let lock = match Self::acquire_lock(root) {
+            Ok(lock) => lock,
+            Err(svc) => return svc,
+        };
         match load_port(root) {
-            Ok(Some(port)) => Self::start_with(root, GatewayConfig { port }).await,
-            Ok(None) => Self::first_run(root, pick_port).await,
+            Ok(Some(port)) => Self::start_with_locked(root, lock, GatewayConfig { port }).await,
+            Ok(None) => Self::first_run(root, lock, pick_port).await,
             Err(e) => {
                 tracing::error!(target: "bytehost::service", error = %e, "读取 gateway 端口失败,应用宿主不可用");
                 Self::unavailable(format!("应用宿主不可用:{e}"))
@@ -56,10 +65,30 @@ impl AppService {
         }
     }
 
+    /// 拿同一数据根的服务所有者锁。拿不到(同进程双启动或另一个进程持有)时返回 `Unavailable` 服务
+    /// (**绝不**去动第一个所有者正在管的 gateway/进程,也不留下任何写入)。
+    fn acquire_lock(root: &Path) -> Result<ServiceLock, Arc<Self>> {
+        match ServiceLock::acquire(root) {
+            Ok(lock) => Ok(lock),
+            Err(LockError::AlreadyOwned) => {
+                tracing::warn!(target: "bytehost::service", root = %root.display(), "该数据根已有应用服务在运行,本次不可用");
+                Err(Self::unavailable(
+                    "应用宿主不可用:该数据根已有一个应用服务在运行",
+                ))
+            }
+            Err(LockError::Io(e)) => {
+                tracing::error!(target: "bytehost::service", error = %e, "服务锁不可用,应用宿主不可用");
+                Err(Self::unavailable(format!(
+                    "应用宿主不可用:服务锁不可用:{e}"
+                )))
+            }
+        }
+    }
+
     /// 首次运行选端口的重试次数(范围 12768 个端口,连续占用 5 个几乎不可能,真发生就说明环境有问题)。
     const FIRST_RUN_ATTEMPTS: usize = 5;
 
-    async fn first_run(root: &Path, mut pick: impl FnMut() -> u16) -> Arc<Self> {
+    async fn first_run(root: &Path, lock: ServiceLock, mut pick: impl FnMut() -> u16) -> Arc<Self> {
         for _ in 0..Self::FIRST_RUN_ATTEMPTS {
             let port = pick();
             match Gateway::start(GatewayConfig { port }).await {
@@ -70,7 +99,7 @@ impl AppService {
                         tracing::error!(target: "bytehost::service", error = %e, "gateway 端口写盘失败,应用宿主不可用");
                         return Self::unavailable(format!("应用宿主不可用:端口无法保存:{e}"));
                     }
-                    return Self::finish_start(root, Arc::new(gateway)).await;
+                    return Self::finish_start(root, lock, Arc::new(gateway)).await;
                 }
                 Err(GatewayError::PortInUse(p)) => {
                     tracing::warn!(target: "bytehost::service", port = p, "首次选的端口被占用,换一个重试");
@@ -89,6 +118,15 @@ impl AppService {
 
     /// 用给定的 gateway 配置启动(测试用 `port: 0`)。永不失败。
     pub async fn start_with(root: &Path, config: GatewayConfig) -> Arc<Self> {
+        let lock = match Self::acquire_lock(root) {
+            Ok(lock) => lock,
+            Err(svc) => return svc,
+        };
+        Self::start_with_locked(root, lock, config).await
+    }
+
+    /// `start_with` 拿到锁之后的实现(让 `start` 能在不二次抢锁的前提下复用同一条路径)。
+    async fn start_with_locked(root: &Path, lock: ServiceLock, config: GatewayConfig) -> Arc<Self> {
         let gateway = match Gateway::start(config).await {
             Ok(g) => Arc::new(g),
             Err(e) => {
@@ -96,7 +134,7 @@ impl AppService {
                 return Self::unavailable(format!("应用宿主不可用:{e}"));
             }
         };
-        Self::finish_start(root, gateway).await
+        Self::finish_start(root, lock, gateway).await
     }
 
     /// (仅测试)调小周期健康检查参数与重启退避,让卡死/崩溃的进程在秒级被观察到;
@@ -108,6 +146,10 @@ impl AppService {
         config: GatewayConfig,
         monitor: MonitorConfig,
     ) -> Arc<Self> {
+        let lock = match Self::acquire_lock(root) {
+            Ok(lock) => lock,
+            Err(svc) => return svc,
+        };
         let gateway = match Gateway::start(config).await {
             Ok(g) => Arc::new(g),
             Err(e) => {
@@ -116,12 +158,12 @@ impl AppService {
             }
         };
         let runtime_manager = Arc::new(RuntimeManager::new(root.join("runtimes")));
-        Self::finish_start_with(root, gateway, runtime_manager, Some(monitor)).await
+        Self::finish_start_with(root, lock, gateway, runtime_manager, Some(monitor)).await
     }
 
-    async fn finish_start(root: &Path, gateway: Arc<Gateway>) -> Arc<Self> {
+    async fn finish_start(root: &Path, lock: ServiceLock, gateway: Arc<Gateway>) -> Arc<Self> {
         let runtime_manager = Arc::new(RuntimeManager::new(root.join("runtimes")));
-        Self::finish_start_with(root, gateway, runtime_manager, None).await
+        Self::finish_start_with(root, lock, gateway, runtime_manager, None).await
     }
 
     /// 真正的构造主体:`RuntimeManager` 可注入(测试用假 `Fetcher`);
@@ -129,17 +171,20 @@ impl AppService {
     /// `app_fetcher` 只有测试会给(注入假的来源下载器,替代真实的 `CurlFetcher`),生产为 `None`。
     async fn finish_start_with(
         root: &Path,
+        lock: ServiceLock,
         gateway: Arc<Gateway>,
         runtime_manager: Arc<RuntimeManager>,
         monitor: Option<MonitorConfig>,
     ) -> Arc<Self> {
-        Self::finish_start_with_sources(root, gateway, runtime_manager, monitor, None).await
+        Self::finish_start_with_sources(root, lock, gateway, runtime_manager, monitor, None).await
     }
 
     /// 同 `finish_start_with`,再允许注入应用**来源**的下载器(测试 URL 来源用,不落真实网络)。
+    /// **先经 [`Self::acquire_lock`] 拿到同一数据根的所有者锁再调用**,`lock` 在 `Ready` 期间一直持有。
     #[doc(hidden)]
     pub async fn finish_start_with_sources(
         root: &Path,
+        lock: ServiceLock,
         gateway: Arc<Gateway>,
         runtime_manager: Arc<RuntimeManager>,
         monitor: Option<MonitorConfig>,
@@ -189,6 +234,7 @@ impl AppService {
                 gateway,
                 runtime_manager,
             },
+            lock: std::sync::Mutex::new(Some(lock)),
         })
     }
 
@@ -349,6 +395,7 @@ impl AppService {
     }
 
     /// dozerd 退出前调用(幂等):撤下站点、观察态落成 `Stopped`、停 gateway;`desired` 保留。
+    /// 收尾完成后释放同一数据根的服务所有者锁(让下一次启动能重新拿到)。
     pub async fn shutdown(&self) {
         let State::Ready {
             manager,
@@ -369,6 +416,17 @@ impl AppService {
             }
         }
         gateway.stop().await;
+        self.release_lock();
+    }
+
+    /// 取走并释放服务所有者锁(幂等)。`shutdown` 与"停服务"类管理动作都经它,保证锁与 gateway 生命周期一致。
+    fn release_lock(&self) {
+        let taken = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(taken);
     }
 }
 
@@ -629,7 +687,11 @@ source = "web/"
         let svc =
             AppService::start_with(&blocker.join("bytehost"), GatewayConfig { port: 0 }).await;
         let err = svc.handle(AppRequest::List).await.unwrap_err().message;
-        assert!(err.contains("应用目录"), "{err}");
+        // 数据根不可用(目录建不出来):服务一律"不可用",在动手之前就报清楚——现在先落在这把
+        // 服务所有者锁上(`<root>` 与锁、与 Registry 同一位置,建不出目录时先卡在锁),不再走到
+        // Registry 的"应用目录打不开";不管是哪一处,契约都是"不可用",绝不静默当成功。
+        assert!(err.contains("应用宿主不可用"), "{err}");
+        assert!(err.contains("服务锁") || err.contains("应用目录"), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -724,6 +786,55 @@ source = "web/"
         );
         assert_eq!(fetch(&url, "runner"), (200, "R".to_string()));
         second.shutdown().await;
+    }
+
+    /// 规格 §6.1:同一数据根只允许一个服务所有者。第二个起的服务必须变"不可用"——**不能**去动第一个
+    /// 正在管的 gateway/应用,也不能把第一个停掉;第一个释放锁(退出)之后,新服务才能接管。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_service_on_the_same_root_is_unavailable_and_never_disturbs_the_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bytehost");
+        let first = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
+        install(
+            &first,
+            write_app(&tmp.path().join("src/run"), "runner", "R"),
+        )
+        .await;
+        first
+            .handle(AppRequest::Start { id: id("runner") })
+            .await
+            .unwrap();
+        let url = running_url(
+            first
+                .handle(AppRequest::LaunchUrl { id: id("runner") })
+                .await
+                .unwrap(),
+        );
+        assert_eq!(fetch(&url, "runner"), (200, "R".to_string()));
+
+        // 第二个同根服务:一律不可用。
+        let second = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
+        let failure = second.handle(AppRequest::List).await.unwrap_err();
+        assert_eq!(failure.kind, AppErrorKind::Unavailable, "{failure:?}");
+        assert!(failure.message.contains("已有一个应用服务"), "{failure}");
+        assert!(second.subscribe().is_none(), "不可用的服务无处订阅");
+
+        // 第一个**不受影响**:gateway 仍在、应用仍在跑。
+        assert!(!first.gateway_stopped());
+        assert_eq!(fetch(&url, "runner"), (200, "R".to_string()));
+        let AppReply::Apps { apps } = first.handle(AppRequest::List).await.unwrap() else {
+            panic!()
+        };
+        assert!(apps.iter().any(|a| a.id == id("runner") && a.url.is_some()));
+
+        // 第一个退出后释放锁,第三个才能接管。
+        first.shutdown().await;
+        let third = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
+        assert!(
+            third.handle(AppRequest::List).await.is_ok(),
+            "锁释放后可再起"
+        );
+        third.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -915,7 +1026,8 @@ source = "web/"
         let (_held, taken) = squat();
         let good = free_port();
         let mut picks = vec![taken, good].into_iter();
-        let svc = AppService::first_run(&root, move || picks.next().unwrap()).await;
+        let lock = crate::service_lock::ServiceLock::acquire(&root).unwrap();
+        let svc = AppService::first_run(&root, lock, move || picks.next().unwrap()).await;
         assert!(svc.handle(AppRequest::List).await.is_ok(), "服务可用");
         assert_eq!(persisted_port(&root), Some(good));
         svc.shutdown().await;
@@ -927,7 +1039,8 @@ source = "web/"
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("bytehost");
         let (_held, taken) = squat();
-        let svc = AppService::first_run(&root, move || taken).await;
+        let lock = crate::service_lock::ServiceLock::acquire(&root).unwrap();
+        let svc = AppService::first_run(&root, lock, move || taken).await;
         let failure = svc.handle(AppRequest::List).await.unwrap_err();
         assert_eq!(failure.kind, AppErrorKind::Unavailable);
         assert!(failure.message.contains("占用"), "{failure}");
@@ -938,10 +1051,12 @@ source = "web/"
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_first_run_is_unavailable_when_the_port_cannot_be_saved() {
         let tmp = tempfile::tempdir().unwrap();
-        let blocker = tmp.path().join("not-a-dir");
-        std::fs::write(&blocker, "x").unwrap();
+        let root = tmp.path().join("bytehost");
+        // 目录能建、锁能拿,但 `gateway.json` 处先建一个**目录**:原子改名会失败(写不进盘)。
+        std::fs::create_dir_all(root.join("gateway.json")).unwrap();
         let port = free_port();
-        let svc = AppService::first_run(&blocker.join("bytehost"), move || port).await;
+        let lock = crate::service_lock::ServiceLock::acquire(&root).unwrap();
+        let svc = AppService::first_run(&root, lock, move || port).await;
         let failure = svc.handle(AppRequest::List).await.unwrap_err();
         assert_eq!(failure.kind, AppErrorKind::Unavailable);
         assert!(failure.message.contains("无法保存"), "{failure}");
@@ -1341,7 +1456,8 @@ port_env = "APP_PORT"
             Arc::new(FakeUv::default()),
             pins,
         ));
-        AppService::finish_start_with(root, gateway, rm, None).await
+        let lock = crate::service_lock::ServiceLock::acquire(root).unwrap();
+        AppService::finish_start_with(root, lock, gateway, rm, None).await
     }
 
     fn node_pins(url: &str, sha: String) -> &'static [crate::runtime::managed::Pin] {
@@ -1649,7 +1765,8 @@ source = "web/"
     async fn start_with_source_fetcher(root: &Path, fetcher: Arc<dyn Fetcher>) -> Arc<AppService> {
         let gateway = Arc::new(Gateway::start(GatewayConfig { port: 0 }).await.unwrap());
         let rm = Arc::new(RuntimeManager::new(root.join("runtimes")));
-        AppService::finish_start_with_sources(root, gateway, rm, None, Some(fetcher)).await
+        let lock = crate::service_lock::ServiceLock::acquire(root).unwrap();
+        AppService::finish_start_with_sources(root, lock, gateway, rm, None, Some(fetcher)).await
     }
 
     /// 各新错误类别的线上映射:`SourceNotAllowed`/`Archive`/`Source` 的输入类问题都是 `Rejected`。
