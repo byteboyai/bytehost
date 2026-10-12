@@ -54,8 +54,19 @@ impl std::error::Error for LockError {
 /// 持有期间锁有效;`Drop` 关掉 fd 即释放(内核自动,崩溃亦然)。
 #[derive(Debug)]
 pub struct ServiceLock {
-    _file: File,
+    file: File,
     path: PathBuf,
+}
+
+impl Drop for ServiceLock {
+    fn drop(&mut self) {
+        // 显式解锁再关 fd:若这个 fd 的"打开文件描述"被并发的 fork 短暂共享过,单靠 close 可能不释放锁;
+        // 显式 `LOCK_UN` 把"本进程不再需要这把锁"这件事说清楚(close 仍会兜底)。
+        // SAFETY: 只操作这个已打开的 fd,不改文件内容。
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 impl ServiceLock {
@@ -85,7 +96,7 @@ impl ServiceLock {
             }
             return Err(LockError::Io(err));
         }
-        Ok(Self { _file: file, path })
+        Ok(Self { file, path })
     }
 
     /// 锁文件路径(测试断言用)。
@@ -98,8 +109,9 @@ impl ServiceLock {
 mod tests {
     use super::*;
 
-    /// 跨进程那个用例会 spawn 子进程;子进程会继承本进程当时打开的所有 fd,而 `flock` 锁随 fd 存续——
-    /// 并发跑时它可能"顺手"多留一份别的用例的锁 fd。给这些用例上一把测试内串行锁,避免这种互扰。
+    /// 跨进程那个用例会 spawn 子进程:`flock` 锁隶属于"打开文件描述",`fork` 到 `exec` 之间子进程短暂共享该 fd。
+    /// 真正的释放保障是 [`ServiceLock`] 的 `Drop` 里显式 `LOCK_UN`;这里再把这三个用例彼此串行,避免它们互相制造
+    /// "锁还没被显式放开"的窗口(与生产无关,纯粹是测试卫生)。
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
