@@ -17,6 +17,8 @@ serde_json.workspace = true
 # 消费方(如 dozer-app)的 iced 依赖树,改变其 iced_renderer 类型。
 iced = { version = "0.14", default-features = false, features = ["tokio"] }
 wry = "0.55.1"
+# 取 macOS 主版本号判数据存储清除是否受支持(纯策略 crate 不碰 objc2,宿主层来问)。
+objc2-foundation = "0.3"
 tokio.workspace = true
 
 [dev-dependencies]

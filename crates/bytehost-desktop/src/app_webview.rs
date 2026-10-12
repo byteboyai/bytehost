@@ -22,7 +22,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use bytehost_core::{LogicalRect, SurfaceSlot};
-use bytehost_webview::{AppIpc, AppOrigin, app_init_script, data_store_identifier, new_ipc_nonce};
+use bytehost_webview::{
+    AppIpc, AppOrigin, StoreRemovalOutcome, app_init_script, data_store_identifier, new_ipc_nonce,
+};
 use iced::{Task, window};
 use wry::WebViewBuilderExtDarwin;
 
@@ -179,6 +181,55 @@ pub fn app_handle_count() -> usize {
     with_app_handles(|h| h.len())
 }
 
+/// 当前 macOS 主版本号(纯策略 crate `bytehost-webview` 不碰 objc2,版本判断留给宿主层)。
+pub fn host_os_major() -> isize {
+    objc2_foundation::NSProcessInfo::processInfo()
+        .operatingSystemVersion()
+        .majorVersion
+}
+
+/// 清除一个应用的 WKWebsiteDataStore(卸载"连数据一起删"的浏览器数据部分)。
+///
+/// 规格 §6.4:数据清除队列复用 `bytehost-webview`;系统版本门槛也由它给出
+/// ([`bytehost_webview::supports_store_removal`])——wry **不检查**系统版本,macOS 12/13 上直接调
+/// `remove_data_store` 会因未知选择器让进程崩掉,所以这里先判断。
+///
+/// 结果**异步**回:`remove_data_store` 的完成回调由 WebKit 在事件循环里触发,所以这里通过
+/// `on_result` 把 [`StoreRemovalOutcome`] 送回产品(产品自行发消息/触发重试)。返回的 `Task` 只表示
+/// "已提交到主线程";`on_result` 一定被调用一次(不支持的系统版本上同步调 `Unsupported`)。
+/// **调用前该应用的 webview 必须已离开池**(wry 要求),由调用方保证。
+pub fn remove_app_data_store<M>(
+    window_id: window::Id,
+    app_id: String,
+    store: [u8; 16],
+    on_result: impl Fn(String, StoreRemovalOutcome) + Send + Sync + 'static,
+    wrap: impl FnOnce() -> M + Send + 'static,
+) -> Task<M>
+where
+    M: Send + 'static,
+{
+    if !bytehost_webview::supports_store_removal(host_os_major()) {
+        on_result(app_id, StoreRemovalOutcome::Unsupported);
+        return Task::done(wrap());
+    }
+    window::run(window_id, move |_w| {
+        use wry::WebViewExtDarwin;
+        let id = app_id.clone();
+        let done = on_result;
+        wry::WebView::remove_data_store(&store, move |result| {
+            done(
+                id,
+                match result {
+                    Ok(()) => StoreRemovalOutcome::Done,
+                    Err(wry::Error::DataStoreInUse) => StoreRemovalOutcome::InUse,
+                    Err(e) => StoreRemovalOutcome::Failed(e.to_string()),
+                },
+            );
+        });
+        wrap()
+    })
+}
+
 fn with_app_handles<R>(f: impl FnOnce(&mut HashMap<SurfaceSlot, wry::WebView>) -> R) -> R {
     APP_HANDLES.with(|h| f(&mut h.borrow_mut()))
 }
@@ -233,6 +284,29 @@ mod tests {
         assert!(
             !prod.contains("fn data_store_identifier"),
             "每应用存储标识的第二份实现;唯一真相在 bytehost-webview"
+        );
+    }
+
+    /// 数据存储清除必须**先过系统版本门槛**:wry 不检查系统版本,macOS 12/13 上直接调
+    /// `remove_data_store` 会因未知选择器崩掉。纯策略 crate 给出 `supports_store_removal`,
+    /// 宿主层必须真的先问它——用源码扫描钉住这条顺序(无廉价夹具能跑真实 wry 调用)。
+    #[test]
+    fn remove_app_data_store_gates_on_the_os_version() {
+        let src = include_str!("app_webview.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let start = prod.find("pub fn remove_app_data_store<M>(").unwrap();
+        let body = &prod[start..];
+        assert!(
+            body.contains("supports_store_removal(host_os_major())"),
+            "必须先过 supports_store_removal(host_os_major()) 再调 wry"
+        );
+        assert!(
+            body.contains("wry::WebView::remove_data_store("),
+            "经 wry 的 remove_data_store 清除"
+        );
+        assert!(
+            !body.contains("fn data_store_identifier"),
+            "存储标识唯一真相在 bytehost-webview,不得另抄一份"
         );
     }
 
