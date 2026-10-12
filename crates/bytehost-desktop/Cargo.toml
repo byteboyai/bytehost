@@ -21,6 +21,12 @@ wry = "0.55.1"
 # 取 macOS 主版本号判数据存储清除是否受支持(纯策略 crate 不碰 objc2,宿主层来问)。
 objc2-foundation = "0.3"
 tokio.workspace = true
+# 独立原生浮层建窗(C10):只搬"不碰渲染器后端"的建窗/定位胶水——需要 winit 的
+# 窗口句柄/事件循环类型,以及 macOS 上 `setAcceptsMouseMovedEvents:` 的 objc2 调用。
+# 刻意不引入 iced_wgpu/iced_winit/iced_renderer(见 R2 修复,保持不绑渲染器 feature)。
+winit = "0.30"
+raw-window-handle = "0.6"
+objc2-app-kit = "0.3"
 
 [dev-dependencies]
 

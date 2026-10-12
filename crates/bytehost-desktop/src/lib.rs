@@ -16,12 +16,15 @@
 //! - [`panes`]:`PanelId` 键控的 rail 顺序 + 每面板分栏状态与拖拽换算(产品中立)。
 //! - [`hover`] 提供产品中立的可悬停元素槽位词汇(`HoverSlot`,与具体面板无关)。
 //! - `focus`:独立原生窗口的"因失焦而关闭"判定(与产品无关)。
+//! - [`overlay`]:独立原生浮层的建窗 + 定位 + 鼠标穿透/圆角遮罩几何(产品中立,
+//!   不绑渲染器后端;渲染管线经泛型工厂接入)。
 
 pub mod app_webview;
 pub mod dispatch;
 pub mod focus;
 pub mod hover;
 pub mod layout;
+pub mod overlay;
 pub mod panel;
 pub mod panes;
 pub mod shell;
@@ -40,6 +43,12 @@ pub use layout::{
 pub use panes::{
     PaneDims, PaneDragInput, PaneDragOutcome, PaneSpec, PaneStore, RailItems,
     apply_pane_split_drag,
+};
+pub use overlay::{
+    BACKDROP_CORNER_RADIUS, POPUP_WIDTH_FRACTION, centered_card_offset,
+    enable_overlay_mouse_moved_events, full_window_overlay_bounds, open_child_window,
+    open_child_window_unfocused, open_overlay, popup_card_size, reposition_overlay, stack_bounds,
+    window_logical_size,
 };
 pub use shell::{HostMessage, Product, SurfaceEvent, route_lifecycle};
 pub use surface::SurfaceExecutor;
