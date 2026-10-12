@@ -11,6 +11,7 @@ pub mod id;
 pub mod layout;
 pub mod registry;
 pub mod request;
+pub mod surface;
 
 pub use geometry::{Insets, LogicalRect, host_rect};
 pub use id::{PanelId, PanelIdError, PanelInstanceId, ScopeId, ScopeIdError, SurfaceSlot};
@@ -19,4 +20,7 @@ pub use registry::{CatalogError, PanelCatalog, PanelMeta};
 pub use request::{
     BackgroundExecutor, Emitter, Generation, RequestKey, RequestToken, RequestTracker,
     ResultEnvelope, run_scoped,
+};
+pub use surface::{
+    PushState, ReadyPolicy, Surface, SurfaceEvent, SurfaceId, SurfaceKind, SurfaceState,
 };
