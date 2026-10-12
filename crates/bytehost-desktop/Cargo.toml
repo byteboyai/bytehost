@@ -8,7 +8,10 @@ description = "bytehost 共享桌面宿主:iced 窗口壳 + wry 子视图执行 
 
 [dependencies]
 bytehost-core.workspace = true
-iced = { version = "0.14", features = ["tokio"] }
+# 只消费 iced 的核心契约(Element/Task/window/widget/futures),不打开任何
+# 渲染器后端默认 feature——否则会把 tiny-skia fallback renderer 强制并进
+# 消费方(如 dozer-app)的 iced 依赖树,改变其 iced_renderer 类型。
+iced = { version = "0.14", default-features = false, features = ["tokio"] }
 wry = "0.55.1"
 tokio.workspace = true
 
