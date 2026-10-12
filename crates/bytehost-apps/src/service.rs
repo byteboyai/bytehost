@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::HOST_VERSION;
 use crate::gateway::{Gateway, GatewayConfig, GatewayError};
+use crate::id::AppId;
 use crate::manager::{AppManager, ManagerConfig, ManagerError, MonitorConfig};
 use crate::port::{load_port, persist_port, pick_port};
 use crate::process::restart::RestartPolicy;
@@ -394,29 +395,86 @@ impl AppService {
         }
     }
 
-    /// dozerd 退出前调用(幂等):撤下站点、观察态落成 `Stopped`、停 gateway;`desired` 保留。
+    /// 退出收尾的默认上界:撤应用(`suspend_all`)按应用各给 `supervisor::DEFAULT_GRACE`,这个总超时留足够余量;
+    /// 超过就当作"停止失败/超时"报出来,**不静默遗留子进程**(规格 §6.1)。测试用
+    /// [`AppService::shutdown_reporting_within`] 传更短的超时。
+    pub const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// dozerd 退出前调用(幂等,**兼容入口**):撤下站点、观察态落成 `Stopped`、停 gateway;`desired` 保留。
     /// 收尾完成后释放同一数据根的服务所有者锁(让下一次启动能重新拿到)。
+    ///
+    /// 本函数是既有调用方用的无返回值包装:失败只记日志。**需要可观察的退出结果**请用
+    /// [`AppService::shutdown_reporting`](Self::shutdown_reporting)——它返回 `Result`,让调用方能显示可操作错误
+    /// 而不是靠日志推断成功(规格 §6.1)。
     pub async fn shutdown(&self) {
+        if let Err(e) = self.shutdown_reporting().await {
+            tracing::error!(target: "bytehost::service", error = %e, "退出收尾未干净结束");
+        }
+    }
+
+    /// 可观察的退出收尾:返回应用级失败、收尾任务失败/超时、gateway 是否确认释放。
+    /// 无论结果如何都释放所有者锁(否则进程退出后数据根再也起不来)——未停干净的子进程由下一次启动的孤儿回收
+    /// (按进程身份核对,不听信可复用的 PID)兜底。
+    pub async fn shutdown_reporting(&self) -> Result<ShutdownReport, ShutdownError> {
+        self.shutdown_reporting_within(Self::SHUTDOWN_TIMEOUT).await
+    }
+
+    /// [`shutdown_reporting`](Self::shutdown_reporting) 的可配超时版本,供测试注入短超时。
+    pub async fn shutdown_reporting_within(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ShutdownReport, ShutdownError> {
         let State::Ready {
             manager,
             gateway,
             runtime_manager,
         } = &self.state
         else {
-            return;
+            // 非 Ready(Unavailable):没有运行中的服务,直接释放锁并报干净。
+            self.release_lock();
+            return Ok(ShutdownReport::default());
         };
         // 先取消并收掉还在跑的运行时安装/下载线程,再撤应用(不能把 dozerd 的退出拖住)。
         let rm = runtime_manager.clone();
         let _ = tokio::task::spawn_blocking(move || rm.cancel_all_and_join()).await;
+
         let m = manager.clone();
-        match tokio::task::spawn_blocking(move || m.suspend_all()).await {
-            Ok(report) => log_report(&report, "退出收尾"),
-            Err(e) => {
-                tracing::error!(target: "bytehost::service", error = %e, "退出收尾任务失败(panic?)")
+        let suspend = tokio::task::spawn_blocking(move || m.suspend_all());
+        let report = match tokio::time::timeout(timeout, suspend).await {
+            Ok(Ok(report)) => {
+                log_report(&report, "退出收尾");
+                ShutdownReport {
+                    app_failures: report
+                        .failures
+                        .iter()
+                        .map(|(id, e)| (id.clone(), e.to_string()))
+                        .collect(),
+                    problems: report.problems.clone(),
+                    gateway_released: false,
+                }
             }
-        }
+            Ok(Err(e)) => {
+                // 收尾任务 panic/被取消。仍要放锁,但把失败报上去(不假装成功)。
+                self.release_lock();
+                return Err(ShutdownError::TaskFailed(e.to_string()));
+            }
+            Err(_elapsed) => {
+                // 超时:某些应用可能没停下来。放锁让退出继续,由报错暴露问题。
+                self.release_lock();
+                return Err(ShutdownError::TimedOut(timeout));
+            }
+        };
+
         gateway.stop().await;
+        let released = gateway.is_stopped();
         self.release_lock();
+        if !released {
+            return Err(ShutdownError::GatewayNotReleased);
+        }
+        Ok(ShutdownReport {
+            gateway_released: released,
+            ..report
+        })
     }
 
     /// 取走并释放服务所有者锁(幂等)。`shutdown` 与"停服务"类管理动作都经它,保证锁与 gateway 生命周期一致。
@@ -495,6 +553,49 @@ impl std::fmt::Display for PortResetError {
 }
 
 impl std::error::Error for PortResetError {}
+
+/// [`AppService::shutdown_reporting`] 的可观察结果:退出是否有应用级失败、gateway 是否确认释放。
+/// `Ok` 但 `ShutdownReport` 里非空代表"退出完成但有应用没干净停下来"——调用方应把 `app_failures`/`problems`
+/// 显示成可操作错误,而不是靠日志推断(规格 §6.1)。
+#[derive(Debug, Default)]
+pub struct ShutdownReport {
+    /// 停不下来的应用(逐应用报 `AppId` + 说明)。
+    pub app_failures: Vec<(AppId, String)>,
+    /// 无法处理的记录/资源(路径 + 说明)。
+    pub problems: Vec<(String, String)>,
+    /// gateway 是否确认停止(`Gateway::is_stopped`)。`Ok` 路径下恒为 `true`。
+    pub gateway_released: bool,
+}
+
+impl ShutdownReport {
+    /// 退出是否完全干净(没有应用级失败、没有遗留记录问题)。
+    pub fn is_clean(&self) -> bool {
+        self.app_failures.is_empty() && self.problems.is_empty()
+    }
+}
+
+/// [`AppService::shutdown_reporting`] 的失败:说明"收尾没干净结束",调用方(dozerd)可据此报错退出。
+#[derive(Debug)]
+pub enum ShutdownError {
+    /// 收尾任务 panic/被取消。
+    TaskFailed(String),
+    /// 收尾超时:可能仍有应用在跑(不静默遗留;下一次启动的孤儿回收会兜底)。
+    TimedOut(std::time::Duration),
+    /// gateway 未确认释放(可能仍有子进程守着端口)。
+    GatewayNotReleased,
+}
+
+impl std::fmt::Display for ShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TaskFailed(e) => write!(f, "退出收尾任务失败:{e}"),
+            Self::TimedOut(d) => write!(f, "退出收尾超时({d:?}),可能有应用未停止"),
+            Self::GatewayNotReleased => write!(f, "退出收尾后 gateway 未确认释放"),
+        }
+    }
+}
+
+impl std::error::Error for ShutdownError {}
 
 /// 把对账/收尾的结果写进日志:单个应用的失败,以及读不出来的记录(损坏的 `state.json`)。
 fn log_report(report: &crate::manager::ReconcileReport, what: &str) {
@@ -901,6 +1002,89 @@ source = "web/"
             "锁释放后可再起"
         );
         third.shutdown().await;
+    }
+
+    /// 干净退出:可观察结果确认 gateway 已释放、无应用级失败——**不靠日志推断**。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clean_shutdown_reports_gateway_released_and_no_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bytehost");
+        let svc = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
+        install(&svc, write_app(&tmp.path().join("src/a"), "alpha", "A")).await;
+        svc.handle(AppRequest::Start { id: id("alpha") })
+            .await
+            .unwrap();
+
+        let report = svc.shutdown_reporting().await.unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        assert!(report.gateway_released, "gateway 应确认释放");
+        assert!(svc.gateway_stopped());
+    }
+
+    /// 退出收尾超时:报 `TimedOut`(**不假装成功**),但仍放锁让进程能退出。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_that_overruns_the_timeout_is_reported_not_swallowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bytehost");
+        let svc = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
+        install(&svc, write_app(&tmp.path().join("src/a"), "alpha", "A")).await;
+        svc.handle(AppRequest::Start { id: id("alpha") })
+            .await
+            .unwrap();
+        // 0 超时:收尾几乎必然来不及跑完 → 走超时分支。
+        match svc
+            .shutdown_reporting_within(std::time::Duration::ZERO)
+            .await
+        {
+            Err(ShutdownError::TimedOut(_)) => {}
+            other => panic!("应报超时:{other:?}"),
+        }
+        // 超时也放锁:同根可再起一个服务。
+        let again = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
+        assert!(again.handle(AppRequest::List).await.is_ok());
+        again.shutdown().await;
+    }
+
+    /// 停止失败:应用记录所在的目录不可写,`set_observed(Stopped)` 存不下 → 逐应用报进 `app_failures`
+    /// (调用方据此显示可操作错误),而不是只在日志里。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_failure_shows_up_in_the_report_not_only_in_logs() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bytehost");
+        let svc = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
+        install(&svc, write_app(&tmp.path().join("src/a"), "alpha", "A")).await;
+        svc.handle(AppRequest::Start { id: id("alpha") })
+            .await
+            .unwrap();
+
+        // 让 `<root>/apps/alpha` 不可写:`suspend_all` 里 `set_observed` 的 `registry.save` 会失败。
+        let app_dir = root.join("apps").join("alpha");
+        let original = std::fs::metadata(&app_dir).unwrap().permissions();
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let report = svc.shutdown_reporting().await.unwrap();
+        // 恢复权限,便于 tempdir 清理与后续断言。
+        std::fs::set_permissions(&app_dir, original).unwrap();
+
+        assert!(
+            report.app_failures.iter().any(|(a, _)| a == &id("alpha")),
+            "停止失败应逐应用报出来:{report:?}"
+        );
+        assert!(!report.is_clean());
+        assert!(
+            report.gateway_released,
+            "即便有应用停不下来,gateway 也应释放"
+        );
+    }
+
+    /// `Unavailable` 状态下 `shutdown_reporting` 直接报干净并放锁(没有运行中的服务)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_reporting_on_an_unavailable_service_is_clean() {
+        let svc = AppService::unavailable("test");
+        let report = svc.shutdown_reporting().await.unwrap();
+        assert!(report.is_clean());
+        assert!(!report.gateway_released, "没起过 gateway,不谎报已释放");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
