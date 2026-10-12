@@ -12,7 +12,10 @@
 #     - 依赖闭包只允许 serde 家族(core 不得拖入任何界面/平台库)。
 #
 #   group "desktop"(桌面宿主 bytehost-desktop;Task 07 起存在)
-#     - 允许 iced*/wry(它就是要实现窗口),但**不得**出现 dozer*、digger*、tauri*、objc2*。
+#     - 允许 iced*/wry(它就是要实现窗口),但**不得**出现 dozer*、digger*、tauri*。
+#     - **不**禁 objc2*:它是 wry/winit 在 macOS 上的**传递**平台依赖,禁它等于禁 wry;
+#       规格 §67 的 desktop 白名单是 iced/wry/byteui/core,并未禁平台绑定。
+#       (tauri* 仍禁:防止重新引入 Tauri 作为可选框架。)
 #     - 尚不存在时跳过(新建后自动纳入)。
 #
 # `--self-test` 追加门禁变异测试:临时注入(1)core→iced 依赖、(2)apps→digger 依赖,
@@ -95,7 +98,7 @@ fi
 # ---- group: desktop(存在才检查)----
 if cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"bytehost-desktop"'; then
   check_forbidden bytehost-desktop "$product_banned" "产品 crate,共享桌面宿主不得依赖"
-  check_forbidden bytehost-desktop '^tauri.*|^objc2.*' "tauri/objc2 不在共享桌面宿主的依赖白名单"
+  check_forbidden bytehost-desktop '^tauri.*' "tauri 不在共享桌面宿主的依赖白名单(防止重新引入 Tauri)"
 else
   echo "note: bytehost-desktop 尚未创建,跳过 desktop 组(Task 07 起自动纳入)" >&2
 fi

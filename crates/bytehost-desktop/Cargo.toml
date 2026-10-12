@@ -1,0 +1,19 @@
+[package]
+name = "bytehost-desktop"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "bytehost 共享桌面宿主:iced 窗口壳 + wry 子视图执行 + 产品泛型回调。允许 iced/wry,不含任何产品业务 crate。"
+
+[dependencies]
+bytehost-core.workspace = true
+iced = { version = "0.14", features = ["tokio"] }
+wry = "0.55.1"
+tokio.workspace = true
+
+[dev-dependencies]
+
+[[example]]
+name = "minimal"
+path = "examples/minimal.rs"
