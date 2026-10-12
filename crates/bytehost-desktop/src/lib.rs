@@ -13,6 +13,7 @@
 //! - [`dispatch`]:Tokio 执行器与 iced 结果投递适配;
 //! - [`surface`]:Surface 生命周期状态机执行、`(instance, slot, generation)` 路由与几何。
 //! - [`layout`]:产品历史布局 → 稳定 `Layout` 的迁移流程(版本闸门 / 未知保留 / 原子落盘)。
+//! - [`panes`]:`PanelId` 键控的 rail 顺序 + 每面板分栏状态与拖拽换算(产品中立)。
 //! - `focus`:独立原生窗口的"因失焦而关闭"判定(与产品无关)。
 
 pub mod app_webview;
@@ -20,6 +21,7 @@ pub mod dispatch;
 pub mod focus;
 pub mod layout;
 pub mod panel;
+pub mod panes;
 pub mod shell;
 pub mod surface;
 
@@ -32,8 +34,12 @@ pub use layout::{
     LegacyPanelAdapter, MigrateError, MigrationOutcome, atomic_save_layout, migrate_legacy_file,
     migrate_legacy_layout, reconcile_with_catalog,
 };
+pub use panes::{
+    PaneDims, PaneDragInput, PaneDragOutcome, PaneSpec, PaneStore, RailItems,
+    apply_pane_split_drag,
+};
 pub use shell::{HostMessage, Product, SurfaceEvent, route_lifecycle};
 pub use surface::SurfaceExecutor;
 
 /// 复用 core 的几何与身份类型,产品无需再依赖 core 的路径。
-pub use bytehost_core::{LogicalRect, SurfaceSlot};
+pub use bytehost_core::{LogicalRect, SurfaceSlot, id::PanelId};
