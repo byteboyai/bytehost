@@ -65,6 +65,11 @@ impl<T: PartialEq + Clone + Send + 'static> SurfaceExecutor<T> {
     /// 注册一个新的 Surface(尚未创建原生实例)。返回其身份供后续引用。
     ///
     /// `physical` 是交给 `crate::panel` 的句柄键;`build_script` 把载荷转成注入脚本。
+    ///
+    /// **物理槽是独占的**:若该 `physical` 已被别的 Surface 占用(代表重建/替换),
+    /// 或同一 `id` 被重复注册,旧登记会被**原子清除**(entries 与路由表一起),
+    /// 避免旧身份残留:旧身份不再被 `drain_ready_pushes`/`apply` 命中,也不会
+    /// 在 `unregister(old_id)` 时误注销新实例的路由。
     pub fn register(
         &mut self,
         id: SurfaceId,
@@ -72,6 +77,17 @@ impl<T: PartialEq + Clone + Send + 'static> SurfaceExecutor<T> {
         physical: PhysicalSlot,
         build_script: ScriptBuilder<T>,
     ) {
+        // 先清掉任何与本次注册冲突的旧登记:同 id,或占用了同一物理槽。
+        let conflicting: Vec<SurfaceId> = self
+            .entries
+            .iter()
+            .filter(|(eid, e)| **eid == id || e.physical == physical)
+            .map(|(eid, _)| *eid)
+            .collect();
+        for old in conflicting {
+            self.entries.remove(&old);
+            self.router.unregister(physical);
+        }
         self.router.register(id, physical);
         self.entries.insert(
             id,
@@ -144,10 +160,17 @@ impl<T: PartialEq + Clone + Send + 'static> SurfaceExecutor<T> {
     }
 
     /// 注销并返回物理槽(销毁清理路由表用);原生 `panel::destroy` 由调用方执行。
+    ///
+    /// 只有当 `id` 仍是该物理槽的**当前占用者**时才注销路由,防止旧身份的延迟清理
+    /// 误注销已替换的新实例。返回 `None` 表示该身份不是当前登记(无需清理)。
     pub fn unregister(&mut self, id: SurfaceId) -> Option<PhysicalSlot> {
         let entry = self.entries.remove(&id)?;
-        self.router.unregister(entry.physical);
-        Some(entry.physical)
+        let physical = entry.physical;
+        // 仅当该物理槽仍归此身份时,才动路由表。
+        if self.router.contains(id) {
+            self.router.unregister(physical);
+        }
+        Some(physical)
     }
 
     /// 迭代所有 Ready 且待推送的 Surface,产出 (身份, 物理槽, 脚本) 供窗口线程执行。
@@ -285,5 +308,80 @@ mod tests {
             ex.ready_policy(id),
             Some(bytehost_core::ReadyPolicy::NavigationCompleted)
         );
+    }
+
+    #[test]
+    fn replacing_a_slot_evicts_the_old_ready_entry() {
+        // 旧实例已 Ready 且有挂起推送;同物理槽换新身份后:
+        // (a) 新实例的首次 push 是它自己的快照,drain 不得把旧载荷送给新槽;
+        // (b) apply(old_id, ..) 不再命中旧 entry(旧身份已被清)。
+        let old = sid(1, 0);
+        let new = sid(1, 1);
+        let mut ex = executor_with(old, SurfaceKind::Builtin);
+        ex.begin_create(old);
+        ex.apply(old, CoreEvent::Created);
+        ex.apply(old, CoreEvent::Ready);
+        ex.set_desired(old, 11); // 旧实例挂起一个待推送
+
+        ex.register(
+            new,
+            SurfaceKind::Builtin,
+            Slot(new.slot.0),
+            Box::new(script),
+        );
+
+        assert!(!ex.contains(old), "旧身份已被清出 entries");
+        assert!(!ex.route(old).is_accepted(), "旧身份路由已被注销");
+        assert!(
+            ex.apply(old, CoreEvent::Ready).is_none(),
+            "旧身份事件不再命中"
+        );
+        assert!(
+            ex.drain_ready_pushes().is_empty(),
+            "新实例尚未 ready,不得推出旧载荷"
+        );
+        // 新实例走自己的生命周期,推自己的载荷。
+        ex.begin_create(new);
+        ex.apply(new, CoreEvent::Created);
+        ex.apply(new, CoreEvent::Ready);
+        ex.set_desired(new, 22);
+        let pushes = ex.drain_ready_pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].0, new);
+        assert!(pushes[0].2.contains("22"), "推的是新实例的载荷");
+    }
+
+    #[test]
+    fn late_unregister_of_old_id_does_not_drop_the_new_instance() {
+        // 旧身份的延迟清理不得误注销已替换的新实例路由。
+        let old = sid(2, 0);
+        let new = sid(2, 1);
+        let mut ex = executor_with(old, SurfaceKind::Builtin);
+        ex.register(
+            new,
+            SurfaceKind::Builtin,
+            Slot(new.slot.0),
+            Box::new(script),
+        );
+        // 旧身份已被 register 清掉;晚到的 unregister 是 no-op。
+        assert!(ex.unregister(old).is_none());
+        assert!(ex.contains(new), "新实例仍在登记");
+        assert!(ex.route(new).is_accepted(), "新实例路由仍在");
+        assert_eq!(ex.len(), 1);
+    }
+
+    #[test]
+    fn re_register_same_id_is_idempotent_reset() {
+        let id = sid(3, 0);
+        let mut ex = executor_with(id, SurfaceKind::Builtin);
+        ex.begin_create(id);
+        ex.apply(id, CoreEvent::Created);
+        ex.apply(id, CoreEvent::Ready);
+        ex.set_desired(id, 5);
+        // 同 id 重注册:旧状态被重置为 Absent,载荷清空。
+        ex.register(id, SurfaceKind::Builtin, Slot(id.slot.0), Box::new(script));
+        assert_eq!(ex.state(id), Some(&SurfaceState::Absent));
+        assert_eq!(ex.len(), 1);
+        assert!(ex.drain_ready_pushes().is_empty());
     }
 }
