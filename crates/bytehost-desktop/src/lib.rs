@@ -9,13 +9,16 @@
 //! 模块:
 //! - [`shell`]:`HostMessage<M>`、`Product<M>` trait 与窗口壳;
 //! - [`panel`]:窗口生命周期与 wry 子视图的创建/驱动(主线程 thread_local 句柄);
-//! - [`dispatch`]:Tokio 执行器与 iced 结果投递适配。
+//! - [`dispatch`]:Tokio 执行器与 iced 结果投递适配;
+//! - [`surface`]:Surface 生命周期状态机执行、`(instance, slot, generation)` 路由与几何。
 
 pub mod dispatch;
 pub mod panel;
 pub mod shell;
+pub mod surface;
 
 pub use shell::{HostMessage, Product, SurfaceEvent, route_lifecycle};
+pub use surface::SurfaceExecutor;
 
 /// 复用 core 的几何与身份类型,产品无需再依赖 core 的路径。
 pub use bytehost_core::{LogicalRect, SurfaceSlot};
