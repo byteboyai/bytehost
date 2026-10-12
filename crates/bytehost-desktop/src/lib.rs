@@ -11,12 +11,18 @@
 //! - [`panel`]:窗口生命周期与 wry 子视图的创建/驱动(主线程 thread_local 句柄);
 //! - [`dispatch`]:Tokio 执行器与 iced 结果投递适配;
 //! - [`surface`]:Surface 生命周期状态机执行、`(instance, slot, generation)` 路由与几何。
+//! - [`layout`]:产品历史布局 → 稳定 `Layout` 的迁移流程(版本闸门 / 未知保留 / 原子落盘)。
 
 pub mod dispatch;
+pub mod layout;
 pub mod panel;
 pub mod shell;
 pub mod surface;
 
+pub use layout::{
+    LegacyPanelAdapter, MigrateError, MigrationOutcome, atomic_save_layout, migrate_legacy_file,
+    migrate_legacy_layout, reconcile_with_catalog,
+};
 pub use shell::{HostMessage, Product, SurfaceEvent, route_lifecycle};
 pub use surface::SurfaceExecutor;
 
