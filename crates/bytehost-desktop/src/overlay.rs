@@ -193,23 +193,41 @@ pub fn reposition_overlay(
     }
 }
 
-/// 主窗口外框位置 + 内区尺寸 + 缩放 + 条数 → 右下角 Toast 堆叠窗口的物理位置与
-/// 尺寸。窗口尺寸钳到主窗口内且 ≥1(主窗口被缩得比 Toast 还小也不出 0/负尺寸,
-/// 否则 wgpu surface 配置会失败)。`count == 0` 按 1 处理。定位约定与
-/// [`full_window_overlay_bounds`] 一致:以 `outer_position` 为原点、`inner_size`
-/// 为范围。`toast_width`/`toast_height`/`gap`/`margin_right`/`margin_bottom` 是
-/// 产品给定的逻辑像素常量。
+/// Toast 堆叠的几何常量(逻辑像素),由产品给定。用具名字段而非 5 个相邻 `f32`
+/// 位置参数,避免顺序传错(见仓库约定:相邻同类型参数多时用参数结构体)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ToastMetrics {
+    /// 单条 Toast 的逻辑宽度。
+    pub width: f32,
+    /// 单条 Toast 的逻辑高度。
+    pub height: f32,
+    /// 相邻 Toast 之间的逻辑间距。
+    pub gap: f32,
+    /// 距主窗口右边缘的逻辑外边距。
+    pub margin_right: f32,
+    /// 距主窗口下边缘的逻辑外边距。
+    pub margin_bottom: f32,
+}
+
+/// 主窗口外框位置 + 内区尺寸 + 缩放 + 条数 + Toast 几何常量 → 右下角 Toast 堆叠
+/// 窗口的物理位置与尺寸。窗口尺寸钳到主窗口内且 ≥1(主窗口被缩得比 Toast 还小也
+/// 不出 0/负尺寸,否则 wgpu surface 配置会失败)。`count == 0` 按 1 处理。定位约定
+/// 与 [`full_window_overlay_bounds`] 一致:以 `outer_position` 为原点、`inner_size`
+/// 为范围。
 pub fn stack_bounds(
     main_outer_pos: PhysicalPosition<i32>,
     main_inner_size: PhysicalSize<u32>,
     scale: f64,
     count: usize,
-    toast_width: f32,
-    toast_height: f32,
-    gap: f32,
-    margin_right: f32,
-    margin_bottom: f32,
+    metrics: ToastMetrics,
 ) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
+    let ToastMetrics {
+        width: toast_width,
+        height: toast_height,
+        gap,
+        margin_right,
+        margin_bottom,
+    } = metrics;
     let n = count.max(1);
     let px = |logical: f32| (f64::from(logical) * scale).round() as i64;
     let main_w = i64::from(main_inner_size.width);
@@ -229,6 +247,17 @@ pub fn stack_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用固定 Toast 几何(与产品默认一致)。
+    fn metrics() -> ToastMetrics {
+        ToastMetrics {
+            width: 380.0,
+            height: 56.0,
+            gap: 8.0,
+            margin_right: 16.0,
+            margin_bottom: 48.0,
+        }
+    }
 
     #[test]
     fn full_window_overlay_bounds_matches_main_window_exactly() {
@@ -267,11 +296,7 @@ mod tests {
             PhysicalSize::new(1200, 800),
             1.0,
             1,
-            380.0,
-            56.0,
-            8.0,
-            16.0,
-            48.0,
+            metrics(),
         );
         assert_eq!(size, PhysicalSize::new(380, 56));
         assert_eq!(pos, PhysicalPosition::new(904, 746));
@@ -284,11 +309,7 @@ mod tests {
             PhysicalSize::new(1200, 800),
             1.0,
             3,
-            380.0,
-            56.0,
-            8.0,
-            16.0,
-            48.0,
+            metrics(),
         );
         // 3*56 + 2*8 = 184
         assert_eq!(size, PhysicalSize::new(380, 184));
@@ -302,11 +323,7 @@ mod tests {
             PhysicalSize::new(200, 30),
             1.0,
             1,
-            380.0,
-            56.0,
-            8.0,
-            16.0,
-            48.0,
+            metrics(),
         );
         assert_eq!(size, PhysicalSize::new(200, 30));
         assert_eq!(pos, PhysicalPosition::new(100, 50));
@@ -316,11 +333,7 @@ mod tests {
             PhysicalSize::new(0, 0),
             1.0,
             1,
-            380.0,
-            56.0,
-            8.0,
-            16.0,
-            48.0,
+            metrics(),
         );
         assert!(size.width >= 1 && size.height >= 1);
     }
@@ -332,11 +345,7 @@ mod tests {
             PhysicalSize::new(1200, 800),
             1.0,
             0,
-            380.0,
-            56.0,
-            8.0,
-            16.0,
-            48.0,
+            metrics(),
         );
         assert_eq!(size, PhysicalSize::new(380, 56));
     }

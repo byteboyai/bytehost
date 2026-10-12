@@ -41,7 +41,7 @@ pub use layout::{
     migrate_legacy_layout, reconcile_with_catalog,
 };
 pub use overlay::{
-    BACKDROP_CORNER_RADIUS, POPUP_WIDTH_FRACTION, centered_card_offset,
+    BACKDROP_CORNER_RADIUS, POPUP_WIDTH_FRACTION, ToastMetrics, centered_card_offset,
     enable_overlay_mouse_moved_events, full_window_overlay_bounds, open_child_window,
     open_child_window_unfocused, open_overlay, popup_card_size, reposition_overlay, stack_bounds,
     window_logical_size,
