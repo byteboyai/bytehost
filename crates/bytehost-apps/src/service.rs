@@ -428,7 +428,73 @@ impl AppService {
             .take();
         drop(taken);
     }
+
+    /// **受控端口重置**(规格 §6.1:停服务 → 销毁应用 Surface → 说明 origin 改变影响 → 确认 → 修改并重启)。
+    /// 这是"修改"这一步的管理接口——调用方负责先停掉服务(既有 `shutdown`,会释放所有者锁),再调用它,
+    /// 然后重新 `start`。本函数:
+    /// - **占有权校验**:拿不到同一数据根的服务锁(`已有服务在运行`)就拒绝,绝不在服务活着时改端口;
+    /// - **原子持久化**:复用 `persist_port`(先写临时文件再改名);写失败时**原来的 `gateway.json` 原样保留**,
+    ///   调用方仍可用旧端口重启(可恢复状态);
+    /// - **不暴露任意写**:只改 `<root>/gateway.json` 这一个既定文件,不提供“写任意内部文件”的口子。
+    pub fn reset_port(root: &Path, requested: u16) -> Result<u16, PortResetError> {
+        if !(crate::port::PORT_MIN..=crate::port::PORT_MAX).contains(&requested) {
+            return Err(PortResetError::OutOfRange(requested));
+        }
+        // 占有权校验:服务在跑时锁拿不到,拒绝(不能把端口从正在运行的 gateway 底下换掉)。
+        let lock = match ServiceLock::acquire(root) {
+            Ok(lock) => lock,
+            Err(LockError::AlreadyOwned) => return Err(PortResetError::ServiceRunning),
+            Err(LockError::Io(e)) => return Err(PortResetError::Io(e)),
+        };
+        if let Err(e) = persist_port(root, requested) {
+            return Err(PortResetError::Io(e));
+        }
+        drop(lock);
+        Ok(requested)
+    }
+
+    /// 受控地"忘掉"已持久化的端口(下次 `start` 会重新随机选并绑定):同样先做占有权校验。
+    /// 用于恢复"端口文件损坏"这类不可用状态——删除坏文件也是**受控**的,不暴露任意写。
+    pub fn clear_port(root: &Path) -> Result<(), PortResetError> {
+        let lock = match ServiceLock::acquire(root) {
+            Ok(lock) => lock,
+            Err(LockError::AlreadyOwned) => return Err(PortResetError::ServiceRunning),
+            Err(LockError::Io(e)) => return Err(PortResetError::Io(e)),
+        };
+        let path = root.join("gateway.json");
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(PortResetError::Io(e)),
+        }
+        drop(lock);
+        Ok(())
+    }
 }
+
+/// [`AppService::reset_port`]/[`AppService::clear_port`] 的失败:都说明"没有真的改成功",调用方可据此重试或
+/// 保持旧端口继续跑。
+#[derive(Debug)]
+pub enum PortResetError {
+    /// 同一数据根已有服务在运行:先停服务再重置。
+    ServiceRunning,
+    /// 请求的端口不在允许范围内(见 `port::PORT_MIN..=PORT_MAX`)。
+    OutOfRange(u16),
+    /// 读/写端口文件失败(原来的文件未被破坏)。
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for PortResetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ServiceRunning => write!(f, "应用服务正在运行,请先停止服务再重置端口"),
+            Self::OutOfRange(p) => write!(f, "端口 {p} 不在允许范围"),
+            Self::Io(e) => write!(f, "端口文件读写失败:{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PortResetError {}
 
 /// 把对账/收尾的结果写进日志:单个应用的失败,以及读不出来的记录(损坏的 `state.json`)。
 fn log_report(report: &crate::manager::ReconcileReport, what: &str) {
@@ -879,6 +945,82 @@ source = "web/"
             std::fs::read_to_string(root.join("gateway.json")).unwrap(),
             "{not json"
         );
+    }
+
+    /// 受控端口重置:服务停着时把端口改掉并持久化;重启用新端口。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_port_changes_the_persisted_port_when_no_service_owns_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bytehost");
+        std::fs::create_dir_all(&root).unwrap();
+        crate::port::persist_port(&root, 24000).unwrap();
+        assert_eq!(AppService::reset_port(&root, 25000).unwrap(), 25000);
+        assert_eq!(persisted_port(&root), Some(25000), "新端口已落盘");
+        assert!(!root.join("gateway.tmp").exists(), "原子写不留临时文件");
+    }
+
+    /// 服务在运行时**拒绝**重置——不能把端口从活着的 gateway 底下换掉。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_port_is_refused_while_a_service_owns_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bytehost");
+        let svc = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
+        match AppService::reset_port(&root, 25000) {
+            Err(PortResetError::ServiceRunning) => {}
+            other => panic!("服务在跑时应拒绝重置:{other:?}"),
+        }
+        // 停服务后可以重置,且旧端口文件不受影响(此处原本没有持久化端口)。
+        svc.shutdown().await;
+        assert_eq!(AppService::reset_port(&root, 25000).unwrap(), 25000);
+    }
+
+    /// 越界端口被拒,且不写盘(原有文件原样保留)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_port_rejects_out_of_range_ports_without_touching_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bytehost");
+        std::fs::create_dir_all(&root).unwrap();
+        crate::port::persist_port(&root, 24000).unwrap();
+        match AppService::reset_port(&root, 80) {
+            Err(PortResetError::OutOfRange(80)) => {}
+            other => panic!("越界端口应被拒:{other:?}"),
+        }
+        assert_eq!(persisted_port(&root), Some(24000), "旧端口原样保留");
+    }
+
+    /// 写盘失败时保留可恢复状态:原 `gateway.json` 未被破坏,调用方仍能用旧端口重启。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_port_keeps_the_old_file_when_persisting_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bytehost");
+        std::fs::create_dir_all(&root).unwrap();
+        crate::port::persist_port(&root, 24000).unwrap();
+        // 把临时文件路径占成一个目录,`persist_port` 的 `File::create(gateway.tmp)` 会失败。
+        std::fs::create_dir(root.join("gateway.tmp")).unwrap();
+        match AppService::reset_port(&root, 25000) {
+            Err(PortResetError::Io(_)) => {}
+            other => panic!("写盘失败应报 Io:{other:?}"),
+        }
+        assert_eq!(persisted_port(&root), Some(24000), "旧端口文件保留");
+    }
+
+    /// `clear_port`:受控地忘掉端口(下次 `start` 重新选)。服务在跑时同样被拒。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_port_forgets_the_port_but_only_when_nobody_owns_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bytehost");
+        std::fs::create_dir_all(&root).unwrap();
+        crate::port::persist_port(&root, 24000).unwrap();
+        let svc = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
+        assert!(matches!(
+            AppService::clear_port(&root),
+            Err(PortResetError::ServiceRunning)
+        ));
+        svc.shutdown().await;
+        AppService::clear_port(&root).unwrap();
+        assert_eq!(persisted_port(&root), None);
+        // 幂等:再清一次也不报错。
+        AppService::clear_port(&root).unwrap();
     }
 
     /// `start` 用持久化的端口:停了再起,端口不变(origin 含端口,端口变了所有应用的本地存储都会丢)。
