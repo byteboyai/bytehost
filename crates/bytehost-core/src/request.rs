@@ -259,6 +259,84 @@ pub fn run_scoped<C, M, W, EX, EM>(
     }));
 }
 
+/// 一个面板实例、**跨多个 scope** 的 tracker 集合。
+///
+/// 有些面板同时服务多个作用域(如浏览器既有"全局书签"lane 又有"项目书签"lane)。
+/// 单个 [`RequestTracker`] 只绑定一个 scope,故这里惰性为每个 `ScopeId` 建一个
+/// core tracker,但共用同一个 `owner`/`instance`/`generation`——保证同一实例不同
+/// scope 的 token 因 scope 不同而互不接受,且实例重建后旧 token 全被拒。
+///
+/// 这是把 Dozer 迁移前 `request_tracker.rs` 的"一 tracker 服务多 scope"语义提升为
+/// 中立机制(compat bridge C8):产品不再需要自己的包装类型,只需按业务把项目/全局
+/// 映射成 `ScopeId`。
+#[derive(Debug, Clone)]
+pub struct ScopedTrackers(Arc<ScopedInner>);
+
+#[derive(Debug)]
+struct ScopedInner {
+    owner: u64,
+    instance: PanelInstanceId,
+    generation: Generation,
+    scopes: Mutex<HashMap<ScopeId, RequestTracker>>,
+}
+
+impl ScopedTrackers {
+    /// `owner` 由调用方给一个进程内唯一值(重开的同 slot 面板互不接受对方 token)。
+    pub fn new(owner: u64, instance: PanelInstanceId, generation: Generation) -> Self {
+        Self(Arc::new(ScopedInner {
+            owner,
+            instance,
+            generation,
+            scopes: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    /// 取(或惰性建)某 scope 的 core tracker。
+    fn core_for(&self, scope: &ScopeId) -> RequestTracker {
+        let mut scopes = self.0.scopes.lock().unwrap();
+        scopes
+            .entry(scope.clone())
+            .or_insert_with(|| {
+                RequestTracker::new(
+                    self.0.owner,
+                    scope.clone(),
+                    self.0.instance,
+                    self.0.generation,
+                )
+            })
+            .clone()
+    }
+
+    /// 发起一次 **latest-only 读取**(该 scope 内)。同 key 的旧 token 立即失效。
+    pub fn begin(&self, scope: &ScopeId, key: RequestKey) -> RequestToken {
+        self.core_for(scope).begin(key)
+    }
+
+    /// **作用域写入**(该 scope 内):不因新请求被作废;实例过期后其 UI 回包被丢弃。
+    pub fn scope(&self, scope: &ScopeId) -> RequestToken {
+        self.core_for(scope).scope()
+    }
+
+    /// 显式作废某个 key 的当前结果,**对所有已知 scope 一并作废**
+    /// (等价于迁移前"单 tracker 单表"的语义)。
+    pub fn invalidate(&self, key: RequestKey) {
+        let scopes = self.0.scopes.lock().unwrap();
+        for tracker in scopes.values() {
+            tracker.invalidate(key);
+        }
+    }
+
+    /// **派发前**校验:来源 tracker 一致、实例与 generation 仍存活、scope 一致,
+    /// 且属于当前有效请求或写入。scope 直接从 `token.scope()` 取,故无需产品携带。
+    pub fn accepts(&self, token: &RequestToken) -> bool {
+        let scopes = self.0.scopes.lock().unwrap();
+        match scopes.get(token.scope()) {
+            Some(tracker) => tracker.accepts(token),
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +432,57 @@ mod tests {
         let second = t.begin(LIST);
         assert!(!t.accepts(&first));
         assert!(t.accepts(&second));
+    }
+
+    // ---- 多 scope 集合(ScopedTrackers) ----
+
+    #[test]
+    fn scoped_trackers_serve_multiple_scopes_independently() {
+        let t = ScopedTrackers::new(1, PanelInstanceId::new(0, 0), Generation::new(0));
+        let a = t.begin(&scope("project:1"), LIST);
+        let b = t.begin(&scope("global"), LIST);
+        assert!(t.accepts(&a));
+        assert!(t.accepts(&b));
+        // 刷新项目 lane 不影响全局 lane。
+        let a2 = t.begin(&scope("project:1"), LIST);
+        assert!(!t.accepts(&a));
+        assert!(t.accepts(&a2));
+        assert!(t.accepts(&b));
+    }
+
+    #[test]
+    fn scoped_trackers_reject_unknown_scope_and_reopened_instance() {
+        let t = ScopedTrackers::new(1, PanelInstanceId::new(0, 0), Generation::new(0));
+        let tok = t.begin(&scope("project:7"), LIST);
+        // 另一个实例(owner 不同)即便 scope/instance/generation 相同也拒绝。
+        let reopened = ScopedTrackers::new(2, PanelInstanceId::new(0, 0), Generation::new(0));
+        assert!(!reopened.accepts(&tok));
+        assert!(t.accepts(&tok));
+        // 从未发起的 scope:直接拒。
+        let fresh = ScopedTrackers::new(1, PanelInstanceId::new(0, 0), Generation::new(0));
+        assert!(!fresh.accepts(&tok));
+    }
+
+    #[test]
+    fn scoped_trackers_invalidate_applies_to_all_known_scopes() {
+        let t = ScopedTrackers::new(1, PanelInstanceId::new(0, 0), Generation::new(0));
+        let a = t.begin(&scope("project:1"), LIST);
+        let b = t.begin(&scope("project:2"), LIST);
+        t.invalidate(LIST);
+        assert!(!t.accepts(&a));
+        assert!(!t.accepts(&b));
+    }
+
+    #[test]
+    fn scoped_write_is_scoped_but_survives_new_reads() {
+        let t = ScopedTrackers::new(1, PanelInstanceId::new(0, 0), Generation::new(0));
+        let write = t.scope(&scope("project:3"));
+        t.begin(&scope("project:3"), LIST);
+        assert!(t.accepts(&write), "写不因同 scope 新读取被作废");
+        // 写属于 project:3;一个独立的实例对 project:4 的写不被本实例接受。
+        let other = ScopedTrackers::new(2, PanelInstanceId::new(0, 0), Generation::new(0));
+        let other_write = other.scope(&scope("project:4"));
+        assert!(!t.accepts(&other_write));
     }
 
     // ---- 执行原语:派发前校验 ----

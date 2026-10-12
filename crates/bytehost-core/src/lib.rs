@@ -19,7 +19,7 @@ pub use layout::{LAYOUT_SCHEMA_VERSION, Layout, LayoutError, Rail};
 pub use registry::{CatalogError, PanelCatalog, PanelMeta};
 pub use request::{
     BackgroundExecutor, Emitter, Generation, RequestKey, RequestToken, RequestTracker,
-    ResultEnvelope, run_scoped,
+    ResultEnvelope, ScopedTrackers, run_scoped,
 };
 pub use surface::{
     PushState, ReadyPolicy, Surface, SurfaceEvent, SurfaceId, SurfaceKind, SurfaceState,

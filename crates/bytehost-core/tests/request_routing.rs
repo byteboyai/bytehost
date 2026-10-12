@@ -6,7 +6,8 @@
 use std::sync::mpsc;
 
 use bytehost_core::request::{
-    BackgroundExecutor, Emitter, Generation, RequestKey, RequestTracker, ResultEnvelope, run_scoped,
+    BackgroundExecutor, Emitter, Generation, RequestKey, RequestTracker, ResultEnvelope,
+    ScopedTrackers, run_scoped,
 };
 use bytehost_core::{PanelInstanceId, ScopeId};
 
@@ -127,4 +128,23 @@ fn independent_env_envelopes_carry_identity() {
     assert_eq!(env.token.generation(), Generation::new(0));
     assert_eq!(env.token.key(), Some(LIST));
     assert!(env.token.seq() > 0);
+}
+
+#[test]
+fn scoped_trackers_route_dual_lane_panel_by_scope() {
+    // 模拟"一个面板实例同时服务全局 + 项目"两条 lane(浏览器书签场景)。
+    let t = ScopedTrackers::new(1, PanelInstanceId::new(0, 0), Generation::new(0));
+    let project = t.begin(&scope("project:9"), LIST);
+    let global = t.begin(&scope("global"), LIST);
+
+    // 两条 lane 互不接受,即使 key 相同、实例相同。
+    assert!(t.accepts(&project));
+    assert!(t.accepts(&global));
+    assert_ne!(project.scope(), global.scope());
+
+    // 切项目后旧项目 lane 的新读取作废旧结果;全局 lane 不受影响。
+    let project2 = t.begin(&scope("project:9"), LIST);
+    assert!(!t.accepts(&project));
+    assert!(t.accepts(&project2));
+    assert!(t.accepts(&global));
 }
