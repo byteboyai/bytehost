@@ -2,7 +2,8 @@
 //!
 //! 模式:
 //!   cargo run                 → 开真实窗口(需显示环境;webview 在 iced 之上)
-//!   SELFTEST=1 cargo run      → 建窗后立刻退出(无交互,验证入口能启动)
+//!   SELFTEST=1 cargo run      → 建窗+真建 wry 子视图后退出(建窗或子视图创建失败
+//!                                以非零码退出,不能只算"入口能启动")
 //!
 //! 关键点(与 D/spike/editor-host 同构):
 //! - 唯一 iced 事件循环 `iced::application(...).run()`;
@@ -28,7 +29,8 @@ thread_local! {
 enum Msg {
     Ready(window::Id, Size),
     HostBuilt(Result<(), String>),
-    Quit,
+    /// SELFTEST 收到 HostBuilt 后请求退出,带退出码(0=成功建窗+build;非 0=失败)。
+    Quit(i32),
 }
 
 struct Probe {
@@ -94,21 +96,34 @@ fn update(app: &mut Probe, msg: Msg) -> Task<Msg> {
                 Ok(())
             })
             .map(Msg::HostBuilt);
-            let exit = std::env::var("SELFTEST").is_ok().then_some(Msg::Quit);
-            return match exit {
-                Some(q) => Task::done(q),
-                None => build,
-            };
+            // SELFTEST:无论是否自检都先执行 build(真建 wry 子视图);
+            // 自检模式由 HostBuilt 收尾退出,失败时以非零码退出。
+            return build;
         }
-        Msg::HostBuilt(Ok(())) => {
-            app.built = true;
-            app.note = "webview child built".into();
+        Msg::HostBuilt(result) => {
+            let selftest = std::env::var("SELFTEST").is_ok();
+            match result {
+                Ok(()) => {
+                    app.built = true;
+                    app.note = "webview child built".into();
+                    if selftest {
+                        return Task::done(Msg::Quit(0));
+                    }
+                }
+                Err(e) => {
+                    app.note = format!("build failed: {e}");
+                    if selftest {
+                        // 建窗/build 失败必须非零退出,不能被当成"入口能启动"通过。
+                        return Task::done(Msg::Quit(1));
+                    }
+                }
+            }
         }
-        Msg::HostBuilt(Err(e)) => {
-            app.note = format!("build failed: {e}");
-        }
-        Msg::Quit => {
+        Msg::Quit(code) => {
             HOST.with(|h| drop(h.borrow_mut().take()));
+            if code != 0 {
+                std::process::exit(code);
+            }
             return iced::exit();
         }
     }
@@ -126,7 +141,7 @@ fn view(app: &Probe) -> Element<'_, Msg> {
 fn subscription(_app: &Probe) -> Subscription<Msg> {
     use iced::event;
     event::listen_with(|evt, _status, _id| match evt {
-        iced::Event::Window(window::Event::CloseRequested) => Some(Msg::Quit),
+        iced::Event::Window(window::Event::CloseRequested) => Some(Msg::Quit(0)),
         _ => None,
     })
 }
