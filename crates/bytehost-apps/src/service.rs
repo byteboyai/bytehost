@@ -413,17 +413,24 @@ impl AppService {
     }
 
     /// 可观察的退出收尾:返回应用级失败、收尾任务失败/超时、gateway 是否确认释放。
-    /// 无论结果如何都释放所有者锁(否则进程退出后数据根再也起不来)——未停干净的子进程由下一次启动的孤儿回收
-    /// (按进程身份核对,不听信可复用的 PID)兜底。
+    ///
+    /// **独占权与 gateway 生命周期绑死**(规格 §6.1,复盘发现 3):只有在**确认 gateway 已停**(accept 循环退出)
+    /// 之后才释放所有者锁。收尾超时说明旧 gateway/后台撤应用可能还在跑,此时**不得**提前放锁——否则同根下一次启动
+    /// 会拿到锁、把还活着的旧 gateway 底下换掉(端口/子进程被两任所有者同时管)。未停干净的子进程由下一次
+    /// 启动的孤儿回收兜底(按进程身份核对,不听信可复用的 PID)。真正进程退出时 `flock` 由内核释放,不会永久卡死。
     pub async fn shutdown_reporting(&self) -> Result<ShutdownReport, ShutdownError> {
         self.shutdown_reporting_within(Self::SHUTDOWN_TIMEOUT).await
     }
 
     /// [`shutdown_reporting`](Self::shutdown_reporting) 的可配超时版本,供测试注入短超时。
+    ///
+    /// `timeout` 是**整个退出收尾的总时限**:运行时取消/join、撤应用、停 gateway 三者共享同一 deadline
+    /// (复盘发现 3 要求把 runtime cancel/join 纳入总退出时限)。任一环节超时都**保留**所有者锁并报错。
     pub async fn shutdown_reporting_within(
         &self,
         timeout: std::time::Duration,
     ) -> Result<ShutdownReport, ShutdownError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         let State::Ready {
             manager,
             gateway,
@@ -434,13 +441,23 @@ impl AppService {
             self.release_lock();
             return Ok(ShutdownReport::default());
         };
-        // 先取消并收掉还在跑的运行时安装/下载线程,再撤应用(不能把 dozerd 的退出拖住)。
+        // 先取消并收掉还在跑的运行时安装/下载线程(不能把 dozerd 的退出拖住),但它也吃总时限。
         let rm = runtime_manager.clone();
-        let _ = tokio::task::spawn_blocking(move || rm.cancel_all_and_join()).await;
+        let runtime_join = tokio::task::spawn_blocking(move || rm.cancel_all_and_join());
+        match tokio::time::timeout_at(deadline, runtime_join).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // 收尾任务 panic/被取消。保留独占权:旧服务可能还在,放锁会让下一次启动与它并存。
+                return Err(ShutdownError::TaskFailed(e.to_string()));
+            }
+            Err(_elapsed) => {
+                return Err(ShutdownError::TimedOut(timeout));
+            }
+        }
 
         let m = manager.clone();
         let suspend = tokio::task::spawn_blocking(move || m.suspend_all());
-        let report = match tokio::time::timeout(timeout, suspend).await {
+        let report = match tokio::time::timeout_at(deadline, suspend).await {
             Ok(Ok(report)) => {
                 log_report(&report, "退出收尾");
                 ShutdownReport {
@@ -454,25 +471,26 @@ impl AppService {
                 }
             }
             Ok(Err(e)) => {
-                // 收尾任务 panic/被取消。仍要放锁,但把失败报上去(不假装成功)。
-                self.release_lock();
+                // 收尾任务 panic/被取消。撤应用没跑完,保留独占权报错(不假装成功)。
                 return Err(ShutdownError::TaskFailed(e.to_string()));
             }
             Err(_elapsed) => {
-                // 超时:某些应用可能没停下来。放锁让退出继续,由报错暴露问题。
-                self.release_lock();
+                // 超时:某些应用可能没停下来,`suspend_all` 线程也可能还在跑。**保留**独占权,由报错暴露问题。
                 return Err(ShutdownError::TimedOut(timeout));
             }
         };
 
-        gateway.stop().await;
-        let released = gateway.is_stopped();
-        self.release_lock();
-        if !released {
-            return Err(ShutdownError::GatewayNotReleased);
+        // 撤应用已在时限内跑完;无论如何都停 gateway(否则端口被旧 accept 循环占着),同样吃总时限。
+        // 只有在确认 gateway 停了之后才放锁——锁与 gateway 生命周期保持一致。
+        match tokio::time::timeout_at(deadline, gateway.stop()).await {
+            Ok(()) if gateway.is_stopped() => {}
+            _ => {
+                return Err(ShutdownError::GatewayNotReleased);
+            }
         }
+        self.release_lock();
         Ok(ShutdownReport {
-            gateway_released: released,
+            gateway_released: true,
             ..report
         })
     }
@@ -579,7 +597,8 @@ impl ShutdownReport {
 pub enum ShutdownError {
     /// 收尾任务 panic/被取消。
     TaskFailed(String),
-    /// 收尾超时:可能仍有应用在跑(不静默遗留;下一次启动的孤儿回收会兜底)。
+    /// 收尾超时:可能仍有应用在跑(不静默遗留)。**独占权保留**——旧 gateway/后台撤应用可能还活着,
+    /// 放锁会让同根下一次启动与它并存;进程真正退出时 `flock` 由内核释放。
     TimedOut(std::time::Duration),
     /// gateway 未确认释放(可能仍有子进程守着端口)。
     GatewayNotReleased,
@@ -1021,9 +1040,10 @@ source = "web/"
         assert!(svc.gateway_stopped());
     }
 
-    /// 退出收尾超时:报 `TimedOut`(**不假装成功**),但仍放锁让进程能退出。
+    /// 退出收尾超时:报 `TimedOut`(**不假装成功**),且**保留**所有者锁——旧服务可能还在跑,
+    /// 提前放锁会让同根下一次启动与它并存(复盘发现 3)。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_shutdown_that_overruns_the_timeout_is_reported_not_swallowed() {
+    async fn a_shutdown_that_overruns_the_timeout_keeps_the_lock() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("bytehost");
         let svc = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
@@ -1039,10 +1059,12 @@ source = "web/"
             Err(ShutdownError::TimedOut(_)) => {}
             other => panic!("应报超时:{other:?}"),
         }
-        // 超时也放锁:同根可再起一个服务。
+        // 超时**不**放锁:同根再起一个服务必须不可用(否则会和还活着的旧服务并存)。
         let again = AppService::start_with(&root, GatewayConfig { port: 0 }).await;
-        assert!(again.handle(AppRequest::List).await.is_ok());
-        again.shutdown().await;
+        assert!(
+            again.handle(AppRequest::List).await.is_err(),
+            "超时后独占权必须保留:同根不得再起第二个服务"
+        );
     }
 
     /// 停止失败:应用记录所在的目录不可写,`set_observed(Stopped)` 存不下 → 逐应用报进 `app_failures`
