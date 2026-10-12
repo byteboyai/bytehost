@@ -114,7 +114,7 @@ pub fn handle_count() -> usize {
     with_handles(|h| h.len())
 }
 
-fn rect_to_wry(rect: LogicalRect) -> wry::Rect {
+pub(crate) fn rect_to_wry(rect: LogicalRect) -> wry::Rect {
     wry::Rect {
         position: wry::dpi::LogicalPosition::new(rect.x, rect.y).into(),
         size: wry::dpi::LogicalSize::new(rect.width, rect.height).into(),

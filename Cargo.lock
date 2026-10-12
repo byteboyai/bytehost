@@ -179,6 +179,7 @@ name = "bytehost-desktop"
 version = "0.1.0"
 dependencies = [
  "bytehost-core",
+ "bytehost-webview",
  "iced",
  "serde_json",
  "tokio",

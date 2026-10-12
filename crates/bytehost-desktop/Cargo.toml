@@ -8,6 +8,9 @@ description = "bytehost 共享桌面宿主:iced 窗口壳 + wry 子视图执行 
 
 [dependencies]
 bytehost-core.workspace = true
+# 应用 webview 的纯安全策略(origin 导航白名单、存储标识、IPC nonce/注入脚本):
+# 规格 §6.4 要求 builder 只在 desktop 层有一份,产品不复制 wry 初始化代码。
+bytehost-webview = { path = "../bytehost-webview" }
 serde_json.workspace = true
 # 只消费 iced 的核心契约(Element/Task/window/widget/futures),不打开任何
 # 渲染器后端默认 feature——否则会把 tiny-skia fallback renderer 强制并进

@@ -1,0 +1,250 @@
+//! 应用 webview 的**受限 builder**:把 `bytehost-webview` 的纯安全策略落成一个真实的 wry 子视图。
+//!
+//! 规格 §6.4:导航策略、数据存储 ID、nonce、IPC 白名单、数据清除队列复用 `bytehost-webview`;
+//! "新 desktop 层统一实现 builder,产品只给策略配置与资源,不各自复制 wry 初始化代码"。
+//! 因此**唯一一份**受限 wry 构造在这里,产品(Dozer / Digger)不各写一遍。
+//!
+//! 应用代码不可信(第三方或 agent 生成),与预览/浏览器那条可信路径的区别:
+//! - 不注册任何自定义协议(预览 host/允许文件只在那条协议后面);
+//! - IPC 只认 `focus`/`mouseup`/`zoom_*` 白名单消息,且必须带本 webview 的随机 nonce
+//!   (页面伪造不了,见 `AppIpc::parse`/`app_init_script`),其余一律丢弃;
+//! - 下载一律拒绝:wry 0.55 的**默认**是放行(默认 `download_started_handler` 返回 `true`,
+//!   且下载不经导航策略),所以必须显式 `.with_download_started_handler(|_, _| false)`;
+//!   开发者工具同理显式关闭(`.with_devtools(false)`,debug 下默认是开的);
+//! - 导航只放行本应用 origin(`AppOrigin::allows_navigation`),`window.open`/新窗口一律拒绝;
+//! - 每应用独立的 WKWebsiteDataStore(macOS 14+;更老的系统 wry 会退回默认存储);
+//! - `url` 不是该形状的应用站点地址时**不创建**(`CreateFailed`,fail closed)。
+//!
+//! 无法在 wry 层强制的项:**摄像头/麦克风** —— wry 0.55 会无条件批准权限请求,这里没有 hook
+//! 可拦;目前靠系统 TCC 挡着,且产品不声明用途(见规格 §6.4)。不虚报为已强制。
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use bytehost_core::{LogicalRect, SurfaceSlot};
+use bytehost_webview::{AppIpc, AppOrigin, app_init_script, data_store_identifier, new_ipc_nonce};
+use iced::{Task, window};
+use wry::WebViewBuilderExtDarwin;
+
+/// 创建一个应用子视图所需的**全部**产品输入:slot、加载地址、逻辑矩形、可见性。
+///
+/// 产品只给这些;安全策略(origin 白名单、nonce、存储标识、下载/devtools/新窗口)全部由本模块
+/// 固定,产品改不了也无需重复。
+#[derive(Debug, Clone)]
+pub struct AppSurfaceSpec {
+    pub slot: SurfaceSlot,
+    pub url: String,
+    pub rect: LogicalRect,
+    pub visible: bool,
+}
+
+/// 应用子视图的创建结果:成功交回 slot;失败带错误串(不 panic)。
+#[derive(Debug, Clone)]
+pub struct AppSurfaceBuilt {
+    pub slot: SurfaceSlot,
+    pub result: Result<(), String>,
+}
+
+/// 从应用 webview 上行、且**通过 nonce 白名单**的事件。宿主据此路由焦点/拖拽/缩放。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppSurfaceIpc {
+    Focus,
+    MouseUp,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+}
+
+impl From<AppIpc> for AppSurfaceIpc {
+    fn from(ipc: AppIpc) -> Self {
+        match ipc {
+            AppIpc::Focus => Self::Focus,
+            AppIpc::MouseUp => Self::MouseUp,
+            AppIpc::ZoomIn => Self::ZoomIn,
+            AppIpc::ZoomOut => Self::ZoomOut,
+            AppIpc::ZoomReset => Self::ZoomReset,
+        }
+    }
+}
+
+thread_local! {
+    /// 非 Send 的应用 wry 句柄只在主线程持有;与 `panel::HANDLES` 分表,避免与内置面板混用。
+    static APP_HANDLES: RefCell<HashMap<SurfaceSlot, wry::WebView>> =
+        RefCell::new(HashMap::new());
+}
+
+/// 在主线程用 `window::run` 创建一个**受限**应用子视图。
+///
+/// - `on_ipc`:收到一条通过 nonce 白名单的上行事件(在窗口线程调用,须自行把消息送回窗口)。
+/// - `on_ready`:页面导航完成(用于把 `SurfaceKind::Application` 推到 `Ready`)。
+/// - `wrap`:把创建结果包成产品消息。
+///
+/// 返回的 `Task` 完成时产出 `wrap(AppSurfaceBuilt)`。
+pub fn build_app_child<M>(
+    window_id: window::Id,
+    spec: AppSurfaceSpec,
+    on_ipc: impl Fn(SurfaceSlot, AppSurfaceIpc) + Send + 'static,
+    on_ready: impl Fn(SurfaceSlot) + Send + 'static,
+    wrap: impl Fn(AppSurfaceBuilt) -> M + Send + 'static,
+) -> Task<M>
+where
+    M: Send + 'static,
+{
+    iced::window::run(window_id, move |w| {
+        // fail closed:地址不是 `<id>.localhost:<port>` 形状就不创建。
+        let Some(origin) = AppOrigin::from_url(&spec.url) else {
+            return AppSurfaceBuilt {
+                slot: spec.slot,
+                result: Err("应用地址不是应用站点形状,拒绝创建".into()),
+            };
+        };
+        let slot = spec.slot;
+        let nonce = new_ipc_nonce();
+        let app_id = origin.app_id().to_owned();
+        let built = wry::WebViewBuilder::new()
+            .with_url(&spec.url)
+            .with_bounds(crate::panel::rect_to_wry(spec.rect))
+            .with_visible(spec.visible)
+            .with_allow_link_preview(false)
+            // 剪贴板:保守关闭。wry 的 `clipboard` 只影响 Linux/Windows(macOS 由系统管辖),
+            // 但显式写 false 让"不做声明即不放行"这条在跨平台上一致,而不是依赖默认值(默认恰好也是 false)。
+            .with_clipboard(false)
+            .with_data_store_identifier(data_store_identifier(&app_id))
+            .with_download_started_handler(|_, _| false)
+            .with_devtools(false)
+            .with_initialization_script(app_init_script(&nonce))
+            .with_ipc_handler(move |req| {
+                if let Some(ipc) = AppIpc::parse(req.body().as_str(), &nonce) {
+                    on_ipc(slot, ipc.into());
+                }
+            })
+            .with_navigation_handler(move |url: String| origin.allows_navigation(&url))
+            .with_new_window_req_handler(|_url, _features| wry::NewWindowResponse::Deny)
+            .with_on_page_load_handler(move |event, _url| {
+                if matches!(event, wry::PageLoadEvent::Finished) {
+                    on_ready(slot);
+                }
+            })
+            .build_as_child(&w);
+        match built {
+            Ok(wv) => {
+                with_app_handles(|h| {
+                    h.insert(slot, wv);
+                });
+                AppSurfaceBuilt {
+                    slot,
+                    result: Ok(()),
+                }
+            }
+            Err(e) => AppSurfaceBuilt {
+                slot,
+                result: Err(e.to_string()),
+            },
+        }
+    })
+    .map(wrap)
+}
+
+/// 重设某个应用子视图的 bounds(主线程)。
+pub fn set_app_bounds(slot: SurfaceSlot, rect: LogicalRect) -> bool {
+    with_app_handles(|h| {
+        if let Some(wv) = h.get(&slot) {
+            let _ = wv.set_bounds(crate::panel::rect_to_wry(rect));
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// 向某个应用子视图注入脚本(主线程)。返回是否有该实例。
+pub fn evaluate_app(slot: SurfaceSlot, script: &str) -> bool {
+    with_app_handles(|h| {
+        if let Some(wv) = h.get(&slot) {
+            let _ = wv.evaluate_script(script);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// 销毁某个应用子视图(主线程)。返回是否确实销毁了一个实例。
+pub fn destroy_app(slot: SurfaceSlot) -> bool {
+    with_app_handles(|h| h.remove(&slot).is_some())
+}
+
+/// 当前已创建的应用子视图数量(测试/诊断用)。
+pub fn app_handle_count() -> usize {
+    with_app_handles(|h| h.len())
+}
+
+fn with_app_handles<R>(f: impl FnOnce(&mut HashMap<SurfaceSlot, wry::WebView>) -> R) -> R {
+    APP_HANDLES.with(|h| f(&mut h.borrow_mut()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// builder 是创建应用 wry webview 的唯一路径,没有廉价夹具能真的建一个;这些是它**必须**写出、
+    /// 且 wry 默认值会反过来的配置,用源码扫描钉住(wry 0.55 默认:下载放行、debug 下开发者工具开、
+    /// 媒体权限自动批准)。与 Dozer `app_webview.rs::build_app_webview_pins_the_restrictive_settings` 同型,
+    /// 但这里的 builder 是共享层唯一一份。
+    #[test]
+    fn build_app_child_pins_the_restrictive_settings() {
+        let src = include_str!("app_webview.rs");
+        // 只看生产代码:本文件的测试模块自身含这些字面量(在断言里),扫进去会自我命中。
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let start = prod.find("pub fn build_app_child<M>(").unwrap();
+        let body = &prod[start..];
+        for required in [
+            ".with_download_started_handler(|_, _| false)",
+            ".with_devtools(false)",
+            ".with_clipboard(false)",
+            ".with_new_window_req_handler(",
+            ".with_navigation_handler(",
+            ".with_data_store_identifier(",
+            ".with_initialization_script(app_init_script(",
+            "AppIpc::parse(",
+            "AppOrigin::from_url(",
+        ] {
+            assert!(body.contains(required), "缺少 {required}");
+        }
+        for forbidden in [
+            "with_custom_protocol",
+            "with_download_completed_handler",
+            ".with_devtools(true)",
+        ] {
+            assert!(!body.contains(forbidden), "不得出现 {forbidden}");
+        }
+    }
+
+    /// 策略与存储标识只在 `bytehost-webview` 有一份:desktop builder 不得再抄
+    /// `allows_navigation` / `data_store_identifier` 的实现(只能 import)。
+    #[test]
+    fn no_second_copy_of_the_navigation_policy() {
+        let src = include_str!("app_webview.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(
+            !prod.contains("fn allows_navigation"),
+            "导航策略的第二份实现;唯一真相在 bytehost-webview"
+        );
+        assert!(
+            !prod.contains("fn data_store_identifier"),
+            "每应用存储标识的第二份实现;唯一真相在 bytehost-webview"
+        );
+    }
+
+    #[test]
+    fn app_surface_ipc_maps_every_whitelisted_verb() {
+        assert_eq!(AppSurfaceIpc::from(AppIpc::Focus), AppSurfaceIpc::Focus);
+        assert_eq!(AppSurfaceIpc::from(AppIpc::MouseUp), AppSurfaceIpc::MouseUp);
+        assert_eq!(AppSurfaceIpc::from(AppIpc::ZoomIn), AppSurfaceIpc::ZoomIn);
+        assert_eq!(AppSurfaceIpc::from(AppIpc::ZoomOut), AppSurfaceIpc::ZoomOut);
+        assert_eq!(
+            AppSurfaceIpc::from(AppIpc::ZoomReset),
+            AppSurfaceIpc::ZoomReset
+        );
+    }
+}
