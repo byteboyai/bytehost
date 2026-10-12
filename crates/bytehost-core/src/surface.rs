@@ -12,6 +12,8 @@
 //! - 同一时刻每个 Surface 至多一个原生实例;
 //! - 旧 generation 的 ready/IPC/脚本结果一律丢弃;
 //! - 隐藏时不接受业务输入;
+//! - **可见性与就绪度分开维护**:隐藏不撤销已完成的握手,但"未握手即隐藏再恢复"
+//!   回到 `WaitingReady`(不凭空 Ready);隐藏期间到达的 ready 被记住,恢复后即为 Ready;
 //! - 内置面板首次 ready 后发送**完整快照**,隐藏期间保留最新待推送状态,恢复后同步;
 //!   新建实例(重建)必须重新发送快照。
 
@@ -194,6 +196,10 @@ pub struct Surface<T> {
     kind: SurfaceKind,
     state: SurfaceState,
     push: PushState<T>,
+    /// 本实例是否**曾经**完成 Ready 握手。可见性与就绪度分开维护:
+    /// 隐藏不撤销已完成的握手(恢复即 Ready),但"未握手即隐藏再恢复"必须回到
+    /// `WaitingReady`,不能凭空 Ready(否则宿主页处理函数未安装时会丢首帧)。
+    ready_once: bool,
 }
 
 impl<T: PartialEq + Clone> Surface<T> {
@@ -204,6 +210,7 @@ impl<T: PartialEq + Clone> Surface<T> {
             kind,
             state: SurfaceState::Absent,
             push: PushState::new(),
+            ready_once: false,
         }
     }
 
@@ -239,6 +246,8 @@ impl<T: PartialEq + Clone> Surface<T> {
             SurfaceState::Absent | SurfaceState::Failed { .. }
         ) {
             self.state = SurfaceState::Creating;
+            // 新实例尚未握手;可见性与就绪度都从零开始。
+            self.ready_once = false;
             true
         } else {
             false
@@ -271,12 +280,14 @@ impl<T: PartialEq + Clone> Surface<T> {
             (SurfaceState::WaitingReady, SurfaceEvent::Ready) => {
                 // 新实例就绪:强制重发快照。
                 self.push.reset_for_new_instance();
+                self.ready_once = true;
                 self.state = SurfaceState::Ready;
                 Some(event)
             }
             (SurfaceState::Ready, SurfaceEvent::Ready) => {
                 // 重复 ready 幂等(但保留一次重发语义):不切换状态,返回事件让上层可重发。
                 self.push.reset_for_new_instance();
+                self.ready_once = true;
                 Some(event)
             }
             (SurfaceState::Ready, SurfaceEvent::Hidden)
@@ -285,16 +296,25 @@ impl<T: PartialEq + Clone> Surface<T> {
                 Some(event)
             }
             (SurfaceState::Hidden, SurfaceEvent::Resumed) => {
-                self.state = SurfaceState::Ready;
+                // 可见性恢复:只有**本实例曾完成握手**才回到 Ready;否则回到
+                // WaitingReady 等握手——否则宿主页处理函数未安装时会丢首帧。
+                self.state = if self.ready_once {
+                    SurfaceState::Ready
+                } else {
+                    SurfaceState::WaitingReady
+                };
                 Some(event)
             }
             (SurfaceState::Hidden, SurfaceEvent::Ready) => {
-                // 隐藏期间到达的 ready:仍视为就绪,但保持隐藏。
-                None
+                // 隐藏期间到达的 ready:记住握手已发生(可见性暂不变),恢复后即为 Ready。
+                self.push.reset_for_new_instance();
+                self.ready_once = true;
+                Some(event)
             }
             // 任何持有实例的状态都可被销毁。
             (s, SurfaceEvent::Destroyed) if s.has_instance() => {
                 self.state = SurfaceState::Destroyed;
+                self.ready_once = false;
                 Some(event)
             }
             // 其余组合在当前状态下无意义。
@@ -409,6 +429,46 @@ mod tests {
             generation: Generation::new(1),
         });
         assert!(current.is_some(), "当前 generation 事件保留");
+    }
+
+    #[test]
+    fn hidden_before_ready_does_not_become_ready_on_resume() {
+        // Created → Hidden → Resumed,且从未收到 Ready:恢复后必须回到 WaitingReady,
+        // 不能凭空 Ready(否则宿主页处理函数未安装时会丢首帧)。
+        let mut s = builtin(0, 0);
+        assert!(s.begin_create());
+        s.apply(SurfaceEvent::Created);
+        assert!(s.apply(SurfaceEvent::Hidden).is_some());
+        assert!(s.apply(SurfaceEvent::Resumed).is_some());
+        assert_eq!(
+            s.state(),
+            &SurfaceState::WaitingReady,
+            "未握手即隐藏再恢复,必须等待握手"
+        );
+        s.push_mut().set_desired(9);
+        assert_eq!(s.take_pending(), None, "未 ready 不推");
+        // 握手完成后退可推。
+        assert!(s.apply(SurfaceEvent::Ready).is_some());
+        assert_eq!(s.take_pending(), Some(&9));
+    }
+
+    #[test]
+    fn ready_during_hidden_is_remembered_and_resumes_to_ready() {
+        // WaitingReady → Hidden → (隐藏期间 Ready) → Resumed:恢复后必须是 Ready,
+        // 且重发快照(隐藏期间的 ready 也要重置 sent)。
+        let mut s = builtin(0, 0);
+        assert!(s.begin_create());
+        s.apply(SurfaceEvent::Created);
+        assert!(s.apply(SurfaceEvent::Hidden).is_some());
+        assert!(
+            s.apply(SurfaceEvent::Ready).is_some(),
+            "隐藏期间的 ready 要被记住"
+        );
+        assert_eq!(s.state(), &SurfaceState::Hidden, "隐藏期间可见性不变");
+        assert!(s.apply(SurfaceEvent::Resumed).is_some());
+        assert_eq!(s.state(), &SurfaceState::Ready, "恢复即 Ready");
+        s.push_mut().set_desired(3);
+        assert_eq!(s.take_pending(), Some(&3), "恢复后推最新快照");
     }
 
     #[test]

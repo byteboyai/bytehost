@@ -17,7 +17,8 @@ pub struct PanelMeta {
     pub id: PanelId,
     /// 用户可见显示名(产品提供;Host 不本地化)。
     pub title: String,
-    /// 该面板声明的 Surface 槽位(至少一个;通常只有 `SurfaceSlot::MAIN`)。
+    /// 该面板声明的 Surface 槽位。**可为空**:Surface 是可选的 WebView 承载机制,
+    /// 纯 iced 原生面板(如大纲、状态页、文件树)不承载 WebView,不声明任何槽位。
     pub surfaces: Vec<SurfaceSlot>,
 }
 
@@ -46,8 +47,8 @@ pub enum CatalogError {
         first_title: String,
         second_title: String,
     },
-    /// 面板未声明任何 Surface。
-    NoSurfaces(PanelId),
+    /// 同一个面板内声明了重复的 Surface 槽位。
+    DuplicateSurface { id: PanelId, slot: SurfaceSlot },
 }
 
 impl fmt::Display for CatalogError {
@@ -61,22 +62,36 @@ impl fmt::Display for CatalogError {
                 f,
                 "面板 id 重复:{id}(先注册为 {first_title:?},又注册为 {second_title:?})"
             ),
-            Self::NoSurfaces(id) => write!(f, "面板 {id} 未声明任何 Surface"),
+            Self::DuplicateSurface { id, slot } => {
+                write!(f, "面板 {id} 重复声明 Surface 槽位 {slot}")
+            }
         }
     }
 }
 
 impl std::error::Error for CatalogError {}
 
+/// 返回第一个重复出现的槽位(若存在),用于注册时拒绝同一面板内重复声明。
+fn first_duplicate(surfaces: &[SurfaceSlot]) -> Option<SurfaceSlot> {
+    let mut seen = std::collections::BTreeSet::new();
+    surfaces.iter().copied().find(|s| !seen.insert(*s))
+}
+
 impl PanelCatalog {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 注册一个面板。重复 id 或空 Surface 立即报错(不静默覆盖)。
+    /// 注册一个面板。重复 id 或同一面板内重复的 Surface 槽位立即报错(不静默覆盖)。
+    ///
+    /// **允许零 Surface**:Surface 是可选的 WebView 承载机制,纯 iced 原生面板不声明槽位。
+    /// 对已声明的槽位仍做重复检查。
     pub fn register(&mut self, meta: PanelMeta) -> Result<(), CatalogError> {
-        if meta.surfaces.is_empty() {
-            return Err(CatalogError::NoSurfaces(meta.id.clone()));
+        if let Some(dup) = first_duplicate(&meta.surfaces) {
+            return Err(CatalogError::DuplicateSurface {
+                id: meta.id.clone(),
+                slot: dup,
+            });
         }
         if let Some(existing) = self.entries.get(&meta.id) {
             return Err(CatalogError::DuplicateId {
@@ -151,16 +166,46 @@ mod tests {
     }
 
     #[test]
-    fn panel_without_surfaces_is_rejected() {
+    fn panel_without_surfaces_is_allowed_for_native_panels() {
+        // Surface 是可选的 WebView 承载机制;纯 iced 原生面板不声明任何槽位。
         let mut c = PanelCatalog::new();
         let meta = PanelMeta {
             id: id("shared.x"),
             title: "X".into(),
             surfaces: vec![],
         };
+        c.register(meta).unwrap();
+        assert_eq!(c.get(&id("shared.x")).unwrap().surfaces.len(), 0);
+    }
+
+    #[test]
+    fn duplicate_surface_slot_within_a_panel_is_rejected() {
+        let mut c = PanelCatalog::new();
+        let meta = PanelMeta {
+            id: id("shared.dup"),
+            title: "Dup".into(),
+            surfaces: vec![SurfaceSlot::MAIN, SurfaceSlot::new(1), SurfaceSlot::MAIN],
+        };
         assert_eq!(
             c.register(meta),
-            Err(CatalogError::NoSurfaces(id("shared.x")))
+            Err(CatalogError::DuplicateSurface {
+                id: id("shared.dup"),
+                slot: SurfaceSlot::MAIN,
+            })
         );
+    }
+
+    #[test]
+    fn native_panel_registers_alongside_surface_panels() {
+        let mut c = PanelCatalog::new();
+        c.register(PanelMeta::single_surface(id("shared.usage"), "Usage"))
+            .unwrap();
+        c.register(PanelMeta {
+            id: id("digger.outline"),
+            title: "大纲".into(),
+            surfaces: vec![],
+        })
+        .unwrap();
+        assert_eq!(c.len(), 2);
     }
 }

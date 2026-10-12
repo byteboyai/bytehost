@@ -223,10 +223,16 @@ pub trait Emitter<M>: Send + Sync + 'static {
 /// 一个**作用域请求**的执行原语:
 /// 1. 读取 `context`(泛型服务上下文,core 不解释其类型);
 /// 2. 在后台执行器上跑 `work`,产出信封;
-/// 3. 结果经 `emitter` 投回 UI,**派发前**由 `accepts` 校验身份(超期的丢弃)。
+/// 3. 结果经 `emitter` 投回 UI,在后台完成时由 `accepts` 先做一次校验(超期的丢弃)。
 ///
-/// 关键:校验发生在**派发路径**上,而非只在后台完成时;因此即便结果早已入队,
-/// 只要期间又有同 key 新请求,旧结果仍会被拒绝。
+/// **契约(重要)**:这里的 `accepts` 是**尽力而为的前置过滤**——它在 `work` 完成、
+/// `emit` 入队**之前**运行,能挡掉"后台还在跑时又被更晚的同 key 请求取代"的结果,
+/// 但**不能**保证"已入队、UI 尚未消费时**又被取代**"的结果不会送达:一旦 `emit`
+/// 把信封投进 UI 通道,后续 `begin` 无法撤回它。
+///
+/// 因此**权威校验必须在消费点**做:UI 收到信封后,应再次用当前 `RequestTracker`
+/// 调 [`RequestTracker::accepts`] 再分发给业务(见产品侧 `AsyncResult` 处理路径)。
+/// 本函数只负责让"明显过期"的结果尽早消失,减少跨线程投递。
 pub fn run_scoped<C, M, W, EX, EM>(
     tracker: &RequestTracker,
     token: RequestToken,
@@ -245,7 +251,8 @@ pub fn run_scoped<C, M, W, EX, EM>(
     let emitter = emitter.clone();
     executor.spawn(Box::new(move || {
         let envelope = ResultEnvelope::new(token, work(context));
-        // 派发前校验:身份过期则丢弃(业务结果已由服务持久化)。
+        // 前置过滤:完成时若身份已过期则丢弃(业务结果已由服务持久化)。
+        // 注意这是尽力而为——已入队后又被取代的结果仍需消费点重校验(见上方契约)。
         if tracker.accepts(&envelope.token) {
             emitter.emit(envelope);
         }
@@ -425,5 +432,26 @@ mod tests {
         assert!(got.contains(&"w2".to_string()), "写 2 必须完成");
         assert!(!got.contains(&"r_old".to_string()), "旧读取必须被丢弃");
         assert!(got.contains(&"r_new".to_string()), "最新读取必须应用");
+    }
+
+    #[test]
+    fn already_emitted_result_is_not_retracted_by_a_later_begin_but_consumer_rejects_it() {
+        // 边界契约:结果一旦入队,后续 begin 不能撤回——run_scoped 的前置过滤只
+        // 覆盖"完成前被取代"。因此消费点必须再次用 accepts 校验(产品侧 AsyncResult
+        // 的权威检查)。本测试把这条边界钉死,防止文档再次夸大前置校验的保证。
+        let t = tracker(1, "p", 1, 0);
+        let (tx, rx) = mpsc::channel();
+        let emitter = ChannelEmitter(tx);
+        let first = t.begin(LIST);
+        run_scoped(&t, first.clone(), (), &InlineExecutor, &emitter, |_| {
+            "first".to_string()
+        });
+        // 结果已入队(前置校验通过,因为此刻 first 仍是最新)。
+        let env = rx.try_recv().expect("first 结果已入队");
+        assert_eq!(env.payload, "first");
+        // 现在发起新请求:入队的旧结果不会被撤回……
+        let _second = t.begin(LIST);
+        assert!(!t.accepts(&env.token), "……但消费点重校验会拒绝它");
+        assert!(t.accepts(&t.begin(LIST)), "最新请求仍被接受");
     }
 }

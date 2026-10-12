@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// 形状为 `<namespace>.<name>` 或 `<namespace>:<name>`(应用面板用 `app:<validated-id>`,
 /// 其中 `<validated-id>` 已由产品侧的 `AppId` 校验)。名字段与命名空间都限小写字母、
-/// 数字、`-`、`_`,以字母开头,保证它既是稳定键、也安全可读。
+/// 数字、`-`、`_`,以字母开头,保证它既是稳定键、也安全可读。**例外**:`app:`
+/// 命名空间的名字段承载已校验的 `AppId`,与 `AppId` 的形状一致——允许数字开头
+/// (如 `app:0day`)、不含 `_`。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct PanelId(String);
@@ -65,6 +67,26 @@ fn valid_segment(seg: &str) -> Result<(), PanelIdError> {
     Ok(())
 }
 
+/// `app:` 命名空间的名字段校验:允许数字开头(与已校验的 `AppId` 形状一致——
+/// `AppId` 允许 `0day` 这类数字开头的 id)。字符集与 `AppId` 相同(`[a-z0-9-]`,
+/// 不含 `_`,不以 `-` 开头/结尾);名字段已由产品侧 `AppId` 校验过,这里只做
+/// 形状自洽检查,避免 `app:123-notes` 这类合法应用在接入 rail/注册表时表示不出来。
+fn valid_app_name_segment(seg: &str) -> Result<(), PanelIdError> {
+    let Some(first) = seg.chars().next() else {
+        return Err(PanelIdError::EmptySegment);
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err(PanelIdError::SegmentMustStartWithLetter(first));
+    }
+    if let Some(c) = seg
+        .chars()
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'))
+    {
+        return Err(PanelIdError::BadChar(c));
+    }
+    Ok(())
+}
+
 impl PanelId {
     pub fn new(s: impl Into<String>) -> Result<Self, PanelIdError> {
         let s = s.into();
@@ -79,12 +101,18 @@ impl PanelId {
         let (ns, rest) = s.split_at(sep_pos);
         let name = &rest[1..];
         valid_segment(ns)?;
-        valid_segment(name)?;
+        // `app:` 命名空间的名字段是已校验的 `AppId`,允许数字开头。
+        if ns == "app" {
+            valid_app_name_segment(name)?;
+        } else {
+            valid_segment(name)?;
+        }
         Ok(Self(s))
     }
 
     /// 用**已校验**的应用 id 构造 `app:<id>` 面板 id。调用方负责先经 `AppId` 校验;
-    /// 这里只做 `app:` 前缀包装,再走一遍本类型自己的形状校验。
+    /// 这里只做 `app:` 前缀包装,再走一遍本类型自己的形状校验(与 `AppId` 形状一致,
+    /// 允许数字开头,如 `app:0day`)。
     pub fn for_app(validated_app_id: &str) -> Result<Self, PanelIdError> {
         Self::new(format!("app:{validated_app_id}"))
     }
@@ -279,6 +307,23 @@ mod tests {
         // 非法应用 id(带大写/斜杠)会被本类型自身再挡一次。
         assert!(PanelId::for_app("Excal").is_err());
         assert!(PanelId::for_app("../x").is_err());
+    }
+
+    #[test]
+    fn panel_id_for_app_accepts_digit_leading_valid_app_ids() {
+        // AppId 允许数字开头(`0day` 是 AppId 自己的测试样例);for_app 必须能表示它。
+        assert_eq!(PanelId::for_app("0day").unwrap().as_str(), "app:0day");
+        assert_eq!(
+            PanelId::for_app("123-notes").unwrap().as_str(),
+            "app:123-notes"
+        );
+        // 但仍拒绝与 AppId 形状不符的:下划线不在 AppId 字符集内。
+        assert!(PanelId::for_app("a_b").is_err());
+        // 普通命名空间的名字段不受此放宽影响,仍要求字母开头。
+        assert_eq!(
+            PanelId::new("ns.0day"),
+            Err(PanelIdError::SegmentMustStartWithLetter('0'))
+        );
     }
 
     #[test]
