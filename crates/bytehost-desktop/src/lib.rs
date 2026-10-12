@@ -14,11 +14,13 @@
 //! - [`surface`]:Surface 生命周期状态机执行、`(instance, slot, generation)` 路由与几何。
 //! - [`layout`]:产品历史布局 → 稳定 `Layout` 的迁移流程(版本闸门 / 未知保留 / 原子落盘)。
 //! - [`panes`]:`PanelId` 键控的 rail 顺序 + 每面板分栏状态与拖拽换算(产品中立)。
+//! - [`hover`] 提供产品中立的可悬停元素槽位词汇(`HoverSlot`,与具体面板无关)。
 //! - `focus`:独立原生窗口的"因失焦而关闭"判定(与产品无关)。
 
 pub mod app_webview;
 pub mod dispatch;
 pub mod focus;
+pub mod hover;
 pub mod layout;
 pub mod panel;
 pub mod panes;
@@ -30,6 +32,7 @@ pub use app_webview::{
     evaluate_app, set_app_bounds,
 };
 pub use focus::{FocusRouter, FocusTarget, FocusTracker, focus_transition};
+pub use hover::HoverSlot;
 pub use layout::{
     LegacyPanelAdapter, MigrateError, MigrationOutcome, atomic_save_layout, migrate_legacy_file,
     migrate_legacy_layout, reconcile_with_catalog,
