@@ -27,7 +27,7 @@ pub use app_webview::{
     AppSurfaceBuilt, AppSurfaceIpc, AppSurfaceSpec, app_handle_count, build_app_child, destroy_app,
     evaluate_app, set_app_bounds,
 };
-pub use focus::{FocusTracker, focus_transition};
+pub use focus::{FocusRouter, FocusTarget, FocusTracker, focus_transition};
 pub use layout::{
     LegacyPanelAdapter, MigrateError, MigrationOutcome, atomic_save_layout, migrate_legacy_file,
     migrate_legacy_layout, reconcile_with_catalog,
