@@ -16,7 +16,7 @@
 ## 谁是消费者
 
 - **Dozer**(wry + iced 宿主):已接入。`dozerd` 打开 `bytehost-apps/server` 跑 gateway 与监管;`dozer-app` 用 `bytehost-client`(UDS)+ `bytehost-panel` + `bytehost-webview`。
-- **Digger**(Tauri 宿主,无守护进程):嵌入待做。用 `bytehost-client/in-process` 的 `InProcess` 直接在进程内驱动 `AppService`,`bytehost-webview` 的纯策略由 Tauri 侧建子 webview 时调用。
+- **Digger**(iced + wry 宿主,无守护进程):**进程内嵌入已实现**(2026-10-12,本地候选,尚未随 tag 发布)。用 `bytehost-client/in-process` 的 `InProcess` 直接在进程内驱动 `AppService`,`bytehost-webview` 的纯策略由 Digger 侧建子 webview 时调用。注意:Digger **不是** Tauri 宿主——Tauri 方案已撤回(见 Digger `docs/adr/ADR-001`、`ADR-011`),与 Dozer 同用 iced 0.14 + `byteui` + `wry` 子 webview。
 
 ## 独立嵌入(没有守护进程)
 
