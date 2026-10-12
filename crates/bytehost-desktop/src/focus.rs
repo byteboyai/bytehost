@@ -136,7 +136,6 @@ impl<K> FocusRouter<K> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,11 +168,25 @@ mod tests {
         assert_eq!(r.current_native(), Some(&7));
         let mut focused = Vec::new();
         let mut window = 0;
-        r.apply(|k| Some(*k as u64), |h| { focused.push(h); true }, || window += 1);
+        r.apply(
+            |k| Some(*k as u64),
+            |h| {
+                focused.push(h);
+                true
+            },
+            || window += 1,
+        );
         assert_eq!(focused, vec![7]);
         assert_eq!(window, 0);
         // 待处理已清空:再 apply 不产生动作。
-        r.apply(|k| Some(*k as u64), |h| { focused.push(h); true }, || window += 1);
+        r.apply(
+            |k| Some(*k as u64),
+            |h| {
+                focused.push(h);
+                true
+            },
+            || window += 1,
+        );
         assert_eq!(focused, vec![7]);
     }
 
@@ -183,12 +196,26 @@ mod tests {
         r.set(FocusTarget::Native(3));
         let mut focused = 0;
         let mut window = 0;
-        r.apply(|_| None, |_| { focused += 1; false }, || window += 1);
+        r.apply(
+            |_| None,
+            |_| {
+                focused += 1;
+                false
+            },
+            || window += 1,
+        );
         assert_eq!(focused, 0);
         assert_eq!(window, 1);
         // 解析到句柄但聚焦失败:也回落窗口。
         r.set(FocusTarget::Native(3));
-        r.apply(|k| Some(*k as u64), |_| { focused += 1; false }, || window += 1);
+        r.apply(
+            |k| Some(*k as u64),
+            |_| {
+                focused += 1;
+                false
+            },
+            || window += 1,
+        );
         assert_eq!(focused, 1);
         assert_eq!(window, 2);
     }
@@ -209,7 +236,14 @@ mod tests {
         let mut r: FocusRouter<u8> = FocusRouter::default();
         r.set_current(FocusTarget::Native(9));
         let mut focused = 0;
-        r.apply(|k| Some(*k as u64), |_| { focused += 1; true }, || {});
+        r.apply(
+            |k| Some(*k as u64),
+            |_| {
+                focused += 1;
+                true
+            },
+            || {},
+        );
         assert_eq!(focused, 0);
     }
 }

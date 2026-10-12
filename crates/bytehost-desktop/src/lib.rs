@@ -40,15 +40,14 @@ pub use layout::{
     LegacyPanelAdapter, MigrateError, MigrationOutcome, atomic_save_layout, migrate_legacy_file,
     migrate_legacy_layout, reconcile_with_catalog,
 };
-pub use panes::{
-    PaneDims, PaneDragInput, PaneDragOutcome, PaneSpec, PaneStore, RailItems,
-    apply_pane_split_drag,
-};
 pub use overlay::{
     BACKDROP_CORNER_RADIUS, POPUP_WIDTH_FRACTION, centered_card_offset,
     enable_overlay_mouse_moved_events, full_window_overlay_bounds, open_child_window,
     open_child_window_unfocused, open_overlay, popup_card_size, reposition_overlay, stack_bounds,
     window_logical_size,
+};
+pub use panes::{
+    PaneDims, PaneDragInput, PaneDragOutcome, PaneSpec, PaneStore, RailItems, apply_pane_split_drag,
 };
 pub use shell::{HostMessage, Product, SurfaceEvent, route_lifecycle};
 pub use surface::SurfaceExecutor;
