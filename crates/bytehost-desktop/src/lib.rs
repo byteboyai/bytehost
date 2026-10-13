@@ -18,6 +18,8 @@
 //! - `focus`:独立原生窗口的"因失焦而关闭"判定(与产品无关)。
 //! - [`overlay`]:独立原生浮层的建窗 + 定位 + 鼠标穿透/圆角遮罩几何(产品中立,
 //!   不绑渲染器后端;渲染管线经泛型工厂接入)。
+//! - `overlay_gpu`(`overlay` feature):独立原生浮层共用的 wgpu 渲染管线 +
+//!   遮罩外壳(C10 方案 C),仅在开启 `overlay` 时编译。
 
 pub mod app_webview;
 pub mod dispatch;
@@ -25,6 +27,8 @@ pub mod focus;
 pub mod hover;
 pub mod layout;
 pub mod overlay;
+#[cfg(feature = "overlay")]
+pub mod overlay_gpu;
 pub mod panel;
 pub mod panes;
 pub mod shell;
@@ -46,6 +50,8 @@ pub use overlay::{
     open_child_window_unfocused, open_overlay, popup_card_size, reposition_overlay, stack_bounds,
     window_logical_size,
 };
+#[cfg(feature = "overlay")]
+pub use overlay_gpu::{OverlayGpu, apply_cursor, backdrop_card, backdrop_card_shrink};
 pub use panes::{
     PaneDims, PaneDragInput, PaneDragOutcome, PaneSpec, PaneStore, RailItems, apply_pane_split_drag,
 };

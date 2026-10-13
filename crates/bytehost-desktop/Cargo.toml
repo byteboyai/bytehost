@@ -28,6 +28,27 @@ winit = "0.30"
 raw-window-handle = "0.6"
 objc2-app-kit = "0.3"
 
+# C10 方案 C:把 `OverlayGpu`(wgpu 渲染管线)+ `backdrop_card*`(遮罩外壳)也上收宿主,
+# 使产品侧浮层文件不再自写"建窗/透明/穿透/alpha 模式"机制(`R-OVERLAY-DUP` 归零)。
+# **默认 feature 关**:不开 `overlay` 的消费方(digger、测试、desktop 自身默认构建)
+# 依赖树**不变**,不触发 R2 红线(不把 tiny-skia fallback renderer 并进消费方)。
+# 开启 `overlay` 的消费方(dozer-app)本来已依赖这些 crate,且必须与本模块使用
+# **同一份** iced/iced_wgpu/iced_winit/iced_renderer(同一 feature 集),否则
+# `Renderer` 类型不匹配——现状三者都以同一 git tag 锁 iced 0.14,可满足。
+iced_wgpu = { version = "0.14", optional = true, default-features = true }
+iced_winit = { version = "0.14", optional = true }
+iced_widget = { version = "0.14", optional = true, features = ["wgpu", "canvas", "svg", "markdown", "highlighter", "image"] }
+iced_renderer = { version = "0.14", optional = true }
+
+[features]
+default = []
+overlay = [
+    "dep:iced_wgpu",
+    "dep:iced_winit",
+    "dep:iced_widget",
+    "dep:iced_renderer",
+]
+
 [dev-dependencies]
 
 [[example]]
