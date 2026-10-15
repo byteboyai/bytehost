@@ -10,3 +10,5 @@ description = "应用 webview 的纯安全策略:origin 导航白名单、每应
 bytehost-apps = { path = "../bytehost-apps" }
 url = "2"
 uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

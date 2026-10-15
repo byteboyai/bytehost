@@ -279,6 +279,8 @@ mod tests {
                 icon: None,
                 surface_hint: None,
                 entrypoint: "main".into(),
+                title_key: None,
+                title_fallback: None,
             },
             entrypoints: BTreeMap::from([(
                 "main".to_string(),
@@ -286,11 +288,14 @@ mod tests {
                     kind: EntrypointKind::Web,
                     path: "/".into(),
                     title: None,
+                    title_key: None,
+                    title_fallback: None,
                 },
             )]),
             runtime,
             permissions,
             health: Health::default(),
+            i18n: None,
         }
     }
 

@@ -1,0 +1,6 @@
+{
+  "app.title": "Bilingual Live",
+  "main.title": "Open Demo",
+  "greeting": "Hello, world!",
+  "switch.hint": "This app receives language changes live via the bytehost i18n bridge."
+}

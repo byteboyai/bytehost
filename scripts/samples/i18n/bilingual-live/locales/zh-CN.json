@@ -1,0 +1,6 @@
+{
+  "app.title": "双语实时",
+  "main.title": "打开演示",
+  "greeting": "你好，世界！",
+  "switch.hint": "本应用通过 bytehost 语言桥实时接收语言变化。"
+}

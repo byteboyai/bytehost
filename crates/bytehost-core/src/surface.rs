@@ -498,4 +498,65 @@ mod tests {
         s.apply(SurfaceEvent::Ready);
         assert!(!s.begin_create(), "就绪时不得再创建");
     }
+
+    /// 语言桥快照的推送维度(B06 / B07):`Surface` 泛型 `PushState` 已原生满足
+    /// "首 ready 推完整快照、仅语言变更也推、hidden 保留最新恢复同步、rebuild 强制重推"。
+    /// 这里用与 `I18nSnapshot` 同形的局部值证明语义,不引入 webview 依赖。
+    #[test]
+    fn locale_push_fires_on_language_change_even_if_shape_unchanged() {
+        #[derive(Debug, Clone, PartialEq)]
+        struct Locale {
+            ui_locale: &'static str,
+            app_locale: &'static str,
+            revision: u64,
+        }
+        let mut s: Surface<Locale> = Surface::new(id(0, 0), SurfaceKind::Application);
+        assert!(s.begin_create());
+        s.apply(SurfaceEvent::Created);
+        s.apply(SurfaceEvent::Ready);
+        s.push_mut().set_desired(Locale {
+            ui_locale: "zh-CN",
+            app_locale: "zh-CN",
+            revision: 1,
+        });
+        assert_eq!(
+            s.take_pending().unwrap().revision,
+            1,
+            "首 ready 推送完整快照"
+        );
+        s.push_mut().mark_sent(Locale {
+            ui_locale: "zh-CN",
+            app_locale: "zh-CN",
+            revision: 1,
+        });
+        assert!(s.take_pending().is_none(), "已送达且未变,不重推");
+
+        // 语言没变但 revision 推进(宿主语言切换代次)→ 必须重推。
+        s.push_mut().set_desired(Locale {
+            ui_locale: "zh-CN",
+            app_locale: "zh-CN",
+            revision: 2,
+        });
+        assert_eq!(
+            s.take_pending().unwrap().revision,
+            2,
+            "仅 revision 变也应重推(精确协商后 app_locale 不变也算变更)"
+        );
+
+        // 隐藏期间 revision 推进:隐藏不推,恢复后推最新。
+        s.push_mut().mark_sent(Locale {
+            ui_locale: "zh-CN",
+            app_locale: "zh-CN",
+            revision: 2,
+        });
+        s.apply(SurfaceEvent::Hidden);
+        s.push_mut().set_desired(Locale {
+            ui_locale: "zh-CN",
+            app_locale: "zh-CN",
+            revision: 3,
+        });
+        assert!(s.take_pending().is_none(), "隐藏期间不推");
+        s.apply(SurfaceEvent::Resumed);
+        assert_eq!(s.take_pending().unwrap().revision, 3, "恢复后推最新快照");
+    }
 }

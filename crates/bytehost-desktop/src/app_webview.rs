@@ -22,6 +22,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use bytehost_core::{LogicalRect, SurfaceSlot};
+pub use bytehost_webview::i18n::{
+    I18nSnapshot, build_i18n_snapshot, i18n_bridge_init_script, i18n_set_locale_script,
+    should_install_bridge,
+};
 use bytehost_webview::{
     AppIpc, AppOrigin, StoreRemovalOutcome, app_init_script, data_store_identifier, new_ipc_nonce,
 };
@@ -78,7 +82,10 @@ thread_local! {
 /// 在主线程用 `window::run` 创建一个**受限**应用子视图。
 ///
 /// - `on_ipc`:收到一条通过 nonce 白名单的上行事件(在窗口线程调用,须自行把消息送回窗口)。
-/// - `on_ready`:页面导航完成(用于把 `SurfaceKind::Application` 推到 `Ready`)。
+/// - `on_ready`:页面导航完成(用于把 `SurfaceKind::Application` 推到 `Ready`);宿主应在此后
+///   经 `evaluate_app` 下发首帧语言快照(见 `i18n_set_locale_script`)。
+/// - `install_i18n_bridge`:manifest 声明 `[i18n]` 且 `webview_locale != none` 时为 `true`,
+///   初始化脚本里装入只读语言桥骨架(真实值由 `evaluate_app` 下发);`none` 不装,桥不存在。
 /// - `wrap`:把创建结果包成产品消息。
 ///
 /// 返回的 `Task` 完成时产出 `wrap(AppSurfaceBuilt)`。
@@ -87,6 +94,7 @@ pub fn build_app_child<M>(
     spec: AppSurfaceSpec,
     on_ipc: impl Fn(SurfaceSlot, AppSurfaceIpc) + Send + 'static,
     on_ready: impl Fn(SurfaceSlot) + Send + 'static,
+    install_i18n_bridge: bool,
     wrap: impl Fn(AppSurfaceBuilt) -> M + Send + 'static,
 ) -> Task<M>
 where
@@ -114,7 +122,7 @@ where
             .with_data_store_identifier(data_store_identifier(&app_id))
             .with_download_started_handler(|_, _| false)
             .with_devtools(false)
-            .with_initialization_script(app_init_script(&nonce))
+            .with_initialization_script(app_init_script(&nonce, install_i18n_bridge))
             .with_ipc_handler(move |req| {
                 if let Some(ipc) = AppIpc::parse(req.body().as_str(), &nonce) {
                     on_ipc(slot, ipc.into());
@@ -307,6 +315,47 @@ mod tests {
         assert!(
             !body.contains("fn data_store_identifier"),
             "存储标识唯一真相在 bytehost-webview,不得另抄一份"
+        );
+    }
+
+    /// T0 spike（i18n 注入接缝）的源码钉死：语言快照**必须**经导航后的 `evaluate_app` 下发，
+    /// **不得**靠创建时一次性冻结的初始化脚本携带。据此保证“语言变化后新文档不会暴露旧快照”。
+    /// 这是 spec §6.1 pending/skeleton 路径的验收依据；T4 实现桥时不得违反。
+    #[test]
+    fn i18n_locale_must_be_pushed_post_navigation_not_via_init_script() {
+        let src = include_str!("app_webview.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+
+        // 初始化脚本只在创建时注入一次（冻结），没有按文档重注入的循环/二次调用路径。
+        assert_eq!(
+            prod.matches("with_initialization_script(").count(),
+            1,
+            "初始化脚本只能注入一次(创建时冻结),不能按文档更新 locale"
+        );
+        assert!(
+            prod.contains("with_initialization_script(app_init_script(&nonce,"),
+            "初始化脚本必须是 app_init_script(&nonce, install_i18n_bridge),不得内嵌 locale 值"
+        );
+
+        // 运行时语言下发唯一通道是 evaluate_app -> wv.evaluate_script（导航完成后）。
+        let eval = prod.find("pub fn evaluate_app(").unwrap();
+        let eval_body = &prod[eval..];
+        assert!(
+            eval_body.contains("wv.evaluate_script("),
+            "运行时下发必须走 evaluate_app -> wv.evaluate_script"
+        );
+
+        // ready 时机是导航完成(PageLoadEvent::Finished),语言首帧在此之后下发。
+        assert!(
+            prod.contains("wry::PageLoadEvent::Finished"),
+            "应用 Surface ready 须为导航完成"
+        );
+
+        // 不引入新的 IPC 动词或 dozer:// 通道。
+        assert!(!prod.contains("dozer://"), "不得注册 dozer:// 通道");
+        assert!(
+            !prod.contains("with_custom_protocol"),
+            "不得为应用注册自定义协议"
         );
     }
 

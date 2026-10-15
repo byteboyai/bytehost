@@ -1,0 +1,6 @@
+{
+  "app.title": "Partial Initial",
+  "main.title": "Open Demo",
+  "greeting": "Hello, world!",
+  "switch.hint": "This app gets the language once at startup (initial), not on later switches."
+}

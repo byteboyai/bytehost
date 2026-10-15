@@ -15,6 +15,7 @@ pub mod digest;
 pub mod event;
 #[cfg(feature = "server")]
 pub mod gateway;
+pub mod i18n;
 pub mod id;
 #[cfg(feature = "server")]
 pub mod launch;

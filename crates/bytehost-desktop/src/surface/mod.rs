@@ -19,6 +19,7 @@ pub mod routing;
 pub use routing::{Routed, SurfaceRouter};
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use bytehost_core::{
     PanelInstanceId, Surface, SurfaceEvent as CoreEvent, SurfaceId, SurfaceKind, SurfaceSlot,
@@ -31,6 +32,53 @@ use routing::PhysicalSlot;
 ///
 /// 宿主不知道业务内容,只负责决定**何时**推(去重、隐藏缓存、重建重发)。
 pub type ScriptBuilder<T> = Box<dyn Fn(&T) -> String + Send>;
+
+/// 应用语言桥快照推送的执行失败有界退避(规格 §6.2 / B11)。
+///
+/// 失败按 250ms / 1s / 2s 退避三次,之后停止主动重试,等下一次 ready / 恢复 / 语言变化等
+/// 事件再触发推送;**绝不**在 `about_to_wait` 里零间隔循环重试。注入脚本执行成功后调用
+/// [`PushBackoff::reset`] 复位,恢复即时推送能力。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PushBackoff {
+    attempts: u8,
+}
+
+impl PushBackoff {
+    pub fn new() -> Self {
+        Self { attempts: 0 }
+    }
+
+    /// 重置(脚本成功执行、或活动版本/语言变化后调用)。
+    pub fn reset(&mut self) {
+        self.attempts = 0;
+    }
+
+    /// 记录一次失败,返回下一次重试应等待的延迟;`None` 表示已达上限,停止主动重试
+    /// (交由 ready/恢复/语言变更等外部事件重新触发)。
+    pub fn on_failure(&mut self) -> Option<Duration> {
+        const DELAYS: [Duration; 3] = [
+            Duration::from_millis(250),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ];
+        let i = self.attempts as usize;
+        if i >= DELAYS.len() {
+            return None;
+        }
+        self.attempts += 1;
+        Some(DELAYS[i])
+    }
+
+    /// 是否已达重试上限。
+    pub fn exhausted(&self) -> bool {
+        self.attempts as usize >= 3
+    }
+}
+
+/// 应用语言桥的推送执行器别名:产品用 `AppDisplayI18n` 算出 [`bytehost_webview::i18n::I18nSnapshot`]
+/// 后,以 `SurfaceExecutor<bytehost_webview::i18n::I18nSnapshot>` 驱动"首次 ready 推完整快照、
+/// 仅语言变更也推、hidden 保留最新恢复同步、rebuild 强制重推"的既有不变量(见 §6.2)。
+pub type AppI18nExecutor = SurfaceExecutor<bytehost_webview::i18n::I18nSnapshot>;
 
 /// 单个 Surface 的运行时登记:core 状态 + 物理槽 + 载荷缓存。
 struct Entry<T> {
@@ -383,5 +431,63 @@ mod tests {
         assert_eq!(ex.state(id), Some(&SurfaceState::Absent));
         assert_eq!(ex.len(), 1);
         assert!(ex.drain_ready_pushes().is_empty());
+    }
+
+    #[test]
+    fn app_i18n_snapshot_is_pushed_on_ready_and_repushed_on_rebuild() {
+        // 应用语言桥走 SurfaceExecutor<I18nSnapshot>:首次 ready 推首帧,同源再导航(新 Ready)
+        // 强制重推,仅语言变化(revision 推进)也触发 pending(B06 / B07)。
+        use bytehost_webview::i18n::{I18nSnapshot, i18n_set_locale_script};
+        let mut ex: SurfaceExecutor<I18nSnapshot> = SurfaceExecutor::new();
+        let id = sid(0, 0);
+        ex.register(
+            id,
+            SurfaceKind::Application,
+            Slot(0),
+            Box::new(i18n_set_locale_script),
+        );
+        ex.begin_create(id);
+        ex.apply(id, CoreEvent::Created);
+        ex.apply(id, CoreEvent::Ready);
+        ex.set_desired(id, I18nSnapshot::new("zh-CN", "zh-CN", 1));
+        let pushes = ex.drain_ready_pushes();
+        assert_eq!(pushes.len(), 1, "首次 ready 推首帧");
+        assert!(pushes[0].2.contains("window.__bytehost_i18n_set"));
+        assert!(
+            pushes[0].2.contains("\"ui_locale\":\"zh-CN\""),
+            "推送携带最新 ui_locale"
+        );
+        ex.mark_sent(id, I18nSnapshot::new("zh-CN", "zh-CN", 1));
+
+        // 同源再导航(新 Ready)→ 强制重推,即使 desired 没变。
+        ex.apply(id, CoreEvent::Ready);
+        let pushes = ex.drain_ready_pushes();
+        assert_eq!(pushes.len(), 1, "重建/new ready 强制重推");
+
+        // 仅语言变化(revision 推进)→ 触发 pending。
+        ex.mark_sent(id, I18nSnapshot::new("zh-CN", "zh-CN", 1));
+        ex.set_desired(id, I18nSnapshot::new("en", "en", 2));
+        assert!(ex.pending(id).is_some(), "语言变化应待推送");
+        let pushes = ex.drain_ready_pushes();
+        assert_eq!(pushes.len(), 1);
+        assert!(pushes[0].2.contains("\"ui_locale\":\"en\""));
+    }
+
+    #[test]
+    fn push_backoff_is_bounded_and_resets_on_success() {
+        // 脚本执行失败按 250ms / 1s / 2s 退避,三次后停止主动重试,成功/变化后复位(B11)。
+        let mut b = PushBackoff::new();
+        assert_eq!(b.on_failure(), Some(Duration::from_millis(250)));
+        assert_eq!(b.on_failure(), Some(Duration::from_secs(1)));
+        assert_eq!(b.on_failure(), Some(Duration::from_secs(2)));
+        assert!(b.exhausted());
+        assert_eq!(b.on_failure(), None, "三次后停止主动重试(等外部事件)");
+        b.reset();
+        assert!(!b.exhausted());
+        assert_eq!(
+            b.on_failure(),
+            Some(Duration::from_millis(250)),
+            "重置后恢复即时重试能力"
+        );
     }
 }

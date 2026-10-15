@@ -2,10 +2,12 @@
 //! 宿主产品把 [`AppRequest`]/[`AppReply`] 原样塞进自己的 socket 协议里(Dozer 见 `dozer-core::protocol` 的
 //! `Request::App`/`Reply::App`),Digger 将来用同一组类型走它自己的 socket。**本 crate 不知道 socket 长什么样。**
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::WebViewLocale;
 use crate::id::{AppId, Version};
 use crate::plan::{ApprovedInstallPlan, InstallPlan, Provenance, TrustLevel};
 use crate::registry::{RollbackNote, UninstallMode};
@@ -73,6 +75,65 @@ pub struct AppSummary {
     /// 最近一次回滚记录(含被跳过的自动回滚);没有则 `None`。旧形状 JSON 解析为 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback_note: Option<RollbackNote>,
+    /// 经校验的 i18n 展示元数据(仅投影声明标题,不携带完整词表/资源路径/启动令牌)。
+    /// 旧形状 JSON(无此字段)解析为 `None`;运行期损坏或不可用时也回落为 `None`,不让 List 整体失败。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_i18n: Option<AppDisplayI18n>,
+}
+
+/// 列表项带出的 i18n 展示元数据:只投影 manifest 声明的标题 key,供产品在视图里按自己的 active locale 解析。
+///
+/// 不含完整词表、资源路径或启动令牌;逐支持语言已解析出标题值,产品用 `resolve_title` 按协商后的语言取用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AppDisplayI18n {
+    /// 声明默认语言(规范标签)。
+    pub default_locale: String,
+    /// 声明的支持语言(规范标签)。
+    pub supported_locales: Vec<String>,
+    /// 页面语言桥能力(`none` 表示不安装桥)。
+    #[serde(default)]
+    pub webview_locale: WebViewLocale,
+    /// 每个被 manifest 声明的标题(presentation + 各 entrypoint)的投影。
+    pub titles: Vec<AppDisplayTitle>,
+}
+
+/// 一个被声明的标题投影:来源、key、必填 fallback,以及逐支持语言已解析出的标题值。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppDisplayTitle {
+    /// 标题来源(presentation 或某 entrypoint)。
+    pub scope: DisplayTitleScope,
+    /// 资源 key。
+    pub key: String,
+    /// 解析失败时的兜底文本(始终非空)。
+    pub fallback: String,
+    /// 规范语言标签 -> 该语言下解析到的标题(已走 current→default→fallback 顺序,空值/不安全值视为缺失)。
+    pub values: BTreeMap<String, String>,
+}
+
+/// 标题投影的来源范围。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum DisplayTitleScope {
+    /// 应用外壳标题(来自 `presentation`)。
+    Presentation,
+    /// 某个 entrypoint 的标题(来自 `entrypoints.<name>`)。
+    Entrypoint { name: String },
+}
+
+impl AppDisplayI18n {
+    /// 按产品的 active locale 解析某个声明的标题。
+    ///
+    /// 协商逻辑(精确匹配声明的某一支持语言,否则取 `default_locale`)由 bytehost 的纯 resolver 提供,
+    /// 产品只传入自己的 `ui_locale`。返回 `None` 表示该 scope 不在投影内(调用方应继续用 `AppSummary.name`)。
+    pub fn resolve_title(&self, scope: &DisplayTitleScope, ui_locale: &str) -> Option<&str> {
+        let t = self.titles.iter().find(|t| &t.scope == scope)?;
+        let negotiated =
+            crate::i18n::negotiate_locale(ui_locale, &self.supported_locales, &self.default_locale);
+        t.values
+            .get(&negotiated)
+            .map(|s| s.as_str())
+            .or(Some(t.fallback.as_str()))
+    }
 }
 
 /// 应用当前的问题(供 GUI 画提示页,见规格 §6.3)。
@@ -506,6 +567,7 @@ mod tests {
                     automatic: false,
                     at_ms: 1_700_000_000_000,
                 }),
+                display_i18n: None,
             }],
         };
         let json = round_trip(&apps);
@@ -686,6 +748,124 @@ mod tests {
             AppIssue::RuntimeMissing {
                 runtime: "node".into()
             }
+        );
+    }
+
+    fn sample_display_i18n() -> AppDisplayI18n {
+        AppDisplayI18n {
+            default_locale: "en".into(),
+            supported_locales: vec!["en".into(), "zh-CN".into()],
+            webview_locale: WebViewLocale::Live,
+            titles: vec![
+                AppDisplayTitle {
+                    scope: DisplayTitleScope::Presentation,
+                    key: "app.title".into(),
+                    fallback: "Notes".into(),
+                    values: [
+                        ("en".to_string(), "Notes".to_string()),
+                        ("zh-CN".to_string(), "笔记".to_string()),
+                    ]
+                    .into(),
+                },
+                AppDisplayTitle {
+                    scope: DisplayTitleScope::Entrypoint {
+                        name: "main".into(),
+                    },
+                    key: "main.title".into(),
+                    fallback: "Open".into(),
+                    values: [
+                        ("en".to_string(), "Open".to_string()),
+                        ("zh-CN".to_string(), "打开".to_string()),
+                    ]
+                    .into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn display_i18n_round_trips_and_keeps_its_shape() {
+        let d = sample_display_i18n();
+        let json = round_trip(&d);
+        assert_eq!(json["default_locale"], "en");
+        assert_eq!(json["supported_locales"], json!(["en", "zh-CN"]));
+        assert_eq!(json["webview_locale"], "live");
+        assert_eq!(json["titles"][0]["scope"]["scope"], "presentation");
+        assert_eq!(json["titles"][0]["key"], "app.title");
+        assert_eq!(json["titles"][0]["fallback"], "Notes");
+        assert_eq!(json["titles"][0]["values"]["zh-CN"], "笔记");
+        assert_eq!(json["titles"][1]["scope"]["scope"], "entrypoint");
+        assert_eq!(json["titles"][1]["scope"]["name"], "main");
+    }
+
+    #[test]
+    fn resolve_title_prefers_negotiated_then_default_then_fallback() {
+        let d = sample_display_i18n();
+        let pres = DisplayTitleScope::Presentation;
+        let main = DisplayTitleScope::Entrypoint {
+            name: "main".into(),
+        };
+        // 协商到声明的 zh-CN → 中文值。
+        assert_eq!(d.resolve_title(&pres, "zh-CN"), Some("笔记"));
+        // 未知语言 → 协商回 default_locale(en)的值。
+        assert_eq!(d.resolve_title(&pres, "fr"), Some("Notes"));
+        assert_eq!(d.resolve_title(&main, "zh-CN"), Some("打开"));
+        // scope 不在投影内 → None(调用方回落 AppSummary.name)。
+        assert_eq!(
+            d.resolve_title(
+                &DisplayTitleScope::Entrypoint {
+                    name: "other".into()
+                },
+                "en"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_display_i18n_on_old_payload_parses_to_none() {
+        // 旧形状 AppSummary(无 display_i18n 字段)解析为 None,旧 GUI 不受影响。
+        let old = json!({
+            "id": "excalidraw",
+            "name": "Excalidraw",
+            "version": "0.17.0",
+            "desired": "running",
+            "observed": {"state": "running"},
+            "url": null
+        });
+        let s: AppSummary = serde_json::from_value(old).unwrap();
+        assert_eq!(s.id, id());
+        assert_eq!(s.name, "Excalidraw");
+        assert!(s.display_i18n.is_none());
+    }
+
+    #[test]
+    fn display_i18n_does_not_alter_name_or_launch_url() {
+        // 加 display_i18n 不应改变 name(语言中立标识),也不应改变 LaunchUrl 应答形状。
+        let s = AppSummary {
+            id: id(),
+            name: "Excalidraw".into(),
+            version: Version::new(0, 17, 0),
+            desired: DesiredState::Running,
+            observed: ObservedState::Running,
+            url: Some("http://excalidraw.localhost:20001/".into()),
+            issue: None,
+            previous_version: None,
+            rollback_note: None,
+            display_i18n: Some(sample_display_i18n()),
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            json["name"], "Excalidraw",
+            "name 保持语言中立,不受 i18n 影响"
+        );
+        assert_eq!(json["version"], "0.17.0");
+        let launch = AppReply::LaunchUrl {
+            url: "http://excalidraw.localhost:20001/?bh_token=t".into(),
+        };
+        assert_eq!(
+            round_trip(&launch),
+            json!({"reply": "launch_url", "url": "http://excalidraw.localhost:20001/?bh_token=t"})
         );
     }
 }

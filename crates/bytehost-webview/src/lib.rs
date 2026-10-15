@@ -4,9 +4,12 @@
 //! - 这个 URL 是否仍在该应用自己的 origin 内([`AppOrigin::allows_navigation`],导航策略的唯一真相);
 //! - 每应用的 WKWebView 数据存储标识([`data_store_identifier`]);
 //! - IPC 消息白名单与 nonce([`AppIpc`]、[`new_ipc_nonce`]、[`app_init_script`]);
+//! - 应用语言桥的只读快照/脚本纯策略([`i18n`]);
 //! - 卸载"连数据一起删"时数据存储清除的排队([`StoreRemovals`])与系统版本门槛([`supports_store_removal`])。
 //!
 //! **不**依赖 wry/iced/objc2/tauri:真正创建 webview、取系统版本号、画界面都在宿主里。
+
+pub mod i18n;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -112,8 +115,13 @@ pub fn new_ipc_nonce() -> String {
 /// 注入脚本(在页面脚本之前运行):先把 `postMessage` 绑定到局部变量——页面之后改写
 /// `window.ipc.postMessage` 也截不到 nonce——再只转发 **`isTrusted` 的真实用户事件**
 /// (页面脚本 `dispatchEvent` 合成的事件 `isTrusted` 为假)。转发的内容只有焦点/拖拽松开/缩放三类。
-pub fn app_init_script(nonce: &str) -> String {
-    format!(
+///
+/// `install_i18n_bridge` 为 `true` 时(manifest 声明 `[i18n]` 且 `webview_locale != none`),脚本末尾
+/// 再装入只读语言桥骨架([`i18n::i18n_bridge_init_script`]):`getSnapshot` 在首帧到达前返回 `null`
+/// (pending/skeleton),真实值由宿主在导航完成后经 `evaluate_app` 下发。桥**不**携带任何运行时 locale 值
+/// (初始化脚本创建时冻结,见 §6.1),也不暴露宿主命令能力。
+pub fn app_init_script(nonce: &str, install_i18n_bridge: bool) -> String {
+    let mut script = format!(
         "(function(){{var post=window.ipc.postMessage.bind(window.ipc);var N='{nonce}';\
 function send(v){{post(N+':'+v)}}\
 document.addEventListener('mousedown',function(e){{if(e.isTrusted)send('focus')}},true);\
@@ -122,7 +130,11 @@ document.addEventListener('keydown',function(e){{if(!e.isTrusted||!e.ctrlKey)ret
 if(c==='Equal'||k==='+'||k==='='){{e.preventDefault();send('zoom_in')}}\
 else if(c==='Minus'||k==='-'){{e.preventDefault();send('zoom_out')}}\
 else if(c==='Digit1'||k==='1'){{e.preventDefault();send('zoom_reset')}}}},true)}})();"
-    )
+    );
+    if install_i18n_bridge {
+        script.push_str(&i18n::i18n_bridge_init_script());
+    }
+    script
 }
 
 /// 清除失败后重试的间隔与次数上限:丢掉 Rust 侧的 `WebView` 句柄不等于 WebKit 已经放开数据存储
@@ -392,7 +404,7 @@ mod tests {
     /// `isTrusted` 的真实用户事件。
     #[test]
     fn the_init_script_binds_post_message_first_and_forwards_only_trusted_events() {
-        let script = app_init_script(NONCE);
+        let script = app_init_script(NONCE, false);
         assert!(script.contains(NONCE));
         assert!(script.contains("window.ipc.postMessage.bind(window.ipc)"));
         assert!(
@@ -409,6 +421,25 @@ mod tests {
             );
         }
         assert!(script.matches("isTrusted").count() >= 3);
+    }
+
+    #[test]
+    fn init_script_with_i18n_bridge_installs_skeleton_but_no_locale_value() {
+        let script = app_init_script(NONCE, true);
+        // IPC 绑定仍在(冻结脚本的前半段不变)。
+        assert!(script.contains("window.ipc.postMessage.bind(window.ipc)"));
+        assert!(script.matches("isTrusted").count() >= 3);
+        // 桥骨架装上了。
+        assert!(script.contains("window.bytehost.i18n=b"));
+        // 但冻结脚本里**不得**出现任何 locale 值(如 "zh-CN"):真实值走 evaluate_app 下发。
+        assert!(
+            !script.contains("zh-CN"),
+            "初始化脚本不得内嵌运行时 locale 值"
+        );
+        assert!(
+            !script.contains("__bytehost_i18n_set("),
+            "下发调用只能在 evaluate_app 脚本里"
+        );
     }
 
     #[test]

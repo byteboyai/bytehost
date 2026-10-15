@@ -51,7 +51,7 @@ cargo test -p bytehost-apps --all-features --test process_apps_live -- --ignored
 cargo test -p bytehost-client --all-features --test embedded_host -- --ignored
 ```
 
-样例应用在 `scripts/samples/`(`py-notes`、`node-notes`);Excalidraw 打包配方在 `scripts/excalidraw/`;受管运行时版本表由 `scripts/pin-runtimes.sh` 从官方源生成(不得手写哈希)。
+样例应用在 `scripts/samples/`(`py-notes`、`node-notes`);i18n 样例在 `scripts/samples/i18n/`(`bilingual-live` 双语热切换 + 输入框/滚动区证明不丢状态、`partial-initial` 部分翻译回落 default、`legacy-sample` 无 i18n 字段走旧路径);`node-notes` 已就地加 `[i18n]` 复用语言桥,证明桥与运行时无关(static_web / Node HTTP 共用同一策略)。i18n 样例校验见 `crates/bytehost-apps/tests/i18n_samples.rs`(`cargo test -p bytehost-apps --features server --test i18n_samples`)。Excalidraw 打包配方在 `scripts/excalidraw/`;受管运行时版本表由 `scripts/pin-runtimes.sh` 从官方源生成(不得手写哈希)。
 
 ## 文档
 

@@ -86,6 +86,8 @@ pub enum ManagerError {
     Source(crate::source::SourceError),
     /// 压缩包解压失败(不安全条目、损坏、超限……)。
     Archive(crate::archive::ArchiveError),
+    /// 包内 i18n 资源校验失败(重复 key、超限、默认语言文件缺失、符号链接/逃逸……)。
+    Resource(crate::i18n::resources::ResourceError),
 }
 
 impl std::fmt::Display for ManagerError {
@@ -119,6 +121,7 @@ impl std::fmt::Display for ManagerError {
             Self::SourceNotAllowed(why) => write!(f, "{why}"),
             Self::Source(e) => write!(f, "{e}"),
             Self::Archive(e) => write!(f, "{e}"),
+            Self::Resource(e) => write!(f, "i18n 资源校验失败: {e}"),
         }
     }
 }
@@ -150,6 +153,8 @@ impl ManagerError {
                 crate::archive::ArchiveError::Io(_) => K::Internal,
                 _ => K::Rejected,
             },
+            // 用户可修正的输入问题(资源声明/内容不合法)→ Rejected。
+            Self::Resource(_) => K::Rejected,
         }
     }
 }
@@ -448,15 +453,40 @@ struct Package {
     manifest: Manifest,
     manifest_digest: String,
     source_digest: String,
+    /// 经校验的 i18n 资源(仅当 manifest 声明 `[i18n]` 时 Some);资源字节已进入 `source_digest`。
+    /// T3 投影 `AppSummary.display_i18n` 时消费本字段。
+    #[allow(dead_code)]
+    i18n: Option<crate::i18n::I18nBundle>,
 }
 
 fn read_package(dir: &Path, host_version: &Version) -> Result<Package, ManagerError> {
     let manifest_text = fs::read_to_string(dir.join("manifest.toml"))?;
     let manifest = Manifest::from_toml(&manifest_text, host_version)?;
+    // 声明 [i18n] 时装载并校验包内资源;校验在 plan 与 install/upgrade 两阶段都会重跑(read_package 是两者共同入口)。
+    let i18n = match &manifest.i18n {
+        Some(i18n) => {
+            let bundle = crate::i18n::resources::load_i18n_resources(
+                dir,
+                i18n,
+                &crate::i18n::resources::ResourceLimits::default(),
+            )
+            .map_err(ManagerError::Resource)?;
+            // 投影预算检查:安装期超 64 入口 / 128 KiB 上限直接拒绝(旧无 i18n 包不受影响)。
+            let _ = crate::i18n::resources::project_display_i18n(
+                &manifest,
+                &bundle,
+                &crate::i18n::resources::ResourceLimits::default(),
+            )
+            .map_err(ManagerError::Resource)?;
+            Some(bundle)
+        }
+        None => None,
+    };
     Ok(Package {
         manifest_digest: sha256_hex(manifest_text.as_bytes()),
         source_digest: digest_tree(dir)?,
         manifest,
+        i18n,
     })
 }
 
@@ -1935,16 +1965,23 @@ impl Core {
             .apps
             .into_iter()
             .map(|r| {
-                let name = fs::read_to_string(
+                let manifest = fs::read_to_string(
                     self.registry
                         .paths()
                         .package_dir(&r.id, &r.current_version)
                         .join("manifest.toml"),
                 )
                 .ok()
-                .and_then(|t| Manifest::from_toml(&t, &self.host_version).ok())
-                .map(|m| m.name)
-                .unwrap_or_else(|| r.id.to_string());
+                .and_then(|t| Manifest::from_toml(&t, &self.host_version).ok());
+                let name = manifest
+                    .as_ref()
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| r.id.to_string());
+                // i18n 投影:从已安装活动版本装载资源并投影;任何失败(运行期损坏/预算/投影不可用)
+                // 回落为 None,绝不让整次 List 失败。
+                let display_i18n = manifest
+                    .as_ref()
+                    .and_then(|m| self.load_display_i18n(&r.id, &r.current_version, m));
                 let url = matches!(r.observed, ObservedState::Running)
                     .then(|| self.gateway.site_url(&r.id));
                 let issue = matches!(r.observed, ObservedState::Failed { .. })
@@ -1965,10 +2002,35 @@ impl Core {
                     issue,
                     previous_version: r.previous_version,
                     rollback_note: r.last_rollback,
+                    display_i18n,
                     id: r.id,
                 }
             })
             .collect())
+    }
+
+    /// 从已安装的活动版本装载并投影 i18n 展示元数据;任何失败(运行期损坏、投影预算、资源缺失)返回 `None`,
+    /// 调用方回落到 `AppSummary.name`,不让整次 List 失败。升级/回滚后活动版本变化,`list` 自然重读。
+    fn load_display_i18n(
+        &self,
+        id: &AppId,
+        version: &Version,
+        manifest: &Manifest,
+    ) -> Option<crate::proto::AppDisplayI18n> {
+        let i18n = manifest.i18n.as_ref()?;
+        let dir = self.registry.paths().package_dir(id, version);
+        let bundle = crate::i18n::resources::load_i18n_resources(
+            &dir,
+            i18n,
+            &crate::i18n::resources::ResourceLimits::default(),
+        )
+        .ok()?;
+        crate::i18n::resources::project_display_i18n(
+            manifest,
+            &bundle,
+            &crate::i18n::resources::ResourceLimits::default(),
+        )
+        .ok()
     }
 
     /// supervisor 退出前调用:撤下所有站点,把运行中的应用的观察态落成 `Stopped`,但**保留 `desired`**——
@@ -2351,6 +2413,568 @@ source = "web/"
             !format!("{events:?}").contains("bh_token"),
             "事件里不能出现令牌"
         );
+    }
+
+    /// 装一个带 i18n 的静态应用:manifest 声明 [i18n],包内 locales/en.json + locales/zh-CN.json。
+    /// 返回来源;调用方负责 approve/install。
+    fn write_i18n_app(dir: &Path, id: &str, version: &str) -> AppSource {
+        write_files(
+            dir,
+            &[
+                (
+                    "manifest.toml",
+                    &format!(
+                        r#"schema_version = 1
+min_host_version = "0.1.0"
+id = "{id}"
+name = "{id} app"
+version = "{version}"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en", "zh-CN"]
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+title_fallback = "{id}"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title_key = "main.title"
+title_fallback = "Open"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+"#
+                    ),
+                ),
+                ("web/index.html", "<h1>x</h1>"),
+                (
+                    "locales/en.json",
+                    r#"{"app.title": "Notes", "main.title": "Open"}"#,
+                ),
+                (
+                    "locales/zh-CN.json",
+                    r#"{"app.title": "笔记", "main.title": "打开"}"#,
+                ),
+            ],
+        );
+        AppSource::LocalDir {
+            path: dir.to_path_buf(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_with_i18n_projection_appears_in_list_and_resolves_by_locale() {
+        let rig = rig().await;
+        let src = write_i18n_app(&rig.src_dir("a"), "notes", "1.0.0");
+        rig.install(&src).unwrap();
+        let listed = rig.manager.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        let di = listed[0]
+            .display_i18n
+            .as_ref()
+            .expect("应带出 display_i18n");
+        assert_eq!(di.default_locale, "en");
+        assert_eq!(
+            di.supported_locales,
+            vec!["en".to_string(), "zh-CN".to_string()]
+        );
+        assert_eq!(
+            di.titles.len(),
+            2,
+            "只投影 presentation + main 两个声明标题"
+        );
+
+        // 解析器按协商语言取:zh-CN → 中文;未知语言 → 回落 default(en)。
+        let pres = crate::proto::DisplayTitleScope::Presentation;
+        assert_eq!(di.resolve_title(&pres, "zh-CN"), Some("笔记"));
+        assert_eq!(di.resolve_title(&pres, "fr"), Some("Notes"));
+        // 运行期投影不改变语言中立的 name。
+        assert_eq!(listed[0].name, "notes app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_is_rejected_when_i18n_projection_exceeds_entry_budget() {
+        let rig = rig().await;
+        // presentation(1) + 65 个 entrypoint = 66 个声明标题,超过 64 上限。
+        let mut toml = String::from(
+            r#"schema_version = 1
+min_host_version = "0.1.0"
+id = "big"
+name = "big app"
+version = "1.0.0"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en"]
+
+[presentation]
+entrypoint = "e0"
+title_key = "app.title"
+title_fallback = "Big"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+"#,
+        );
+        for i in 0..65 {
+            toml.push_str(&format!(
+                "\n[entrypoints.e{i}]\ntype = \"web\"\npath = \"/\"\ntitle_key = \"e{i}.title\"\ntitle_fallback = \"E{i}\"\n"
+            ));
+        }
+        let dir = rig.src_dir("big");
+        write_files(
+            &dir,
+            &[
+                ("manifest.toml", &toml),
+                ("web/index.html", "<h1>x</h1>"),
+                ("locales/en.json", r#"{"app.title": "Big"}"#),
+            ],
+        );
+        let src = AppSource::LocalDir { path: dir };
+        // 安装期投影预算检查在 install_plan(→ read_package)阶段就拒绝,归类 Rejected,且不留下 staging 残留。
+        let err = rig
+            .manager
+            .install_plan(&src, Provenance::Local, TrustLevel::Trusted)
+            .expect_err("超预算应被拒绝");
+        assert_eq!(err.kind(), crate::proto::AppErrorKind::Rejected, "{err}");
+        assert_no_leftovers(&rig);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_falls_back_to_none_when_installed_locale_file_is_corrupted() {
+        let rig = rig().await;
+        let src = write_i18n_app(&rig.src_dir("a"), "notes", "1.0.0");
+        rig.install(&src).unwrap();
+        assert!(
+            rig.manager.list().unwrap()[0].display_i18n.is_some(),
+            "安装完好时应带出投影"
+        );
+        // 运行期损坏默认语言文件:list 不应失败,只把 display_i18n 回落为 None。
+        let pkg = rig
+            .manager
+            .registry
+            .paths()
+            .package_dir(&id("notes"), &Version::new(1, 0, 0));
+        fs::write(pkg.join("locales/en.json"), "{ this is not valid json").unwrap();
+        let listed = rig.manager.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].display_i18n.is_none(),
+            "运行期损坏应回落 None,不让整次 List 失败"
+        );
+    }
+
+    /// 仓库 `scripts/samples/i18n/` 下已交付的样例应用目录(相对 `CARGO_MANIFEST_DIR` 两级上溯)。
+    fn sample_dir(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts")
+            .join("samples")
+            .join("i18n")
+            .join(name)
+    }
+
+    // ---- T5:三个已交付样例应用(spec §8)----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bilingual_live_sample_installs_with_live_locale_and_bilingual_projection() {
+        let rig = rig().await;
+        let src = AppSource::LocalDir {
+            path: sample_dir("bilingual-live"),
+        };
+        rig.install(&src).unwrap();
+        let listed = rig.manager.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        let di = listed[0]
+            .display_i18n
+            .as_ref()
+            .expect("bilingual-live 应带出 display_i18n");
+        assert_eq!(di.default_locale, "en");
+        assert_eq!(
+            di.supported_locales,
+            vec!["en".to_string(), "zh-CN".to_string()]
+        );
+        assert_eq!(
+            di.webview_locale,
+            crate::i18n::WebViewLocale::Live,
+            "webview_locale = \"live\" 应被投影"
+        );
+        let pres = crate::proto::DisplayTitleScope::Presentation;
+        let main = crate::proto::DisplayTitleScope::Entrypoint {
+            name: "main".into(),
+        };
+        // 完整双语:zh-CN 命中译文;未知 UI 语言协商回落 default(en)。
+        assert_eq!(di.resolve_title(&pres, "zh-CN"), Some("双语实时"));
+        assert_eq!(di.resolve_title(&pres, "fr"), Some("Bilingual Live"));
+        assert_eq!(di.resolve_title(&main, "zh-CN"), Some("打开演示"));
+        // 旧 name 仍作为语言中立的稳定身份保留。
+        assert_eq!(listed[0].name, "Bilingual Live Demo");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_initial_sample_installs_with_initial_locale_and_partial_fallback() {
+        let rig = rig().await;
+        let src = AppSource::LocalDir {
+            path: sample_dir("partial-initial"),
+        };
+        rig.install(&src).unwrap();
+        let listed = rig.manager.list().unwrap();
+        let di = listed[0]
+            .display_i18n
+            .as_ref()
+            .expect("partial-initial 应带出 display_i18n");
+        assert_eq!(
+            di.webview_locale,
+            crate::i18n::WebViewLocale::Initial,
+            "webview_locale = \"initial\" 应被投影"
+        );
+        let pres = crate::proto::DisplayTitleScope::Presentation;
+        let main = crate::proto::DisplayTitleScope::Entrypoint {
+            name: "main".into(),
+        };
+        // 仅 app.title 译出;main.title 在 zh-CN 缺失 → 回落 default(en)。
+        assert_eq!(di.resolve_title(&pres, "zh-CN"), Some("部分初始"));
+        assert_eq!(di.resolve_title(&main, "zh-CN"), Some("Open Demo"));
+        assert_eq!(di.resolve_title(&main, "en"), Some("Open Demo"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_sample_installs_without_any_i18n_bridge() {
+        let rig = rig().await;
+        let src = AppSource::LocalDir {
+            path: sample_dir("legacy-sample"),
+        };
+        rig.install(&src).unwrap();
+        let listed = rig.manager.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].display_i18n.is_none(),
+            "无 [i18n] 的旧应用不应投影任何 display_i18n,也不装桥"
+        );
+        assert_eq!(listed[0].name, "Legacy Sample");
+    }
+
+    // ---- T5:拒绝安装的安全测试夹具(spec §8 / B02-B03)----
+
+    /// 写一个待安装来源并断言 `install_plan` 拒绝,且 `apps/` 下不留 staging 残留。
+    fn expect_install_rejected(rig: &Rig, src: &AppSource) {
+        let err = rig
+            .manager
+            .install_plan(src, Provenance::Local, TrustLevel::Trusted)
+            .expect_err("非法来源应在安装期被拒绝");
+        // 错误信息应带字段级原因,且归类为拒绝(或manifest非法),不让其进入安装流程。
+        let _ = err.kind();
+        assert_no_leftovers(rig);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn security_fixture_rejects_path_traversal_strings_dir() {
+        let rig = rig().await;
+        let dir = rig.src_dir("traversal");
+        write_files(
+            &dir,
+            &[
+                (
+                    "manifest.toml",
+                    r#"schema_version = 1
+min_host_version = "0.1.0"
+id = "traversal"
+name = "traversal"
+version = "1.0.0"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en"]
+strings_dir = "../../etc"
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+title_fallback = "T"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title_key = "main.title"
+title_fallback = "Open"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+"#,
+                ),
+                ("web/index.html", "<h1>x</h1>"),
+                ("locales/en.json", r#"{"app.title":"T"}"#),
+            ],
+        );
+        expect_install_rejected(&rig, &AppSource::LocalDir { path: dir });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn security_fixture_rejects_illegal_locale_label() {
+        let rig = rig().await;
+        let dir = rig.src_dir("badlocale");
+        write_files(
+            &dir,
+            &[
+                (
+                    "manifest.toml",
+                    r#"schema_version = 1
+min_host_version = "0.1.0"
+id = "badlocale"
+name = "badlocale"
+version = "1.0.0"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en_US"]
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+title_fallback = "T"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title_key = "main.title"
+title_fallback = "Open"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+"#,
+                ),
+                ("web/index.html", "<h1>x</h1>"),
+                ("locales/en_US.json", r#"{"app.title":"T"}"#),
+            ],
+        );
+        expect_install_rejected(&rig, &AppSource::LocalDir { path: dir });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn security_fixture_rejects_missing_default_locale_file() {
+        let rig = rig().await;
+        let dir = rig.src_dir("nodefault");
+        write_files(
+            &dir,
+            &[
+                (
+                    "manifest.toml",
+                    r#"schema_version = 1
+min_host_version = "0.1.0"
+id = "nodefault"
+name = "nodefault"
+version = "1.0.0"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en", "zh-CN"]
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+title_fallback = "T"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title_key = "main.title"
+title_fallback = "Open"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+"#,
+                ),
+                ("web/index.html", "<h1>x</h1>"),
+                // 只提供 zh-CN,缺 default(en) 文件 → 必须拒绝。
+                ("locales/zh-CN.json", r#"{"app.title":"T"}"#),
+            ],
+        );
+        expect_install_rejected(&rig, &AppSource::LocalDir { path: dir });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn security_fixture_rejects_duplicate_key_in_locale_file() {
+        let rig = rig().await;
+        let dir = rig.src_dir("dupkey");
+        write_files(
+            &dir,
+            &[
+                (
+                    "manifest.toml",
+                    r#"schema_version = 1
+min_host_version = "0.1.0"
+id = "dupkey"
+name = "dupkey"
+version = "1.0.0"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en"]
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+title_fallback = "T"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title_key = "main.title"
+title_fallback = "Open"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+"#,
+                ),
+                ("web/index.html", "<h1>x</h1>"),
+                ("locales/en.json", r#"{"k":"v","k":"w"}"#),
+            ],
+        );
+        expect_install_rejected(&rig, &AppSource::LocalDir { path: dir });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn security_fixture_rejects_title_key_without_fallback() {
+        let rig = rig().await;
+        let dir = rig.src_dir("keynofb");
+        write_files(
+            &dir,
+            &[
+                (
+                    "manifest.toml",
+                    r#"schema_version = 1
+min_host_version = "0.1.0"
+id = "keynofb"
+name = "keynofb"
+version = "1.0.0"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en"]
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title_key = "main.title"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+"#,
+                ),
+                ("web/index.html", "<h1>x</h1>"),
+                ("locales/en.json", r#"{"app.title":"T"}"#),
+            ],
+        );
+        expect_install_rejected(&rig, &AppSource::LocalDir { path: dir });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn security_fixture_rejects_unknown_webview_locale_value() {
+        let rig = rig().await;
+        let dir = rig.src_dir("badwl");
+        write_files(
+            &dir,
+            &[
+                (
+                    "manifest.toml",
+                    r#"schema_version = 1
+min_host_version = "0.1.0"
+id = "badwl"
+name = "badwl"
+version = "1.0.0"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en"]
+webview_locale = "always"
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+title_fallback = "T"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title_key = "main.title"
+title_fallback = "Open"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+"#,
+                ),
+                ("web/index.html", "<h1>x</h1>"),
+                ("locales/en.json", r#"{"app.title":"T"}"#),
+            ],
+        );
+        expect_install_rejected(&rig, &AppSource::LocalDir { path: dir });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn security_fixture_rejects_symlinked_resource_escape() {
+        let rig = rig().await;
+        let dir = rig.src_dir("symescape");
+        write_files(
+            &dir,
+            &[
+                (
+                    "manifest.toml",
+                    r#"schema_version = 1
+min_host_version = "0.1.0"
+id = "symescape"
+name = "symescape"
+version = "1.0.0"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en"]
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+title_fallback = "T"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title_key = "main.title"
+title_fallback = "Open"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+"#,
+                ),
+                ("web/index.html", "<h1>x</h1>"),
+            ],
+        );
+        // en.json 是一个指向包外的符号链接:安装期必须拒绝(不允许包外读取)。
+        let outside_dir = rig.src_dir("symescape_outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("evil.json");
+        fs::write(&outside, r#"{"k":"stolen"}"#).unwrap();
+        let locales = dir.join("locales");
+        fs::create_dir_all(&locales).unwrap();
+        std::os::unix::fs::symlink(&outside, locales.join("en.json")).unwrap();
+        expect_install_rejected(&rig, &AppSource::LocalDir { path: dir });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

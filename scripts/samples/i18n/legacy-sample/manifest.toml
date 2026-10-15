@@ -1,0 +1,17 @@
+schema_version = 1
+min_host_version = "0.1.0"
+id = "legacy-sample"
+name = "Legacy Sample"
+version = "1.0.0"
+
+[presentation]
+entrypoint = "main"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title = "Legacy Sample"
+
+[runtime]
+kind = "static_web"
+source = "web/"

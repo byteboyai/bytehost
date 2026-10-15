@@ -1,0 +1,26 @@
+schema_version = 1
+min_host_version = "0.1.0"
+id = "bilingual-live"
+name = "Bilingual Live Demo"
+version = "1.0.0"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en", "zh-CN"]
+strings_dir = "locales"
+webview_locale = "live"
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+title_fallback = "Bilingual Live"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title_key = "main.title"
+title_fallback = "Open Demo"
+
+[runtime]
+kind = "static_web"
+source = "web/"

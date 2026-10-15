@@ -834,6 +834,7 @@ mod tests {
             issue: None,
             previous_version: None,
             rollback_note: None,
+            display_i18n: None,
         }
     }
 

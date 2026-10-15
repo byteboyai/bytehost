@@ -1,10 +1,11 @@
 //! Manifest v1:应用对宿主的**申请**。字段、取值与校验规则见 `docs/superpowers/specs/2026-10-04-bytehost-app-host-design.md` §4.1。
 //! 所有结构 `deny_unknown_fields`;`validate` 一次性收集全部问题,不在第一个问题处停下。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::{I18n, normalize_locale};
 use crate::id::{AppId, Version};
 use crate::permissions::Permissions;
 
@@ -22,6 +23,9 @@ pub struct Manifest {
     pub presentation: Presentation,
     pub entrypoints: BTreeMap<String, Entrypoint>,
     pub runtime: Runtime,
+    /// 可选 i18n 声明;声明后 `title_key`/`title_fallback` 才能成对出现。
+    #[serde(default)]
+    pub i18n: Option<I18n>,
     #[serde(default)]
     pub permissions: Permissions,
     #[serde(default)]
@@ -37,6 +41,12 @@ pub struct Presentation {
     pub surface_hint: Option<String>,
     /// 默认入口,必须是 `entrypoints` 里的键。
     pub entrypoint: String,
+    /// 标题资源 key;与 `title_fallback` 成对必填,且必须有 `[i18n]`。
+    #[serde(default)]
+    pub title_key: Option<String>,
+    /// 标题 fallback;与 `title_key` 成对必填。非空、最长 64 个 Unicode 字符、不含控制/双向控制字符。
+    #[serde(default)]
+    pub title_fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,6 +57,12 @@ pub struct Entrypoint {
     /// 应用内路径,以 `/` 开头。
     pub path: String,
     pub title: Option<String>,
+    /// 标题资源 key;与 `title_fallback` 成对必填,且必须有 `[i18n]`。
+    #[serde(default)]
+    pub title_key: Option<String>,
+    /// 标题 fallback;与 `title_key` 成对必填。
+    #[serde(default)]
+    pub title_fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +226,68 @@ impl Manifest {
         {
             problems.push("presentation.surface_hint 只能是 1–32 个小写字母或 '_'".to_string());
         }
+
+        // i18n 声明与标题协商:locale 子集校验/规范化、查重、default 包含、key/fallback 成对。
+        let has_i18n = self.i18n.is_some();
+        if let Some(i18n) = &self.i18n {
+            match normalize_locale(&i18n.default_locale) {
+                Ok(default) => {
+                    if i18n.supported_locales.is_empty() {
+                        problems.push("i18n.supported_locales 不能为空".to_string());
+                    } else {
+                        let mut seen = BTreeSet::new();
+                        let mut normalized = Vec::new();
+                        let mut bad = false;
+                        for loc in &i18n.supported_locales {
+                            match normalize_locale(loc) {
+                                Ok(n) => {
+                                    if !seen.insert(n.clone()) {
+                                        problems.push(format!(
+                                            "i18n.supported_locales 含重复语言 {loc}"
+                                        ));
+                                        bad = true;
+                                    } else {
+                                        normalized.push(n);
+                                    }
+                                }
+                                Err(e) => {
+                                    problems.push(format!(
+                                        "i18n.supported_locales 含非法语言 {loc}: {e}"
+                                    ));
+                                    bad = true;
+                                }
+                            }
+                        }
+                        if !bad && !normalized.contains(&default) {
+                            problems
+                                .push("i18n.supported_locales 必须包含 default_locale".to_string());
+                        }
+                    }
+                }
+                Err(e) => problems.push(format!("i18n.default_locale 非法: {e}")),
+            }
+            if let Some(dir) = &i18n.strings_dir {
+                check_relative("i18n.strings_dir", dir, &mut problems);
+            }
+        }
+
+        check_title_pair(
+            "presentation",
+            &self.presentation.title_key,
+            &self.presentation.title_fallback,
+            has_i18n,
+            &mut problems,
+        );
+        for (name, ep) in &self.entrypoints {
+            check_title_pair(
+                &format!("entrypoints.{name}"),
+                &ep.title_key,
+                &ep.title_fallback,
+                has_i18n,
+                &mut problems,
+            );
+        }
+
         self.validate_runtime(&mut problems);
         check_url_path("health.path", &self.health.path, &mut problems);
         if !(1..=60_000).contains(&self.health.timeout_ms) {
@@ -274,6 +352,35 @@ impl Manifest {
             }
         }
     }
+
+    /// 给定 UI 语言与已装载资源,返回应用(外壳)标题。
+    /// 未声明 `[i18n]` 或未声明 `title_key` 时沿用旧 `Manifest.name`。
+    ///
+    /// 解析顺序(纯逻辑,见 `I18nBundle::resolve_title`):当前语言 key → default 语言 key → `title_fallback`。
+    pub fn resolve_display_title(
+        &self,
+        bundle: &crate::i18n::I18nBundle,
+        ui_locale: &str,
+    ) -> String {
+        let i18n = match &self.i18n {
+            Some(i) => i,
+            None => return self.name.clone(),
+        };
+        let (key, fallback) = match (
+            &self.presentation.title_key,
+            &self.presentation.title_fallback,
+        ) {
+            (Some(k), Some(f)) => (k, f),
+            _ => return self.name.clone(),
+        };
+        let negotiated =
+            crate::i18n::negotiate_locale(ui_locale, &i18n.supported_locales, &i18n.default_locale);
+        let r = crate::i18n::TitleRef {
+            key: key.clone(),
+            fallback: fallback.clone(),
+        };
+        bundle.resolve_title(&r, &negotiated, &i18n.default_locale)
+    }
 }
 
 /// 相对路径:非空、不以 `/` 开头、不含 `..` 段、不含反斜杠或 NUL。
@@ -331,6 +438,39 @@ fn check_display(field: &str, text: &str, problems: &mut Vec<String>) {
     }
 }
 
+/// 校验 `title_key`/`title_fallback` 成对(两者都给或都不给);只给其一则报错。
+/// 任一个出现但缺少 `[i18n]` 声明也报错。fallback 必须满足标题字符安全与 64 字符上限。
+fn check_title_pair(
+    field: &str,
+    key: &Option<String>,
+    fallback: &Option<String>,
+    needs_i18n: bool,
+    problems: &mut Vec<String>,
+) {
+    match (key, fallback) {
+        (Some(k), Some(f)) => {
+            if k.is_empty() {
+                problems.push(format!("{field}.title_key 不能为空"));
+            }
+            if f.is_empty() {
+                problems.push(format!("{field}.title_fallback 不能为空"));
+            } else {
+                check_display(&format!("{field}.title_fallback"), f, problems);
+                if f.chars().count() > 64 {
+                    problems.push(format!("{field}.title_fallback 最长 64 个字符"));
+                }
+            }
+        }
+        (None, None) => {}
+        _ => problems.push(format!("{field} 必须同时声明 title_key 与 title_fallback")),
+    }
+    if (key.is_some() || fallback.is_some()) && !needs_i18n {
+        problems.push(format!(
+            "{field} 声明了 title_key/title_fallback 但缺少 [i18n]"
+        ));
+    }
+}
+
 /// 应用内的 URL 路径:以单个 `/` 开头(`//host/x`、`/\\host` 会被浏览器当成另一个 origin),不含反斜杠、
 /// `?`、`#`、控制字符与 `..` 段。
 fn check_url_path(field: &str, path: &str, problems: &mut Vec<String>) {
@@ -366,7 +506,7 @@ mod tests {
         assert!(matches!(m.runtime, Runtime::StaticWeb { ref source } if source == "web/"));
     }
 
-    fn valid() -> Manifest {
+    pub(crate) fn valid() -> Manifest {
         Manifest {
             schema_version: 1,
             min_host_version: Version::new(0, 1, 0),
@@ -377,6 +517,8 @@ mod tests {
                 icon: Some("assets/icon.svg".into()),
                 surface_hint: Some("browser".into()),
                 entrypoint: "main".into(),
+                title_key: None,
+                title_fallback: None,
             },
             entrypoints: BTreeMap::from([(
                 "main".to_string(),
@@ -384,6 +526,8 @@ mod tests {
                     kind: EntrypointKind::Web,
                     path: "/".into(),
                     title: Some("Excalidraw".into()),
+                    title_key: None,
+                    title_fallback: None,
                 },
             )]),
             runtime: Runtime::StaticWeb {
@@ -391,6 +535,7 @@ mod tests {
             },
             permissions: Permissions::default(),
             health: Health::default(),
+            i18n: None,
         }
     }
 
@@ -824,6 +969,8 @@ source = "web/"
                     kind: EntrypointKind::Web,
                     path: "/x".into(),
                     title: None,
+                    title_key: None,
+                    title_fallback: None,
                 },
             );
             assert_eq!(problems(&m).len(), 1, "key {bad:?}");
@@ -834,5 +981,280 @@ source = "web/"
         let mut m = valid();
         m.entrypoints.get_mut("main").unwrap().title = Some("t".repeat(64));
         assert_eq!(m.validate(&HOST), Ok(()));
+    }
+}
+
+#[cfg(all(test, feature = "manifest-toml"))]
+#[cfg(test)]
+mod i18n_tests {
+    use super::tests::valid;
+    use super::*;
+    use crate::i18n::{I18nBundle, WebViewLocale, negotiate_locale, normalize_locale};
+
+    const HOST: Version = Version::new(0, 1, 0);
+
+    const BASE: &str = r#"
+schema_version = 1
+min_host_version = "0.1.0"
+id = "notes"
+name = "Notes"
+version = "1.0.0"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en", "zh-CN"]
+strings_dir = "locales"
+webview_locale = "live"
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+title_fallback = "Notes"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+title = "Notes"
+title_key = "entry.main.title"
+title_fallback = "Notes"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+
+[health]
+path = "/"
+timeout_ms = 3000
+"#;
+
+    fn parsed() -> Manifest {
+        Manifest::from_toml(BASE, &HOST).expect("带 i18n 的清单应通过校验")
+    }
+
+    #[test]
+    fn a_manifest_with_i18n_parses_and_validates() {
+        let m = parsed();
+        let i18n = m.i18n.expect("应有 [i18n]");
+        assert_eq!(i18n.default_locale, "en");
+        assert_eq!(
+            i18n.supported_locales,
+            vec!["en".to_string(), "zh-CN".to_string()]
+        );
+        assert_eq!(i18n.strings_dir.as_deref(), Some("locales"));
+        assert_eq!(i18n.webview_locale, WebViewLocale::Live);
+        assert_eq!(m.presentation.title_key.as_deref(), Some("app.title"));
+        assert_eq!(m.presentation.title_fallback.as_deref(), Some("Notes"));
+    }
+
+    #[test]
+    fn webview_locale_defaults_to_none_when_omitted() {
+        let text = BASE.replace("webview_locale = \"live\"\n", "");
+        let m = Manifest::from_toml(&text, &HOST).unwrap();
+        assert_eq!(m.i18n.unwrap().webview_locale, WebViewLocale::None);
+    }
+
+    #[test]
+    fn locale_tags_normalize_to_canonical_form() {
+        for (raw, want) in [
+            ("zh-CN", Ok("zh-CN")),
+            ("ZH-CN", Ok("zh-CN")),
+            ("zh-Hans-CN", Ok("zh-Hans-CN")),
+            ("ZH-HANS-CN", Ok("zh-Hans-CN")),
+            ("en", Ok("en")),
+        ] {
+            assert_eq!(
+                normalize_locale(raw),
+                want.map(str::to_string),
+                "normalize {raw}"
+            );
+        }
+        for bad in [
+            "zh_CN",
+            "en_US.UTF-8",
+            "a",
+            "abcdefghi",
+            "en--US",
+            "en-x-foo",
+            "zh-Hans-CN-extra",
+            "en-1",
+        ] {
+            assert!(normalize_locale(bad).is_err(), "应为非法: {bad}");
+        }
+    }
+
+    #[test]
+    fn locale_negotiation_is_exact_no_family_or_simp_trad() {
+        let supported = vec!["en".to_string(), "zh-CN".to_string()];
+        assert_eq!(negotiate_locale("zh-CN", &supported, "en"), "zh-CN");
+        assert_eq!(negotiate_locale("ZH-CN", &supported, "en"), "zh-CN");
+        assert_eq!(negotiate_locale("fr", &supported, "en"), "en"); // 未知回到 default
+        assert_eq!(negotiate_locale("zh-TW", &supported, "en"), "en"); // 不做简繁转换
+    }
+
+    #[test]
+    fn title_resolves_current_then_default_then_fallback() {
+        let m = parsed();
+        let mut bundle = I18nBundle::default();
+        bundle
+            .locales
+            .insert("en".into(), [("app.title".into(), "Notes".into())].into());
+        bundle
+            .locales
+            .insert("zh-CN".into(), [("app.title".into(), "笔记".into())].into());
+        assert_eq!(m.resolve_display_title(&bundle, "zh-CN"), "笔记");
+        assert_eq!(m.resolve_display_title(&bundle, "en"), "Notes");
+        assert_eq!(m.resolve_display_title(&bundle, "fr"), "Notes"); // 未知语言回退 default
+        bundle.locales.get_mut("zh-CN").unwrap().remove("app.title");
+        assert_eq!(m.resolve_display_title(&bundle, "zh-CN"), "Notes"); // 缺译文→default
+        bundle.locales.get_mut("en").unwrap().remove("app.title");
+        assert_eq!(m.resolve_display_title(&bundle, "zh-CN"), "Notes"); // 都缺→fallback
+    }
+
+    #[test]
+    fn no_i18n_or_no_key_falls_back_to_manifest_name() {
+        let m = valid();
+        assert_eq!(
+            m.resolve_display_title(&I18nBundle::default(), "zh-CN"),
+            "Excalidraw"
+        );
+    }
+
+    #[test]
+    fn illegal_i18n_declarations_are_rejected_with_field_level_reasons() {
+        // supported 必须包含 default
+        let t = BASE.replace(
+            "supported_locales = [\"en\", \"zh-CN\"]",
+            "supported_locales = [\"zh-CN\"]",
+        );
+        match Manifest::from_toml(&t, &HOST) {
+            Err(ManifestError::Invalid(p)) => {
+                assert!(
+                    p.iter().any(|x| x.contains("必须包含 default_locale")),
+                    "{p:?}"
+                )
+            }
+            other => panic!("应为 Invalid: {other:?}"),
+        }
+        // 重复(规范化后)语言
+        let t = BASE.replace(
+            "supported_locales = [\"en\", \"zh-CN\"]",
+            "supported_locales = [\"en\", \"EN\"]",
+        );
+        match Manifest::from_toml(&t, &HOST) {
+            Err(ManifestError::Invalid(p)) => {
+                assert!(p.iter().any(|x| x.contains("重复语言")), "{p:?}")
+            }
+            other => panic!("应为 Invalid: {other:?}"),
+        }
+        // 非法语言标签
+        let t = BASE.replace(
+            "supported_locales = [\"en\", \"zh-CN\"]",
+            "supported_locales = [\"en\", \"zh_CN\"]",
+        );
+        match Manifest::from_toml(&t, &HOST) {
+            Err(ManifestError::Invalid(p)) => {
+                assert!(p.iter().any(|x| x.contains("非法语言")), "{p:?}")
+            }
+            other => panic!("应为 Invalid: {other:?}"),
+        }
+        // title_key 无 fallback
+        let t = BASE.replace("title_fallback = \"Notes\"\n", "");
+        match Manifest::from_toml(&t, &HOST) {
+            Err(ManifestError::Invalid(p)) => assert!(
+                p.iter()
+                    .any(|x| x.contains("必须同时声明 title_key 与 title_fallback")),
+                "{p:?}"
+            ),
+            other => panic!("应为 Invalid: {other:?}"),
+        }
+        // fallback 超长
+        let t = BASE.replace(
+            "title_fallback = \"Notes\"",
+            &format!("title_fallback = \"{}\"", "N".repeat(65)),
+        );
+        match Manifest::from_toml(&t, &HOST) {
+            Err(ManifestError::Invalid(p)) => {
+                assert!(p.iter().any(|x| x.contains("最长 64")), "{p:?}")
+            }
+            other => panic!("应为 Invalid: {other:?}"),
+        }
+        // fallback 含控制字符
+        let t = BASE.replace(
+            "title_fallback = \"Notes\"",
+            "title_fallback = \"Note\\ns\"",
+        );
+        match Manifest::from_toml(&t, &HOST) {
+            Err(ManifestError::Invalid(p)) => {
+                assert!(p.iter().any(|x| x.contains("控制字符")), "{p:?}")
+            }
+            other => panic!("应为 Invalid: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn title_key_without_i18n_is_rejected() {
+        let text = r#"
+schema_version = 1
+min_host_version = "0.1.0"
+id = "x"
+name = "X"
+version = "1.0.0"
+
+[presentation]
+entrypoint = "main"
+title_key = "app.title"
+title_fallback = "X"
+
+[entrypoints.main]
+type = "web"
+path = "/"
+
+[runtime]
+kind = "static_web"
+source = "web/"
+"#;
+        match Manifest::from_toml(text, &HOST) {
+            Err(ManifestError::Invalid(p)) => {
+                assert!(p.iter().any(|x| x.contains("缺少 [i18n]")), "{p:?}")
+            }
+            other => panic!("应为 Invalid: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_manifest_without_i18n_still_validates() {
+        assert_eq!(valid().validate(&HOST), Ok(()));
+    }
+
+    #[test]
+    fn new_manifest_round_trips_through_json() {
+        let m = parsed();
+        let json = serde_json::to_string(&m).expect("序列化");
+        let m2: Manifest = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(m, m2);
+    }
+
+    #[test]
+    fn compat_boundary_new_fields_are_unknown_to_old_parser() {
+        // 新清单的线上文本携带 [i18n] 与 title_key;旧解析器(deny_unknown_fields)会拒绝这些未知字段。
+        // 锁定:当前解析器认识它们(否则 parsed() 失败),且文本确实包含这些新段。
+        assert!(BASE.contains("[i18n]"));
+        assert!(BASE.contains("title_key"));
+        assert!(BASE.contains("title_fallback"));
+        // 去掉 [i18n] 与 title_key/fallback 后是纯旧清单,必须通过——证明新字段正是这些增量、
+        // 且旧清单在新解析器上无回归。
+        let without_i18n = BASE
+            .replace(
+                "[i18n]\ndefault_locale = \"en\"\nsupported_locales = [\"en\", \"zh-CN\"]\nstrings_dir = \"locales\"\nwebview_locale = \"live\"\n",
+                "",
+            )
+            .replace("title_key = \"app.title\"\n", "")
+            .replace("title_fallback = \"Notes\"\n", "")
+            .replace("title_key = \"entry.main.title\"\n", "")
+            .replace("title_fallback = \"Notes\"\n", "");
+        assert!(
+            Manifest::from_toml(&without_i18n, &HOST).is_ok(),
+            "纯旧清单应通过"
+        );
     }
 }

@@ -4,13 +4,26 @@ id = "node-notes"
 name = "Node Notes"
 version = "1.0.0"
 
+# i18n:复用 bytehost 语言桥。webview_locale="live" 表示宿主在页面初始化与后续
+# 语言切换时都经桥推送快照;页面用 app_locale 渲染并设 document.lang。
+# 安装器会在 [i18n] 声明时校验 locales/ 下的资源文件(默认语言 en 必在)。
+[i18n]
+default_locale = "en"
+supported_locales = ["en", "zh-CN"]
+strings_dir = "locales"
+webview_locale = "live"
+
 [presentation]
 entrypoint = "main"
+title_key = "app.title"
+title_fallback = "Node Notes"
 
 [entrypoints.main]
 type = "web"
 path = "/"
 title = "Node Notes"
+title_key = "main.title"
+title_fallback = "Open Demo"
 
 [runtime]
 kind = "node"

@@ -46,8 +46,9 @@ function indexHtml(counter) {
 <html lang="en">
 <head><meta charset="utf-8"><title>Node Notes</title></head>
 <body>
-<h1>Node Notes</h1>
+<h1 id="greeting">Node Notes</h1>
 <p id="count">hits: ${counter}</p>
+<p id="meta"></p>
 <p>runtime: Node.js ${RUNNING}</p>
 <pre id="events"></pre>
 <pre id="wslog"></pre>
@@ -59,6 +60,21 @@ function indexHtml(counter) {
   var ws = new WebSocket('ws://' + location.host + '/ws');
   ws.onopen = function () { ws.send('hello'); };
   ws.onmessage = function (e) { document.getElementById('wslog').textContent += 'ws: ' + e.data + "\\n"; };
+</script>
+<script>
+  // bytehost 语言桥(localhost 注入,Node HTTP 应用同样可复用):用 app_locale 设
+  // document.lang 并刷新标题/快照显示。无桥(旧宿主/未声明 webview_locale)则保留兜底文案。
+  var STRINGS = { en: "Node Notes", "zh-CN": "Node 笔记" };
+  function applyI18n(snap) {
+    if (!snap) return;
+    document.documentElement.lang = snap.app_locale;
+    document.getElementById('greeting').textContent = STRINGS[snap.app_locale] || STRINGS.en;
+    document.getElementById('meta').textContent =
+      "ui_locale=" + snap.ui_locale + " app_locale=" + snap.app_locale +
+      " revision=" + snap.locale_revision;
+  }
+  var bridge = window.bytehost && window.bytehost.i18n;
+  if (bridge) { applyI18n(bridge.getSnapshot()); bridge.subscribe(applyI18n); }
 </script>
 </body>
 </html>

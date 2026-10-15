@@ -303,6 +303,8 @@ name = "bytehost-webview"
 version = "0.1.0"
 dependencies = [
  "bytehost-apps",
+ "serde",
+ "serde_json",
  "url",
  "uuid",
 ]
