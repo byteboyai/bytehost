@@ -18,3 +18,7 @@ pub use persist::{Defaults, Loaded};
 pub mod theme;
 
 pub use theme::metrics_from_theme;
+
+pub mod view;
+
+pub use view::{BodyArea, El, PanelMeta, ShellHost, TopBarSlots, map_event, pair_view, view};
