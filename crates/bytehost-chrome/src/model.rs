@@ -63,6 +63,8 @@ pub enum ShellMsg {
     ShowPanel(PanelId),
     Maximize(Side),
     MaximizeClose,
+    /// 切换配对面板"第一个 slot 收起"(列表的收起 / 展开按钮)。面板没有配对规格时什么都不做。
+    TogglePane(PanelId),
     /// 左键按下:按模型记录的光标位置决定聚焦哪一侧。
     ZoneClicked,
     Resized { w: f32, h: f32 },
@@ -309,6 +311,14 @@ impl ShellModel {
             ShellMsg::MaximizeClose => {
                 self.maximized = None;
                 Outcome::default()
+            }
+            ShellMsg::TogglePane(panel) => {
+                let Some(pane) = (ctx.rules)(&panel).and_then(|r| r.pane) else {
+                    return Outcome::default();
+                };
+                let collapsed = self.panes.get_or(&panel, PaneDims::new(pane.default_split, false)).collapsed;
+                self.panes.set_collapsed(&panel, !collapsed, pane.default_split);
+                Outcome { persist: true, ..Outcome::default() }
             }
             ShellMsg::ZoneClicked => {
                 if let Some(side) = geometry::zone_at_x(self.cursor.0, self.window.0, &self.zone_state(), ctx.metrics) {
@@ -769,6 +779,50 @@ mod tests {
         run(&mut s, ShellMsg::DividerPress(Divider::Pair(Side::Left)));
         run(&mut s, ShellMsg::CursorMoved { x: 300.0, y: 300.0 });
         assert!(s.panes().is_empty());
+    }
+
+    // ---- 切换配对收起 ----
+    #[test]
+    fn toggle_pane_flips_collapsed_keeps_the_split_and_asks_to_persist() {
+        let mut s = model();
+        // 还没有条目:第一次切换用 default_split(0.4)建一条已收起的
+        let out = run(&mut s, ShellMsg::TogglePane(id("t.list")));
+        assert!(out.persist);
+        assert_eq!(s.panes().get(&id("t.list")), Some(PaneDims::new(0.4, true)));
+        // 再切换一次展开
+        assert!(run(&mut s, ShellMsg::TogglePane(id("t.list"))).persist);
+        assert_eq!(s.panes().get(&id("t.list")), Some(PaneDims::new(0.4, false)));
+        // 拖出一个 0.5 的比例,收起再展开后比例还在
+        run(&mut s, ShellMsg::DividerPress(Divider::Pair(Side::Left)));
+        run(&mut s, ShellMsg::CursorMoved { x: 51.0 + 312.0, y: 300.0 });
+        run(&mut s, ShellMsg::PointerReleased);
+        run(&mut s, ShellMsg::TogglePane(id("t.list")));
+        let d = s.panes().get(&id("t.list")).unwrap();
+        assert!(d.collapsed && (d.split - 0.5).abs() < 1e-3);
+        run(&mut s, ShellMsg::TogglePane(id("t.list")));
+        let d = s.panes().get(&id("t.list")).unwrap();
+        assert!(!d.collapsed && (d.split - 0.5).abs() < 1e-3, "the dragged split survives a collapse/expand round trip");
+    }
+
+    #[test]
+    fn toggle_pane_on_a_panel_without_a_pair_does_nothing() {
+        let mut s = model();
+        for p in ["t.plain", "t.nope"] {
+            let out = run(&mut s, ShellMsg::TogglePane(id(p)));
+            assert!(!out.persist, "{p}");
+        }
+        assert!(s.panes().is_empty());
+    }
+
+    #[test]
+    fn a_collapsed_pair_expands_again_when_dragged_back_out() {
+        let mut s = model();
+        run(&mut s, ShellMsg::TogglePane(id("t.list")));
+        assert!(s.panes().get(&id("t.list")).unwrap().collapsed);
+        // 收起时没有分隔线可拖;直接模拟"仍在拖拽中"的光标回到宽处:展开
+        run(&mut s, ShellMsg::DividerPress(Divider::Pair(Side::Left)));
+        run(&mut s, ShellMsg::CursorMoved { x: 51.0 + 250.0, y: 300.0 });
+        assert!(!s.panes().get(&id("t.list")).unwrap().collapsed);
     }
 
     // ---- 配对矩形 ----
