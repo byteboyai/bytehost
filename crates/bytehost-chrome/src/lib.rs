@@ -5,3 +5,4 @@ pub mod metrics;
 
 pub use geometry::{Rect, ShellRects, Side};
 pub use metrics::ChromeMetrics;
+pub mod rail;
