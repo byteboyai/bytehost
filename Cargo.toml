@@ -14,3 +14,8 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 bytehost-core = { path = "crates/bytehost-core" }
+
+# 开发期临时配置:byteui 的外壳区域样式还在 sibling worktree 里,没有发布 tag。打 tag 之前删除本段,并把
+# crates/bytehost-chrome/Cargo.toml 里的 byteui 依赖改成新 tag。
+[patch."https://github.com/byteboyai/byteui"]
+byteui = { path = "../byteui-shell" }
