@@ -97,7 +97,8 @@ where
         .width(Length::Fill),
         rail::icon_rail::<M, H>(model, host, Side::Right, m),
     ];
-    let base: El<'a, M> = column![top, body].into();
+    // 与 Dozer 一致:窗口根容器铺窗口底色,区域外边距 / 分隔线两侧的留白露出的就是这个颜色(而不是 iced 默认主题的底色)。
+    let base: El<'a, M> = container(column![top, body]).width(Length::Fill).height(Length::Fill).style(root_style).into();
 
     let mut layers: Vec<El<'a, M>> = vec![base];
     if let Some(side) = model.maximized() {
@@ -112,6 +113,11 @@ where
         return layers.pop().expect("one layer");
     }
     stack(layers).width(Length::Fill).height(Length::Fill).into()
+}
+
+/// 窗口根容器的底色:byteui 区域样式里的 `window_background`。
+fn root_style(_: &iced_widget::Theme) -> container::Style {
+    container::Style { background: Some(byteui::theme::region::window_background().into()), ..container::Style::default() }
 }
 
 /// 把 iced 事件映射成骨架消息(产品在自己的 `listen_with` 里调用,非捕获闭包即可)。
@@ -134,6 +140,12 @@ mod tests {
     use super::*;
     use crate::model::{Ctx, PaneRules};
     use bytehost_desktop::PaneSpec;
+
+    #[test]
+    fn the_root_paints_the_window_background_so_margins_do_not_show_the_iced_default() {
+        let style = root_style(&iced_widget::Theme::Light);
+        assert_eq!(style.background, Some(byteui::theme::region::window_background().into()));
+    }
 
     #[derive(Debug, Clone)]
     #[allow(dead_code)]
