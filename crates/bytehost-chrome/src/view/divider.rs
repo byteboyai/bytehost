@@ -12,21 +12,44 @@ use crate::model::Divider;
 ///
 /// `on_press` 只发起拖拽;持续追踪交给全局的 `CursorMoved` / `PointerReleased`(`MouseArea` 的 `on_move` 要求光标
 /// 不离开这条窄带,快速拖拽会断)。
-pub fn divider_bar<'a, M: Clone + 'a>(kind: Divider, left_bg: Color, right_bg: Color, on_press: M) -> El<'a, M> {
+pub fn divider_bar<'a, M: Clone + 'a>(
+    kind: Divider,
+    left_bg: Color,
+    right_bg: Color,
+    on_press: M,
+) -> El<'a, M> {
     let width = byteui::theme::geometry::divider_width();
     let body: El<'a, M> = if matches!(kind, Divider::Zones) {
-        iced_widget::Space::new().width(Length::Fixed(width)).height(Length::Fill).into()
+        iced_widget::Space::new()
+            .width(Length::Fixed(width))
+            .height(Length::Fill)
+            .into()
     } else {
         let line_w = 2.0_f32;
         let side_w = (width - line_w) / 2.0;
         let fill = |c: Color| {
-            container(iced_widget::Space::new()).width(Length::Fixed(side_w)).height(Length::Fill).style(move |_t: &iced_widget::Theme| container::Style { background: Some(c.into()), ..container::Style::default() })
+            container(iced_widget::Space::new())
+                .width(Length::Fixed(side_w))
+                .height(Length::Fill)
+                .style(move |_t: &iced_widget::Theme| container::Style {
+                    background: Some(c.into()),
+                    ..container::Style::default()
+                })
         };
         let line = container(iced_widget::Space::new())
             .width(Length::Fixed(line_w))
             .height(Length::Fill)
-            .style(|_t: &iced_widget::Theme| container::Style { background: Some(byteui::theme::color::current().border.into()), ..container::Style::default() });
-        row![fill(left_bg), line, fill(right_bg)].width(Length::Fixed(width)).height(Length::Fill).into()
+            .style(|_t: &iced_widget::Theme| container::Style {
+                background: Some(byteui::theme::color::current().border.into()),
+                ..container::Style::default()
+            });
+        row![fill(left_bg), line, fill(right_bg)]
+            .width(Length::Fixed(width))
+            .height(Length::Fill)
+            .into()
     };
-    MouseArea::new(body).interaction(mouse::Interaction::ResizingColumn).on_press(on_press).into()
+    MouseArea::new(body)
+        .interaction(mouse::Interaction::ResizingColumn)
+        .on_press(on_press)
+        .into()
 }

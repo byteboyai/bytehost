@@ -7,7 +7,10 @@ fn insets(p: iced_widget::core::Padding) -> Insets {
 }
 
 fn zone(style: byteui::theme::region::RegionStyle) -> ZoneInsets {
-    ZoneInsets { margin: insets(style.margin), padding: insets(style.padding) }
+    ZoneInsets {
+        margin: insets(style.margin),
+        padding: insets(style.padding),
+    }
 }
 
 /// 当前主题下的度量(已含全局 UI scale)。运行时每次需要几何时现读,这样 Ctrl +/- 缩放后几何与控件一起变。

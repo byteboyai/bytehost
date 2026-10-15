@@ -16,18 +16,54 @@ pub fn split_portions(split: f32) -> (u16, u16) {
 ///
 /// 两块的宽度由它们**自己的外层容器**声明成 `FillPortion`,不再套一层包装容器:`Limits::width(Fixed(w))` 会把子元素的
 /// min/max 都钉成 `w`,父级的 `FillPortion` 只约束包装容器本身、传不进子元素,曾导致两块 pane 全部以 0 宽布局。
-pub fn pair_view<'a, M: Clone + 'a>(area: &BodyArea, first: El<'a, M>, second: El<'a, M>, on_divider_press: M, first_bg: iced_widget::core::Color, second_bg: iced_widget::core::Color) -> El<'a, M> {
+pub fn pair_view<'a, M: Clone + 'a>(
+    area: &BodyArea,
+    first: El<'a, M>,
+    second: El<'a, M>,
+    on_divider_press: M,
+    first_bg: iced_widget::core::Color,
+    second_bg: iced_widget::core::Color,
+) -> El<'a, M> {
     if area.collapsed {
-        return container(second).width(Length::Fill).height(Length::Fill).into();
+        return container(second)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
     }
     let (p_first, p_second) = split_portions(area.split);
-    let first = container(first).width(Length::FillPortion(p_first)).height(Length::Fill);
-    let second = container(second).width(Length::FillPortion(p_second)).height(Length::Fill);
+    let first = container(first)
+        .width(Length::FillPortion(p_first))
+        .height(Length::Fill);
+    let second = container(second)
+        .width(Length::FillPortion(p_second))
+        .height(Length::Fill);
     // 第一个 slot 此刻是否渲染在左边:几何里已经按镜像算好,直接读,不重复推导。
     let first_on_left = area.pair.map(|p| p.first.x <= p.second.x).unwrap_or(true);
     if first_on_left {
-        row![first, super::divider_bar(Divider::Pair(area.side), first_bg, second_bg, on_divider_press), second].height(Length::Fill).into()
+        row![
+            first,
+            super::divider_bar(
+                Divider::Pair(area.side),
+                first_bg,
+                second_bg,
+                on_divider_press
+            ),
+            second
+        ]
+        .height(Length::Fill)
+        .into()
     } else {
-        row![second, super::divider_bar(Divider::Pair(area.side), second_bg, first_bg, on_divider_press), first].height(Length::Fill).into()
+        row![
+            second,
+            super::divider_bar(
+                Divider::Pair(area.side),
+                second_bg,
+                first_bg,
+                on_divider_press
+            ),
+            first
+        ]
+        .height(Length::Fill)
+        .into()
     }
 }

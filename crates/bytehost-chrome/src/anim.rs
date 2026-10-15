@@ -15,7 +15,11 @@ impl HoverAnim {
     }
     pub fn advance(&mut self) {
         let next = self.progress + (self.target - self.progress) * 0.5;
-        self.progress = if (next - self.target).abs() < 0.01 { self.target } else { next };
+        self.progress = if (next - self.target).abs() < 0.01 {
+            self.target
+        } else {
+            next
+        };
     }
     pub fn active(&self) -> bool {
         (self.progress - self.target).abs() > 0.001
@@ -35,7 +39,10 @@ pub struct SlotAnim {
 
 impl SlotAnim {
     pub fn new(side: Side, target: f32) -> Self {
-        Self { current: target, side }
+        Self {
+            current: target,
+            side,
+        }
     }
     pub fn retarget(&mut self, side: Side, target: f32) {
         if self.side != side {
@@ -44,7 +51,11 @@ impl SlotAnim {
             return;
         }
         let next = self.current + (target - self.current) * 0.5;
-        self.current = if (next - target).abs() < 0.02 { target } else { next };
+        self.current = if (next - target).abs() < 0.02 {
+            target
+        } else {
+            next
+        };
     }
     pub fn active(&self, side: Side, target: f32) -> bool {
         self.side == side && (self.current - target).abs() > 0.005
@@ -89,6 +100,10 @@ mod tests {
         assert!(!a.active(Side::Left, 2.0));
         a.retarget(Side::Right, 1.0);
         assert_eq!(a.current(Side::Right), Some(1.0), "a cross-rail move snaps");
-        assert_eq!(a.current(Side::Left), None, "the old side no longer owns the animation");
+        assert_eq!(
+            a.current(Side::Left),
+            None,
+            "the old side no longer owns the animation"
+        );
     }
 }

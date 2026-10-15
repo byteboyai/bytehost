@@ -15,7 +15,12 @@ pub struct Rect {
 }
 
 impl Rect {
-    pub const ZERO: Self = Self { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    pub const ZERO: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        w: 0.0,
+        h: 0.0,
+    };
 
     pub const fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
         Self { x, y, w, h }
@@ -193,8 +198,18 @@ pub fn layout(window_w: f32, window_h: f32, s: &ZoneState, m: &ChromeMetrics) ->
     ShellRects {
         top_bar: Rect::new(0.0, 0.0, window_w, m.top_bar_height),
         left_rail: Rect::new(0.0, body_y, m.icon_rail_width, rail_h),
-        right_rail: Rect::new(window_w - m.icon_rail_width, body_y, m.icon_rail_width, rail_h),
-        footbar: Rect::new(zones_x, window_h - m.footbar_height, (window_w - 2.0 * m.icon_rail_width).max(0.0), m.footbar_height),
+        right_rail: Rect::new(
+            window_w - m.icon_rail_width,
+            body_y,
+            m.icon_rail_width,
+            rail_h,
+        ),
+        footbar: Rect::new(
+            zones_x,
+            window_h - m.footbar_height,
+            (window_w - 2.0 * m.icon_rail_width).max(0.0),
+            m.footbar_height,
+        ),
         divider,
         left_zone,
         right_zone,
@@ -219,7 +234,11 @@ pub fn zone_at_x(x: f32, window_w: f32, s: &ZoneState, m: &ChromeMetrics) -> Opt
         (false, true) => Some(Side::Left),
         (false, false) => {
             let boundary = m.icon_rail_width + left_zone_width(window_w, s, m);
-            Some(if x < boundary { Side::Left } else { Side::Right })
+            Some(if x < boundary {
+                Side::Left
+            } else {
+                Side::Right
+            })
         }
     }
 }
@@ -236,7 +255,12 @@ mod tests {
     }
 
     fn open(left_width: f32) -> ZoneState {
-        ZoneState { left_collapsed: false, right_collapsed: false, left_width, maximized: None }
+        ZoneState {
+            left_collapsed: false,
+            right_collapsed: false,
+            left_width,
+            maximized: None,
+        }
     }
 
     #[test]
@@ -279,7 +303,10 @@ mod tests {
 
     #[test]
     fn collapsing_one_side_gives_the_other_the_whole_space() {
-        let s = ZoneState { left_collapsed: true, ..open(640.0) };
+        let s = ZoneState {
+            left_collapsed: true,
+            ..open(640.0)
+        };
         let r = layout(W, H, &s, &m());
         assert_eq!(r.left_zone, None);
         assert_eq!(r.left_content, None);
@@ -287,7 +314,10 @@ mod tests {
         assert_eq!(r.divider, Rect::new(44.0, 40.0, 8.0, 838.0));
         assert_eq!(r.right_zone, Some(Rect::new(52.0, 40.0, 1344.0, 838.0)));
 
-        let s = ZoneState { right_collapsed: true, ..open(640.0) };
+        let s = ZoneState {
+            right_collapsed: true,
+            ..open(640.0)
+        };
         let r = layout(W, H, &s, &m());
         assert_eq!(r.right_zone, None);
         assert_eq!(r.left_zone, Some(Rect::new(44.0, 40.0, 1344.0, 838.0)));
@@ -297,20 +327,36 @@ mod tests {
 
     #[test]
     fn both_collapsed_leaves_no_zone() {
-        let s = ZoneState { left_collapsed: true, right_collapsed: true, ..open(640.0) };
+        let s = ZoneState {
+            left_collapsed: true,
+            right_collapsed: true,
+            ..open(640.0)
+        };
         let r = layout(W, H, &s, &m());
-        assert_eq!((r.left_zone, r.right_zone, r.left_content, r.right_content), (None, None, None, None));
+        assert_eq!(
+            (r.left_zone, r.right_zone, r.left_content, r.right_content),
+            (None, None, None, None)
+        );
     }
 
     #[test]
     fn maximizing_one_side_hides_the_other_and_fills_the_box() {
-        let s = ZoneState { maximized: Some(Side::Left), ..open(640.0) };
+        let s = ZoneState {
+            maximized: Some(Side::Left),
+            ..open(640.0)
+        };
         let r = layout(W, H, &s, &m());
         let b = Rect::new(84.0, 80.0, 1272.0, 780.0);
         assert_eq!(r.maximize_box, Some(b));
         assert_eq!(r.left_content, Some(b));
-        assert_eq!(r.right_content, None, "the covered side must report no content so its native view is hidden");
-        let s = ZoneState { maximized: Some(Side::Right), ..open(640.0) };
+        assert_eq!(
+            r.right_content, None,
+            "the covered side must report no content so its native view is hidden"
+        );
+        let s = ZoneState {
+            maximized: Some(Side::Right),
+            ..open(640.0)
+        };
         let r = layout(W, H, &s, &m());
         assert_eq!(r.right_content, Some(b));
         assert_eq!(r.left_content, None);
@@ -319,7 +365,14 @@ mod tests {
     #[test]
     fn tiny_windows_never_produce_negative_sizes() {
         let r = layout(50.0, 50.0, &open(640.0), &m());
-        for rect in [r.top_bar, r.left_rail, r.right_rail, r.footbar, r.divider].into_iter().chain([r.left_zone, r.right_zone, r.left_content, r.right_content].into_iter().flatten()) {
+        for rect in [r.top_bar, r.left_rail, r.right_rail, r.footbar, r.divider]
+            .into_iter()
+            .chain(
+                [r.left_zone, r.right_zone, r.left_content, r.right_content]
+                    .into_iter()
+                    .flatten(),
+            )
+        {
             assert!(rect.w >= 0.0 && rect.h >= 0.0, "{rect:?}");
         }
         assert!(maximize_box(50.0, 50.0, &m()).w >= 0.0);
@@ -334,11 +387,21 @@ mod tests {
         assert_eq!(zone_at_x(900.0, W, &s, &m()), Some(Side::Right));
         assert_eq!(zone_at_x(683.9, W, &s, &m()), Some(Side::Left));
         assert_eq!(zone_at_x(684.0, W, &s, &m()), Some(Side::Right));
-        let s = ZoneState { left_collapsed: true, ..open(640.0) };
+        let s = ZoneState {
+            left_collapsed: true,
+            ..open(640.0)
+        };
         assert_eq!(zone_at_x(100.0, W, &s, &m()), Some(Side::Right));
-        let s = ZoneState { left_collapsed: true, right_collapsed: true, ..open(640.0) };
+        let s = ZoneState {
+            left_collapsed: true,
+            right_collapsed: true,
+            ..open(640.0)
+        };
         assert_eq!(zone_at_x(100.0, W, &s, &m()), None);
-        let s = ZoneState { maximized: Some(Side::Right), ..open(640.0) };
+        let s = ZoneState {
+            maximized: Some(Side::Right),
+            ..open(640.0)
+        };
         assert_eq!(zone_at_x(100.0, W, &s, &m()), Some(Side::Right));
     }
 }

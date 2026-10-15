@@ -54,7 +54,13 @@ pub fn drag_move_into(rails: &mut Rails, drag: &mut RailDrag, side: Side, to: us
 
 /// 跨栏移动的落地:把 `source_side` 第 `source_index` 个面板搬到 `target_side` 第 `target_index` 位。
 /// 源栏只剩这一个(搬走会清空栏)或下标越界时返回 `None` 且不改动;目标下标越界时取末尾。
-pub fn cross_apply(rails: &mut Rails, source_side: Side, source_index: usize, target_side: Side, target_index: usize) -> Option<PanelId> {
+pub fn cross_apply(
+    rails: &mut Rails,
+    source_side: Side,
+    source_index: usize,
+    target_side: Side,
+    target_index: usize,
+) -> Option<PanelId> {
     if source_side == target_side {
         return None;
     }
@@ -72,7 +78,9 @@ pub fn cross_apply(rails: &mut Rails, source_side: Side, source_index: usize, ta
 /// 此刻鼠标下真正拖着的那个面板(同栏重排会实时更新 `source_index`)。
 pub fn dragged_panel(rails: &Rails, drag: Option<&RailDrag>) -> Option<PanelId> {
     let drag = drag?;
-    rails[drag.source_side.index()].get(drag.source_index).cloned()
+    rails[drag.source_side.index()]
+        .get(drag.source_index)
+        .cloned()
 }
 
 /// 自按下以来光标是否已越过阈值(越过才算拖拽,不是单击)。
@@ -96,13 +104,31 @@ pub struct ShowPanel {
 
 /// "把某面板显示出来"的纯逻辑——与图标栏点击的区别:**绝不收起**。已经看得见就什么都不做;被收起就展开;
 /// 显示的是别的就切过去;被另一侧的放大态盖住就退出放大。
-pub fn show_panel_in(side: Side, panel: &PanelId, selected: &PanelId, collapsed: bool, maximized: Option<Side>) -> ShowPanel {
+pub fn show_panel_in(
+    side: Side,
+    panel: &PanelId,
+    selected: &PanelId,
+    collapsed: bool,
+    maximized: Option<Side>,
+) -> ShowPanel {
     let visible = selected == panel && !collapsed;
     let covered = maximized.is_some_and(|m| m != side);
     if visible && !covered {
-        return ShowPanel { selected: selected.clone(), collapsed, maximized, switched: false, changed: false };
+        return ShowPanel {
+            selected: selected.clone(),
+            collapsed,
+            maximized,
+            switched: false,
+            changed: false,
+        };
     }
-    ShowPanel { selected: panel.clone(), collapsed: false, maximized: None, switched: selected != panel, changed: true }
+    ShowPanel {
+        selected: panel.clone(),
+        collapsed: false,
+        maximized: None,
+        switched: selected != panel,
+        changed: true,
+    }
 }
 
 #[cfg(test)]
@@ -114,11 +140,20 @@ mod tests {
     }
 
     fn rails() -> Rails {
-        [vec![id("t.a"), id("t.b"), id("t.c")], vec![id("t.x"), id("t.y")]]
+        [
+            vec![id("t.a"), id("t.b"), id("t.c")],
+            vec![id("t.x"), id("t.y")],
+        ]
     }
 
     fn drag(side: Side, index: usize) -> RailDrag {
-        RailDrag { source_side: side, source_index: index, origin_index: index, pending_cross: None, press_pos: (0.0, 0.0) }
+        RailDrag {
+            source_side: side,
+            source_index: index,
+            origin_index: index,
+            pending_cross: None,
+            press_pos: (0.0, 0.0),
+        }
     }
 
     fn names(r: &Rails, side: Side) -> Vec<&str> {
@@ -132,7 +167,10 @@ mod tests {
         drag_move_into(&mut r, &mut d, Side::Left, 2);
         assert_eq!(names(&r, Side::Left), ["t.b", "t.c", "t.a"]);
         assert_eq!(d.source_index, 2);
-        assert_eq!(d.origin_index, 0, "origin stays so the end can tell a reorder happened");
+        assert_eq!(
+            d.origin_index, 0,
+            "origin stays so the end can tell a reorder happened"
+        );
         assert_eq!(dragged_panel(&r, Some(&d)), Some(id("t.a")));
     }
 
@@ -152,7 +190,11 @@ mod tests {
         let mut d = drag(Side::Left, 1);
         drag_move_into(&mut r, &mut d, Side::Right, 1);
         assert_eq!(d.pending_cross, Some((Side::Right, 1)));
-        assert_eq!(names(&r, Side::Left), ["t.a", "t.b", "t.c"], "nothing moves until the button is released");
+        assert_eq!(
+            names(&r, Side::Left),
+            ["t.a", "t.b", "t.c"],
+            "nothing moves until the button is released"
+        );
         // hovering back cancels the pending move
         drag_move_into(&mut r, &mut d, Side::Left, 1);
         assert_eq!(d.pending_cross, None);
@@ -161,11 +203,17 @@ mod tests {
     #[test]
     fn cross_side_move_relocates_and_clamps_the_target_index() {
         let mut r = rails();
-        assert_eq!(cross_apply(&mut r, Side::Left, 1, Side::Right, 1), Some(id("t.b")));
+        assert_eq!(
+            cross_apply(&mut r, Side::Left, 1, Side::Right, 1),
+            Some(id("t.b"))
+        );
         assert_eq!(names(&r, Side::Left), ["t.a", "t.c"]);
         assert_eq!(names(&r, Side::Right), ["t.x", "t.b", "t.y"]);
         // an index past the end lands the panel last
-        assert_eq!(cross_apply(&mut r, Side::Left, 0, Side::Right, 99), Some(id("t.a")));
+        assert_eq!(
+            cross_apply(&mut r, Side::Left, 0, Side::Right, 99),
+            Some(id("t.a"))
+        );
         assert_eq!(names(&r, Side::Right), ["t.x", "t.b", "t.y", "t.a"]);
     }
 
@@ -190,7 +238,10 @@ mod tests {
         let r = rails();
         assert_eq!(dragged_panel(&r, None), None);
         assert_eq!(dragged_panel(&r, Some(&drag(Side::Right, 9))), None);
-        assert_eq!(dragged_panel(&r, Some(&drag(Side::Right, 1))), Some(id("t.y")));
+        assert_eq!(
+            dragged_panel(&r, Some(&drag(Side::Right, 1))),
+            Some(id("t.y"))
+        );
     }
 
     #[test]
@@ -198,7 +249,10 @@ mod tests {
         let mut d = drag(Side::Left, 0);
         d.press_pos = (10.0, 10.0);
         assert!(!past_threshold(&d, (10.0, 10.0)));
-        assert!(!past_threshold(&d, (14.0, 10.0)), "exactly at the threshold is still a click");
+        assert!(
+            !past_threshold(&d, (14.0, 10.0)),
+            "exactly at the threshold is still a click"
+        );
         assert!(past_threshold(&d, (14.1, 10.0)));
         assert!(past_threshold(&d, (13.0, 13.0)), "diagonal distance counts");
     }

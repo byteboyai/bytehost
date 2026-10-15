@@ -11,10 +11,20 @@ pub struct Insets {
 }
 
 impl Insets {
-    pub const ZERO: Self = Self { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0 };
+    pub const ZERO: Self = Self {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: 0.0,
+    };
 
     pub const fn new(top: f32, right: f32, bottom: f32, left: f32) -> Self {
-        Self { top, right, bottom, left }
+        Self {
+            top,
+            right,
+            bottom,
+            left,
+        }
     }
 
     pub const fn uniform(v: f32) -> Self {
@@ -82,8 +92,14 @@ impl ChromeMetrics {
             min_split_ratio: 0.2,
             max_split_ratio: 0.8,
             maximize_padding: 40.0,
-            left_zone: ZoneInsets { margin: Insets::new(6.0, 0.0, 0.0, 6.0), padding: Insets::uniform(1.0) },
-            right_zone: ZoneInsets { margin: Insets::new(6.0, 6.0, 0.0, 0.0), padding: Insets::uniform(1.0) },
+            left_zone: ZoneInsets {
+                margin: Insets::new(6.0, 0.0, 0.0, 6.0),
+                padding: Insets::uniform(1.0),
+            },
+            right_zone: ZoneInsets {
+                margin: Insets::new(6.0, 6.0, 0.0, 0.0),
+                padding: Insets::uniform(1.0),
+            },
         }
     }
 }
