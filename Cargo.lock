@@ -252,6 +252,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytehost-chrome"
+version = "0.1.0"
+dependencies = [
+ "block2 0.6.2",
+ "bytehost-core",
+ "bytehost-desktop",
+ "byteui",
+ "iced_renderer",
+ "iced_widget",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bytehost-client"
 version = "0.1.0"
 dependencies = [
@@ -338,6 +356,18 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "byteui"
+version = "0.4.1"
+source = "git+https://github.com/byteboyai/byteui?tag=v0.4.1#8ef64af21fd2a84ef0ad341a254cfcea4bb011dc"
+dependencies = [
+ "iced_futures",
+ "iced_renderer",
+ "iced_widget",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cairo-rs"

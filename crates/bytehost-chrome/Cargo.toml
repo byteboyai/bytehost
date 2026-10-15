@@ -1,0 +1,26 @@
+[package]
+name = "bytehost-chrome"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "bytehost 共享窗口骨架:顶栏、左右图标栏、左右面板区、分隔线、配对视图、放大态与布局持久化。以 PanelId 为键,不理解任何具体面板。"
+
+[dependencies]
+bytehost-core.workspace = true
+# 配对分割的存储与拖拽换算(`PaneStore` / `apply_pane_split_drag`)复用 bytehost-desktop 已有实现。
+bytehost-desktop = { path = "../bytehost-desktop" }
+serde.workspace = true
+serde_json.workspace = true
+# 控件与度量读 byteui 的主题(几何、配色、外壳区域样式)。
+byteui = { git = "https://github.com/byteboyai/byteui", tag = "v0.4.1" }
+# 控件返回 `Element<'a, M, iced_widget::Theme, iced_renderer::Renderer>`(与 byteui 一致),不开渲染器 feature。
+iced_widget = { version = "0.14", default-features = false }
+iced_renderer = { version = "0.14", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+block2 = "0.6"
+raw-window-handle = "0.6"
