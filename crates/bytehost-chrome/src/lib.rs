@@ -14,3 +14,7 @@ pub use model::{Ctx, Divider, Outcome, PaneRules, PairRects, PanelRules, ShellMo
 pub mod persist;
 
 pub use persist::{Defaults, Loaded};
+
+pub mod theme;
+
+pub use theme::metrics_from_theme;
