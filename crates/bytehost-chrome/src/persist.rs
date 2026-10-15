@@ -112,22 +112,41 @@ fn pick_selected(rail: &[PanelId], want: &Option<String>) -> PanelId {
     want.as_ref().and_then(|w| rail.iter().find(|p| p.as_str() == w)).unwrap_or(&rail[0]).clone()
 }
 
+/// 逐字段解析:某个字段类型不对只让这个字段回到默认,不连累其余偏好(栏位顺序、选中、收起、窗口大小……)。
+fn lenient_file(raw: &serde_json::Value) -> ShellFile {
+    fn field<T: serde::de::DeserializeOwned>(raw: &serde_json::Value, key: &str, fallback: T) -> T {
+        raw.get(key).and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or(fallback)
+    }
+    let d = ShellFile::default();
+    ShellFile {
+        schema_version: field(raw, "schema_version", d.schema_version),
+        window_width: field(raw, "window_width", d.window_width),
+        window_height: field(raw, "window_height", d.window_height),
+        left: field(raw, "left", d.left),
+        right: field(raw, "right", d.right),
+        selected_left: field(raw, "selected_left", d.selected_left),
+        selected_right: field(raw, "selected_right", d.selected_right),
+        left_collapsed: field(raw, "left_collapsed", d.left_collapsed),
+        right_collapsed: field(raw, "right_collapsed", d.right_collapsed),
+        left_width: field(raw, "left_width", d.left_width),
+        panes: field(raw, "panes", d.panes),
+    }
+}
+
 /// 读盘:`json` 为 `None` = 没有文件。`known` 是产品面板清单里的全部面板。
 pub fn load(json: Option<&str>, known: &[PanelId], d: &Defaults, m: &ChromeMetrics) -> Loaded {
     let Some(json) = json else {
         return Loaded::Fresh(default_model(d));
     };
     // 顶层必须是对象:serde 会把 `[1,2]` 这样的数组按"位置序列"塞进结构体,把损坏文件当成已恢复。
-    let Some(file) = serde_json::from_str::<serde_json::Value>(json)
-        .ok()
-        .filter(serde_json::Value::is_object)
-        .and_then(|v| serde_json::from_value::<ShellFile>(v).ok())
-    else {
+    let Some(raw) = serde_json::from_str::<serde_json::Value>(json).ok().filter(serde_json::Value::is_object) else {
         return Loaded::Fresh(default_model(d));
     };
-    if file.schema_version > SCHEMA_VERSION {
-        return Loaded::Newer { model: default_model(d), found: file.schema_version };
+    // 版本号先从原始 JSON 里读:更新版本可能改了字段形状,本版本按类型解析会失败,但仍必须认出它更新、不得回写。
+    if let Some(found) = raw.get("schema_version").and_then(serde_json::Value::as_u64).filter(|v| *v > u64::from(SCHEMA_VERSION)) {
+        return Loaded::Newer { model: default_model(d), found: u32::try_from(found).unwrap_or(u32::MAX) };
     }
+    let file = lenient_file(&raw);
 
     // 1. 栏位:丢未知 / 重复,清单里有而文件里没有的面板补回它的默认栏末尾。
     let mut seen = Vec::new();
@@ -318,6 +337,28 @@ mod tests {
         let l = load_str(r#"{ "left": ["t.a","t.b","t.c"], "right": ["t.x","t.y"], "selected_left": "t.x", "selected_right": "t.zzz" }"#);
         assert_eq!(l.model().selected(Side::Left), &id("t.a"));
         assert_eq!(l.model().selected(Side::Right), &id("t.x"));
+    }
+
+    /// 评审 Important 1:一个字段类型不对,不能让整份偏好(栏位顺序、选中、收起、其余字段)被重置。
+    #[test]
+    fn one_mistyped_field_does_not_reset_the_rest_of_the_file() {
+        let l = load_str(r#"{ "left": ["t.b","t.a","t.c"], "right": ["t.y","t.x"], "selected_left": "t.c", "left_collapsed": "yes", "left_width": null, "window_width": 1000.0, "window_height": 700.0 }"#);
+        assert!(matches!(l, Loaded::Restored(_)), "the file is repaired, not discarded");
+        let model = l.model();
+        assert_eq!(model.rail(Side::Left), [id("t.b"), id("t.a"), id("t.c")], "the user's rail order survives");
+        assert_eq!(model.rail(Side::Right), [id("t.y"), id("t.x")]);
+        assert_eq!(model.selected(Side::Left), &id("t.c"));
+        assert_eq!(model.window(), (1000.0, 700.0));
+        assert_eq!(model.left_width(), 640.0, "only the broken field falls back to its default");
+        assert!(!model.collapsed(Side::Left));
+    }
+
+    /// 评审 Important 2:未来版本改了字段形状(这里 `left` 变成对象数组)时,本版本解析失败也必须认出它更新,不得回写。
+    #[test]
+    fn a_newer_schema_is_recognised_even_when_its_shape_no_longer_parses() {
+        let l = load_str(r#"{ "schema_version": 2, "left": [{ "id": "t.a", "pinned": true }], "right": [{ "id": "t.x" }] }"#);
+        assert!(matches!(l, Loaded::Newer { found: 2, .. }));
+        assert!(!l.may_save());
     }
 
     #[test]
