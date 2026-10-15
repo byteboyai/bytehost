@@ -10,3 +10,7 @@ pub mod anim;
 pub mod model;
 
 pub use model::{Ctx, Divider, Outcome, PaneRules, PairRects, PanelRules, ShellModel, ShellMsg};
+
+pub mod persist;
+
+pub use persist::{Defaults, Loaded};
