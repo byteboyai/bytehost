@@ -7,3 +7,6 @@ pub use geometry::{Rect, ShellRects, Side};
 pub use metrics::ChromeMetrics;
 pub mod rail;
 pub mod anim;
+pub mod model;
+
+pub use model::{Ctx, Divider, Outcome, PaneRules, PairRects, PanelRules, ShellModel, ShellMsg};
