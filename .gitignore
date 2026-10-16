@@ -1,1 +1,5 @@
 /target
+
+# Python 字节码(tools/shared-deps-guard 的测试会生成)
+__pycache__/
+*.pyc
