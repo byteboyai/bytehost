@@ -247,3 +247,99 @@ def check_pins(deps: list[Dep], pins: dict[str, Pin], today: datetime.date) -> l
             issues.append(Issue(WARN, "pin-expired",
                                 f"{name} 的 pin 已过 review_by({pin.review_by}):{pin.reason}"))
     return issues
+
+
+# ---------------------------------------------------------------- 远端规则
+
+
+class Remote(Protocol):
+    def refs(self, repo: str) -> dict[str, str] | None:
+        """{"refs/tags/v1": sha, "refs/heads/main": sha, ...};无法联网时 None。"""
+
+    def has_commit(self, repo: str, rev: str) -> bool | None:
+        """远端是否有该提交;无法确定时 None。"""
+
+
+_SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+
+
+def parse_semver(tag: str) -> tuple[int, int, int] | None:
+    m = _SEMVER_RE.match(tag)
+    return (int(m[1]), int(m[2]), int(m[3])) if m else None
+
+
+def latest_semver_tag(refs: dict[str, str]) -> str | None:
+    best: tuple[tuple[int, int, int], str] | None = None
+    for ref in refs:
+        if not ref.startswith("refs/tags/") or ref.endswith("^{}"):
+            continue
+        tag = ref[len("refs/tags/"):]
+        ver = parse_semver(tag)
+        if ver is not None and (best is None or ver > best[0]):
+            best = (ver, tag)
+    return best[1] if best else None
+
+
+def describe_gap(cur: tuple[int, int, int], latest: tuple[int, int, int]) -> str:
+    if latest[0] != cur[0]:
+        return f"{latest[0] - cur[0]} 个 major"
+    if latest[1] != cur[1]:
+        return f"{latest[1] - cur[1]} 个 minor"
+    return f"{latest[2] - cur[2]} 个 patch"
+
+
+def check_remote(deps: list[Dep], pins: dict[str, Pin], remote: Remote) -> list[Issue]:
+    issues: list[Issue] = []
+    by_repo: dict[str, set[tuple[str, str]]] = {}
+    for d in deps:
+        by_repo.setdefault(d.repo, set()).add((d.ref_kind, d.ref))
+
+    for repo, wanted in sorted(by_repo.items()):
+        refs = remote.refs(repo)
+        if refs is None:
+            issues.append(Issue(WARN, "ref-unverified",
+                                f"无法联网查询 {repo} 的远端引用,本次未验证其 tag/rev 是否存在"))
+            continue
+        shas = set(refs.values())
+        for kind, ref in sorted(wanted):
+            if kind == "tag" and f"refs/tags/{ref}" not in refs:
+                issues.append(Issue(BLOCK, "ref-missing", f"{repo} 的 tag {ref} 在远端不存在,先推送再依赖"))
+            elif kind == "branch" and f"refs/heads/{ref}" not in refs:
+                issues.append(Issue(BLOCK, "ref-missing", f"{repo} 的分支 {ref} 在远端不存在,先推送再依赖"))
+            elif kind == "rev" and not (len(ref) >= 7 and any(s.startswith(ref) for s in shas)):
+                found = remote.has_commit(repo, ref)
+                if found is False:
+                    issues.append(Issue(BLOCK, "ref-missing",
+                                        f"{repo} 的 rev {ref[:12]} 在远端不存在,先推送再依赖"))
+                elif found is None:
+                    issues.append(Issue(WARN, "ref-unverified",
+                                        f"无法确认 {repo} 的 rev {ref[:12]} 是否已在远端"))
+
+        # 落后:只比较语义化 tag;rev 与 `libs-2026-10-16` 这类非语义化 tag 只查存在性
+        if repo in pins:
+            continue
+        current = [(parse_semver(ref), ref) for kind, ref in wanted
+                   if kind == "tag" and parse_semver(ref) is not None]
+        latest_tag = latest_semver_tag(refs)
+        if current and latest_tag:
+            cur_ver, cur_tag = max(current)
+            latest_ver = parse_semver(latest_tag)
+            if latest_ver > cur_ver:
+                issues.append(Issue(WARN, "behind",
+                                    f"{repo} {cur_tag} -> 最新 {latest_tag}"
+                                    f"(落后 {describe_gap(cur_ver, latest_ver)})"))
+    return issues
+
+
+def check_guard_source(remote: Remote, source_tag: str = SOURCE_TAG) -> list[Issue]:
+    """提示 vendor 的本脚本可能不是正本最新版(只能提示,不会自动更新)。"""
+    current = parse_semver(source_tag)
+    refs = remote.refs(CANONICAL_REPO)
+    if current is None or refs is None:
+        return []
+    latest = latest_semver_tag(refs)
+    if latest and parse_semver(latest) > current:
+        return [Issue(INFO, "guard-source",
+                      f"本脚本 vendor 自 {CANONICAL_REPO} {source_tag},现在有 {latest};"
+                      "如果 tools/shared-deps-guard 有更新,请重新 vendor")]
+    return []

@@ -272,5 +272,110 @@ class OfflineRuleTests(unittest.TestCase):
         self.assertIn("spike/x", issues[0].message)
 
 
+class FakeRemote:
+    """refs_by_repo: {"bytehost": {"refs/tags/v0.4.0": "sha", ...}};缺失的仓库视为无法联网。"""
+
+    def __init__(self, refs_by_repo, commits=None):
+        self.refs_by_repo = refs_by_repo
+        self.commits = commits or {}
+
+    def refs(self, repo):
+        return self.refs_by_repo.get(repo)
+
+    def has_commit(self, repo, rev):
+        return self.commits.get((repo, rev))
+
+
+def tags(*names, **extra):
+    refs = {f"refs/tags/{n}": f"sha-{n}" for n in names}
+    refs.update(extra)
+    return refs
+
+
+class SemverTests(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(g.parse_semver("v0.4.1"), (0, 4, 1))
+        self.assertEqual(g.parse_semver("1.2.3"), (1, 2, 3))
+        self.assertIsNone(g.parse_semver("libs-2026-10-16"))
+        self.assertIsNone(g.parse_semver("v1.2.3-rc1"))
+
+    def test_latest_ignores_peeled_and_non_semver_and_compares_numerically(self):
+        refs = tags("v0.9.0", "v0.10.0", "libs-2026-10-16", **{"refs/tags/v0.10.0^{}": "x",
+                                                              "refs/heads/v9.9.9": "y"})
+        self.assertEqual(g.latest_semver_tag(refs), "v0.10.0")
+        self.assertIsNone(g.latest_semver_tag(tags("libs-2026-10-16")))
+
+    def test_gap_wording(self):
+        self.assertEqual(g.describe_gap((0, 2, 0), (0, 4, 0)), "2 个 minor")
+        self.assertEqual(g.describe_gap((0, 4, 0), (1, 0, 0)), "1 个 major")
+        self.assertEqual(g.describe_gap((0, 4, 0), (0, 4, 3)), "3 个 patch")
+
+
+class RemoteRuleTests(unittest.TestCase):
+    def levels(self, issues):
+        return sorted((i.level, i.rule) for i in issues)
+
+    def test_missing_tag_blocks(self):
+        remote = FakeRemote({"bytehost": tags("v0.4.0")})
+        issues = g.check_remote([dep("bytehost-core", ref="v0.9.9")], {}, remote)
+        self.assertIn(("block", "ref-missing"), self.levels(issues))
+
+    def test_missing_branch_blocks_and_existing_branch_passes(self):
+        remote = FakeRemote({"bytehost": {"refs/heads/main": "s"}})
+        self.assertEqual(g.check_remote([dep("a", kind="branch", ref="main")], {}, remote), [])
+        issues = g.check_remote([dep("a", kind="branch", ref="gone")], {}, remote)
+        self.assertEqual(self.levels(issues), [("block", "ref-missing")])
+
+    def test_rev_matching_a_remote_tip_passes_without_fetch(self):
+        remote = FakeRemote({"dozer": {"refs/heads/main": "7cdbffd0178c50891d4c39f8260224e6b76b79e5"}})
+        d = dep("dozer-model", "dozer", "rev", "7cdbffd0178c50891d4c39f8260224e6b76b79e5")
+        self.assertEqual(g.check_remote([d], {"dozer": g.Pin("x", None)}, remote), [])
+
+    def test_rev_not_at_a_tip_falls_back_to_has_commit(self):
+        sha = "67ab0e657d75135b882ace2f3aa7a56617776c60"
+        d = dep("dozer-model", "dozer", "rev", sha)
+        refs = {"dozer": {"refs/heads/main": "ffffffffffffffffffffffffffffffffffffffff"}}
+        pins = {"dozer": g.Pin("x", None)}
+        found = g.check_remote([d], pins, FakeRemote(refs, {("dozer", sha): True}))
+        missing = g.check_remote([d], pins, FakeRemote(refs, {("dozer", sha): False}))
+        unknown = g.check_remote([d], pins, FakeRemote(refs, {}))
+        self.assertEqual(found, [])
+        self.assertEqual(self.levels(missing), [("block", "ref-missing")])
+        self.assertEqual(self.levels(unknown), [("warn", "ref-unverified")])
+
+    def test_unreachable_remote_warns_and_never_blocks(self):
+        issues = g.check_remote([dep("bytehost-core")], {}, FakeRemote({}))
+        self.assertEqual(self.levels(issues), [("warn", "ref-unverified")])
+
+    def test_behind_warns_with_gap(self):
+        remote = FakeRemote({"bytehost": tags("v0.2.0", "v0.4.0")})
+        issues = g.check_remote([dep("bytehost-core", ref="v0.2.0")], {}, remote)
+        self.assertEqual(self.levels(issues), [("warn", "behind")])
+        self.assertIn("v0.2.0 -> 最新 v0.4.0", issues[0].message)
+        self.assertIn("2 个 minor", issues[0].message)
+
+    def test_up_to_date_is_silent(self):
+        remote = FakeRemote({"bytehost": tags("v0.2.0", "v0.4.0")})
+        self.assertEqual(g.check_remote([dep("bytehost-core", ref="v0.4.0")], {}, remote), [])
+
+    def test_pinned_repo_is_never_behind(self):
+        remote = FakeRemote({"bytehost": tags("v0.2.0", "v0.4.0")})
+        pins = {"bytehost": g.Pin("等同步", None)}
+        self.assertEqual(g.check_remote([dep("bytehost-core", ref="v0.2.0")], pins, remote), [])
+
+    def test_non_semver_tag_is_checked_for_existence_only(self):
+        remote = FakeRemote({"dozer": tags("libs-2026-10-16", "v0.5.153")})
+        d = dep("dozer-model", "dozer", "tag", "libs-2026-10-16")
+        self.assertEqual(g.check_remote([d], {}, remote), [])
+
+    def test_guard_source_info_only_when_canonical_has_newer_semver_tag(self):
+        remote = FakeRemote({"bytehost": tags("v0.4.1", "v0.5.0")})
+        issues = g.check_guard_source(remote, "v0.4.1")
+        self.assertEqual([(i.level, i.rule) for i in issues], [("info", "guard-source")])
+        self.assertEqual(g.check_guard_source(remote, "v0.5.0"), [])
+        self.assertEqual(g.check_guard_source(remote, "unreleased"), [])
+        self.assertEqual(g.check_guard_source(FakeRemote({}), "v0.4.1"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
