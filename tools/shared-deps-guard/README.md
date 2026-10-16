@@ -44,6 +44,10 @@ scripts/check-shared-deps.sh --downgrade-blocks   # 阻断降级为警告
 git config core.hooksPath .githooks               # 启用 pre-push(每个克隆一次)
 ```
 
+退出码:`0` 没有阻断;`1` 有阻断;`3` 脚本自己跑不起来(没有 Python 3.11+、读不到提交、脚本出错)。
+钩子对 `3` 的处理:推 main/tag 时仍然拦下(fail-closed),推其他分支只警告;提示里会说明这是环境问题而不是依赖问题。
+包装脚本会按 `python3.13`、`python3.12`、`python3.11`、`python3` 的顺序找 >= 3.11 的解释器(GUI git 客户端的 PATH 往往只有 macOS 自带的 3.9)。
+
 pre-push 对每个被推送的引用检查它的提交:推 `main` 或 tag 时阻断,推其他分支只警告。
 联网失败只警告并放行。确认要绕过时:`git push --no-verify`。
 

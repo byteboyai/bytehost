@@ -37,4 +37,19 @@ git reset -q --hard HEAD~1
 git commit -q --allow-empty -m "clean again"
 pushes origin main || fail "清理后的 main 应该能推送"
 
+# --- 环境错误(退出码 3):脚本自己跑不起来,不是依赖问题
+cp scripts/check_shared_deps.py "$tmp/real_guard.py"
+printf 'import sys\nsys.exit(3)\n' > scripts/check_shared_deps.py
+git commit -qam "guard cannot run"
+pushes origin HEAD:refs/heads/feature/y || fail "脚本跑不起来时,推非 main 分支只应警告"
+pushes origin main && fail "脚本跑不起来时,推 main 应该拦下(fail-closed)"
+git reset -q --hard HEAD~1
+cmp -s scripts/check_shared_deps.py "$tmp/real_guard.py" || fail "测试自己没有还原脚本"
+
+# --- 包装脚本:机器上没有 >= 3.11 的 python 时退出码 3,而不是 1
+fakebin="$tmp/fakebin"; mkdir "$fakebin"
+for n in python3 python3.11 python3.12 python3.13; do printf '#!/bin/sh\nexit 1\n' > "$fakebin/$n"; chmod +x "$fakebin/$n"; done
+rc=0; PATH="$fakebin:/usr/bin:/bin" scripts/check-shared-deps.sh --offline >/dev/null 2>&1 || rc=$?
+[ "$rc" = 3 ] || fail "没有可用 python 时包装脚本应退出 3,实际 $rc"
+
 echo "OK: pre-push 钩子行为符合预期"

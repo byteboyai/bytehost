@@ -527,7 +527,7 @@ class RevModeTests(unittest.TestCase):
         self.assertEqual(worktree_code, 1, worktree_out)
         self.assertIn("lock-not-git", worktree_out)
         self.assertEqual(rev_code, 0, rev_out)
-        self.assertEqual(bad_code, 2)
+        self.assertEqual(bad_code, 3)
 
 
 class AheadHintTests(unittest.TestCase):
@@ -557,6 +557,142 @@ class AheadHintTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("INFO   ahead-of-remote", buf.getvalue())
         self.assertIn("领先 origin/main 2 个提交", buf.getvalue())
+
+
+class RevModeRobustnessTests(unittest.TestCase):
+    TODAY = datetime.date(2026, 10, 16)
+    PATCHED = ('[workspace]\nmembers = []\n\n[patch."https://github.com/byteboyai/bytehost"]\n'
+               'bytehost-core = { path = "../x" }\n')
+
+    def commit_repo(self, tmp, files):
+        import subprocess
+        subprocess.run(["git", "init", "-q", "-b", "main", tmp], check=True)
+        for rel, text in files.items():
+            write(tmp, rel, text)
+        subprocess.run(["git", "-C", tmp, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"],
+                       check=True, capture_output=True)
+
+    def run_rev(self, tmp):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = g.main(["--root", tmp, "--rev", "HEAD", "--offline"], today=self.TODAY)
+        return code, buf.getvalue()
+
+    def test_export_ignore_cannot_hide_a_manifest_from_the_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.commit_repo(tmp, {"Cargo.toml": "[workspace]\nmembers = []\n",
+                                   "crates/a/Cargo.toml": self.PATCHED,
+                                   ".gitattributes": "crates/** export-ignore\n"})
+            code, out = self.run_rev(tmp)
+        self.assertEqual(code, 1, out)
+        self.assertIn("local-patch", out)
+
+    def test_paths_with_glob_characters_are_read_literally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.commit_repo(tmp, {"Cargo.toml": "[workspace]\nmembers = []\n",
+                                   "crates/we[ir]d*/Cargo.toml": self.PATCHED})
+            code, out = self.run_rev(tmp)
+        self.assertEqual(code, 1, out)
+        self.assertIn("local-patch", out)
+
+
+class EnvironmentErrorTests(unittest.TestCase):
+    """退出码 3 = 脚本自己跑不起来(环境/内部错误),区别于 1 = 依赖有问题。"""
+
+    def test_cli_turns_a_crash_into_exit_3_not_a_dependency_verdict(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Cargo.toml", "this is = = not toml")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = g.cli(["--root", tmp, "--offline"])
+        self.assertEqual(code, 3)
+        self.assertIn("脚本自身出错", err.getvalue())
+
+    def test_unreadable_rev_is_exit_3(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Cargo.toml", "[workspace]\nmembers = []\n")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(g.cli(["--root", tmp, "--rev", "no-such-rev", "--offline"]), 3)
+
+
+class TransitiveLockTests(unittest.TestCase):
+    def test_unsourced_lock_package_not_defined_in_the_repo_is_flagged(self):
+        # bytegit 只经传递依赖进来,本仓库没有任何 Cargo.toml 声明或定义它
+        packages = [{"name": "bytegit", "version": "0.7.0"},
+                    {"name": "digger-desktop", "version": "0.1.0"}]
+        issues = g.check_lock([dep("bytehost-core")], packages, "Cargo.lock", local_names={"digger-desktop"})
+        self.assertEqual([(i.level, i.rule) for i in issues], [("block", "lock-not-git")])
+        self.assertIn("bytegit", issues[0].message)
+        self.assertNotIn("digger-desktop", issues[0].message)
+
+    def test_workspace_members_and_in_repo_path_crates_are_not_flagged(self):
+        packages = [{"name": "digger-desktop", "version": "0.1.0"}, {"name": "spike-tool", "version": "0.1.0"}]
+        self.assertEqual(g.check_lock([], packages, "Cargo.lock", local_names={"digger-desktop", "spike-tool"}), [])
+
+    def test_registry_and_git_packages_are_never_flagged_as_local(self):
+        packages = [
+            {"name": "ab_glyph", "version": "0.2.0",
+             "source": "registry+https://github.com/rust-lang/crates.io-index"},
+            {"name": "gpui", "version": "0.1.0", "source": "git+https://github.com/zed-industries/zed#abc"},
+            {"name": "byteui", "version": "0.4.4", "source": "git+https://github.com/byteboyai/byteui?tag=v0.4.4#abc"},
+        ]
+        self.assertEqual(g.check_lock([dep("byteui")], packages, "Cargo.lock", local_names={"digger"}), [])
+
+    def test_collect_package_names_reads_every_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Cargo.toml", '[workspace]\nmembers = ["crates/*"]\n')
+            write(tmp, "crates/a/Cargo.toml", '[package]\nname = "crate-a"\nversion = "0.1.0"\n')
+            write(tmp, "spike/b/Cargo.toml", '[package]\nname = "spike-b"\nversion = "0.1.0"\n')
+            names = g.collect_package_names(Path(tmp))
+        self.assertEqual(names, {"crate-a", "spike-b"})
+
+    def test_main_ignores_a_spike_workspace_that_only_uses_sibling_path_dependencies(self):
+        import contextlib
+        import io
+        remote = FakeRemote({"bytehost": tags("v0.4.1"), "byteui": tags("v0.4.4"), "dozer": tags("libs-2026-10-16")})
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Cargo.toml", DIGGER_ROOT_TOML + '\n[package]\nname = "digger"\nversion = "0.1.0"\n')
+            write(tmp, "Cargo.lock", '[[package]]\nname = "digger"\nversion = "0.1.0"\n')
+            # spike 自带 [workspace],没有任何 byteboyai git 依赖,只路径依赖兄弟仓库(刻意的)
+            write(tmp, "spike/editor/Cargo.toml", """\
+[package]
+name = "editor-spike"
+version = "0.1.0"
+[workspace]
+[dependencies]
+bytehost-webview = { path = "../../../bytehost/crates/bytehost-webview" }
+""")
+            write(tmp, "spike/editor/Cargo.lock",
+                  '[[package]]\nname = "editor-spike"\nversion = "0.1.0"\n\n'
+                  '[[package]]\nname = "bytehost-webview"\nversion = "0.1.0"\n')
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = g.main(["--root", tmp], remote=remote, today=datetime.date(2026, 10, 16))
+        self.assertEqual(code, 0, buf.getvalue())
+
+    def test_main_flags_a_transitive_only_crate_locked_to_a_local_path(self):
+        import contextlib
+        import io
+        cargo = DIGGER_ROOT_TOML + '\n[package]\nname = "digger"\nversion = "0.1.0"\n'
+        lock = ('[[package]]\nname = "digger"\nversion = "0.1.0"\n\n'
+                '[[package]]\nname = "bytegit"\nversion = "0.7.0"\n')  # 被本地 patch,没有 source
+        remote = FakeRemote({"bytehost": tags("v0.4.1"), "byteui": tags("v0.4.4"), "dozer": tags("libs-2026-10-16")})
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Cargo.toml", cargo)
+            write(tmp, "Cargo.lock", lock)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = g.main(["--root", tmp], remote=remote, today=datetime.date(2026, 10, 16))
+        self.assertEqual(code, 1, buf.getvalue())
+        self.assertIn("bytegit", buf.getvalue())
+        self.assertNotIn("digger,", buf.getvalue())
 
 
 if __name__ == "__main__":

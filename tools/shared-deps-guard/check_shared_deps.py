@@ -11,20 +11,24 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
-import io
 import os
 import re
 import subprocess
 import sys
-import tarfile
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Protocol
+
+# 退出码:0 没有阻断;1 有阻断;2 命令行用法错误(argparse);3 脚本自己跑不起来(环境/内部错误)。
+# 3 与 1 分开,钩子才能区分"依赖有问题"和"这台机器上脚本没法运行"。
+ENV_ERROR = 3
 
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
-    sys.exit("check_shared_deps.py 需要 Python 3.11+(tomllib)")
+    print("shared-deps: 需要 Python 3.11+(tomllib);请用更新的 python3 运行", file=sys.stderr)
+    sys.exit(3)
 
 # 正本所在仓库与 vendor 来源 tag。vendor 时把 SOURCE_TAG 改成来源 tag。
 CANONICAL_REPO = "bytehost"
@@ -145,6 +149,16 @@ def find_local_patches(root: Path) -> list[tuple[str, str, str]]:
     return out
 
 
+def collect_package_names(root: Path) -> set[str]:
+    """本仓库里所有 Cargo.toml 定义的 package 名:这些在 Cargo.lock 里没有 source 是正常的。"""
+    names: set[str] = set()
+    for _manifest, doc in _load_all(root):
+        name = doc.get("package", {}).get("name")
+        if isinstance(name, str):
+            names.add(name)
+    return names
+
+
 def load_lock(root: Path) -> list[dict]:
     lock = root / "Cargo.lock"
     if not lock.exists():
@@ -180,10 +194,23 @@ def check_local_patch(patches: list[tuple[str, str, str]]) -> list[Issue]:
     ]
 
 
-def check_lock(deps: list[Dep], packages: list[dict], lock_path: str = "Cargo.lock") -> list[Issue]:
+def check_lock(deps: list[Dep], packages: list[dict], lock_path: str = "Cargo.lock",
+               local_names: set[str] | None = None) -> list[Issue]:
+    """Cargo.lock 里没有 source 的包,既不是本仓库定义的,就是被本地路径覆盖了。
+
+    包括只经传递依赖进来的共享 crate(本仓库没有任何 Cargo.toml 声明它)。
+    local_names 为 None 时只看 deps 里声明的共享 crate。
+    """
     shared = {d.crate for d in deps}
-    local = sorted({pkg["name"] for pkg in packages
-                    if pkg.get("name") in shared and not str(pkg.get("source", "")).startswith("git+")})
+
+    def is_local(pkg: dict) -> bool:
+        source = pkg.get("source")
+        if pkg.get("name") in shared:  # 声明过的共享 crate:必须来自远端 git
+            return not str(source or "").startswith("git+")
+        # 其余只看"根本没有 source"(路径依赖);registry+/git+ 都有 source,不算
+        return local_names is not None and source is None and pkg.get("name") not in local_names
+
+    local = sorted({pkg["name"] for pkg in packages if is_local(pkg)})
     if not local:
         return []
     return [Issue(BLOCK, "lock-not-git",
@@ -445,22 +472,25 @@ WANTED_FILES = {"Cargo.toml", "Cargo.lock", "shared-deps.toml"}
 
 
 def export_rev(repo: Path, rev: str, dest: Path) -> bool:
-    """把某个提交里的 Cargo.toml / Cargo.lock / shared-deps.toml 取到 dest,用来检查"将被推送的内容"。"""
+    """把某个提交里的 Cargo.toml / Cargo.lock / shared-deps.toml 取到 dest,用来检查"将被推送的内容"。
+
+    逐个 `git cat-file blob rev:path` 读取。不用 `git archive`:它会遵守提交里的 .gitattributes
+    export-ignore,一行 `spike/ export-ignore` 就能让清单从检查里消失(放行坏推送)。
+    """
     ls = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "-z", rev],
                         capture_output=True, text=True)
     if ls.returncode != 0:
         return False
-    paths = [p for p in ls.stdout.split("\0") if p and p.rsplit("/", 1)[-1] in WANTED_FILES]
-    if not paths:
-        return True
-    arc = subprocess.run(["git", "-C", str(repo), "archive", rev, "--", *paths], capture_output=True)
-    if arc.returncode != 0:
-        return False
-    with tarfile.open(fileobj=io.BytesIO(arc.stdout)) as tf:
-        try:
-            tf.extractall(dest, filter="data")
-        except TypeError:  # Python < 3.11.4 没有 filter 参数
-            tf.extractall(dest)
+    for path in ls.stdout.split("\0"):
+        if not path or path.rsplit("/", 1)[-1] not in WANTED_FILES:
+            continue
+        blob = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{rev}:{path}"],
+                              capture_output=True)
+        if blob.returncode != 0:
+            return False
+        target = dest / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(blob.stdout)
     return True
 
 
@@ -473,10 +503,13 @@ def run(root: Path, remote: Remote | None, today: datetime.date,
         *check_mismatch(deps),
         *check_pins(deps, pins, today),
     ]
+    local_names = collect_package_names(root)
+    # 只检查声明了 byteboyai git 依赖的工作区:它们才是共享库的消费方。
+    # 只靠路径依赖兄弟仓库的 spike 是刻意的本地依赖,不在守卫范围内。
     for graph in sorted({d.graph for d in deps}):
         lock_path = "Cargo.lock" if graph == "." else f"{graph}/Cargo.lock"
         packages = load_lock(root / graph)
-        issues += check_lock([d for d in deps if d.graph == graph], packages, lock_path)
+        issues += check_lock([d for d in deps if d.graph == graph], packages, lock_path, local_names)
         issues += check_lock_duplicates(packages, lock_path)
     if remote is not None:
         issues += check_remote(deps, pins, remote)
@@ -506,7 +539,7 @@ def main(argv: list[str] | None = None, remote: Remote | None = None,
         with tempfile.TemporaryDirectory() as tmp:
             if not export_rev(root, args.rev, Path(tmp)):
                 print(f"shared-deps: 无法读取提交 {args.rev}", file=sys.stderr)
-                return 2
+                return ENV_ERROR
             issues = run(Path(tmp), remote, today, git_root=root)
     else:
         issues = run(root, remote, today)
@@ -516,5 +549,15 @@ def main(argv: list[str] | None = None, remote: Remote | None = None,
     return 1 if any(i.level == BLOCK for i in issues) else 0
 
 
+def cli(argv: list[str] | None = None) -> int:
+    """入口:脚本自身的任何异常都变成退出码 3,不会被当成"依赖有问题"(1)或"没问题"(0)。"""
+    try:
+        return main(argv)
+    except Exception:
+        traceback.print_exc()
+        print("shared-deps: 脚本自身出错(退出码 3,不是依赖问题)", file=sys.stderr)
+        return ENV_ERROR
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())
