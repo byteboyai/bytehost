@@ -377,5 +377,187 @@ class RemoteRuleTests(unittest.TestCase):
         self.assertEqual(g.check_guard_source(FakeRemote({}), "v0.4.1"), [])
 
 
+class GitRemoteHelperTests(unittest.TestCase):
+    def test_parse_ls_remote_keeps_peeled_entries(self):
+        out = ("aaa\trefs/heads/main\n"
+               "bbb\trefs/tags/v0.4.0\n"
+               "ccc\trefs/tags/v0.4.0^{}\n")
+        self.assertEqual(g.parse_ls_remote(out),
+                         {"refs/heads/main": "aaa", "refs/tags/v0.4.0": "bbb", "refs/tags/v0.4.0^{}": "ccc"})
+        self.assertEqual(g.parse_ls_remote(""), {})
+
+    def test_fetch_failure_classification(self):
+        self.assertIs(g.classify_fetch_failure("fatal: remote error: upload-pack: not our ref abc"), False)
+        self.assertIs(g.classify_fetch_failure("fatal: couldn't find remote ref abc"), False)
+        self.assertIsNone(g.classify_fetch_failure("fatal: unable to access: LibreSSL SSL_connect: SSL_ERROR_SYSCALL"))
+        self.assertIsNone(g.classify_fetch_failure("fatal: could not read Username"))
+
+    def test_short_rev_is_unverifiable_without_network(self):
+        self.assertIsNone(g.GitRemote().has_commit("dozer", "67ab0e6"))
+
+
+class RenderAndDowngradeTests(unittest.TestCase):
+    ISSUES = [g.Issue(g.INFO, "i", "info msg"), g.Issue(g.WARN, "w", "warn msg"),
+              g.Issue(g.BLOCK, "b", "block msg")]
+
+    def test_render_sorts_blocks_first_and_counts(self):
+        text = g.render(self.ISSUES)
+        lines = text.splitlines()
+        self.assertTrue(lines[0].startswith("BLOCK"))
+        self.assertTrue(lines[1].startswith("WARN"))
+        self.assertTrue(lines[2].startswith("INFO"))
+        self.assertEqual(lines[-1], "shared-deps: 1 个阻断, 1 个警告")
+        self.assertEqual(g.render([]), "shared-deps: 没有发现问题")
+
+    def test_downgrade_turns_only_blocks_into_warnings(self):
+        out = g.downgrade_blocks(self.ISSUES)
+        self.assertEqual([i.level for i in out], ["info", "warn", "warn"])
+        self.assertIn("降级", out[2].message)
+
+
+class MainTests(unittest.TestCase):
+    TODAY = datetime.date(2026, 10, 16)
+
+    def project(self, tmp, cargo=DIGGER_ROOT_TOML, lock=None, pins=None):
+        write(tmp, "Cargo.toml", cargo)
+        if lock is not None:
+            write(tmp, "Cargo.lock", lock)
+        if pins is not None:
+            write(tmp, "shared-deps.toml", pins)
+
+    def remote(self):
+        return FakeRemote({
+            "bytehost": tags("v0.4.0", "v0.4.1"),
+            "byteui": tags("v0.4.4"),
+            "dozer": tags("libs-2026-10-16"),
+        })
+
+    def run_main(self, tmp, *flags, remote=None):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = g.main(["--root", tmp, *flags], remote=remote or self.remote(), today=self.TODAY)
+        return code, buf.getvalue()
+
+    def test_clean_project_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.project(tmp)
+            code, out = self.run_main(tmp)
+        self.assertEqual(code, 0, out)
+        self.assertIn("没有发现问题", out)
+
+    def test_local_patch_blocks_and_downgrade_lets_it_through(self):
+        patched = DIGGER_ROOT_TOML + """
+[patch."https://github.com/byteboyai/bytehost"]
+bytehost-core = { path = "../bytehost-chrome/crates/bytehost-core" }
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.project(tmp, cargo=patched)
+            strict_code, strict_out = self.run_main(tmp)
+            lenient_code, lenient_out = self.run_main(tmp, "--downgrade-blocks")
+        self.assertEqual(strict_code, 1)
+        self.assertIn("BLOCK  local-patch", strict_out)
+        self.assertEqual(lenient_code, 0)
+        self.assertIn("WARN   local-patch", lenient_out)
+
+    def test_lock_pointing_at_local_path_blocks(self):
+        lock = '[[package]]\nname = "bytehost-core"\nversion = "0.1.0"\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            self.project(tmp, lock=lock)
+            code, out = self.run_main(tmp)
+        self.assertEqual(code, 1)
+        self.assertIn("lock-not-git", out)
+
+    def test_offline_skips_remote_rules(self):
+        cargo = DIGGER_ROOT_TOML.replace("v0.4.1", "v9.9.9")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.project(tmp, cargo=cargo)
+            online, _ = self.run_main(tmp)
+            offline, out = self.run_main(tmp, "--offline")
+        self.assertEqual(online, 1)  # tag 不存在
+        self.assertEqual(offline, 0, out)
+
+    def test_unreachable_remote_never_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.project(tmp)
+            code, out = self.run_main(tmp, remote=FakeRemote({}))
+        self.assertEqual(code, 0, out)
+        self.assertIn("ref-unverified", out)
+
+    def test_expired_pin_warns_but_exits_zero(self):
+        pins = '[pin.dozer]\nreason = "等同步"\nreview_by = 2026-10-01\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            self.project(tmp, pins=pins)
+            code, out = self.run_main(tmp)
+        self.assertEqual(code, 0, out)
+        self.assertIn("pin-expired", out)
+
+
+class RevModeTests(unittest.TestCase):
+    def git(self, tmp, *args):
+        import subprocess
+        subprocess.run(["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                       check=True, capture_output=True)
+
+    def test_rev_checks_committed_content_not_the_working_tree(self):
+        import contextlib
+        import io
+        good_lock = ('[[package]]\nname = "bytehost-core"\nversion = "0.1.0"\n'
+                     'source = "git+https://github.com/byteboyai/bytehost?tag=v0.4.1#abc"\n')
+        dev_lock = '[[package]]\nname = "bytehost-core"\nversion = "0.1.0"\n'  # 本地 patch 下的样子
+        remote = FakeRemote({"bytehost": tags("v0.4.1"), "byteui": tags("v0.4.4"), "dozer": tags("libs-2026-10-16")})
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Cargo.toml", DIGGER_ROOT_TOML)
+            write(tmp, "Cargo.lock", good_lock)
+            self.git(tmp, "init", "-q", "-b", "main")
+            self.git(tmp, "add", "-A")
+            self.git(tmp, "commit", "-q", "-m", "init")
+            write(tmp, "Cargo.lock", dev_lock)  # 未提交的本地联调状态
+
+            def run(*flags):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    code = g.main(["--root", tmp, *flags], remote=remote, today=datetime.date(2026, 10, 16))
+                return code, buf.getvalue()
+
+            worktree_code, worktree_out = run()
+            rev_code, rev_out = run("--rev", "HEAD")
+            bad_code, _ = run("--rev", "no-such-rev")
+        self.assertEqual(worktree_code, 1, worktree_out)
+        self.assertIn("lock-not-git", worktree_out)
+        self.assertEqual(rev_code, 0, rev_out)
+        self.assertEqual(bad_code, 2)
+
+
+class AheadHintTests(unittest.TestCase):
+    def test_reports_commits_not_yet_on_origin_main_even_in_rev_mode(self):
+        import contextlib
+        import io
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            remote_dir, work = f"{tmp}/remote.git", f"{tmp}/work"
+            subprocess.run(["git", "init", "-q", "--bare", remote_dir], check=True)
+            subprocess.run(["git", "init", "-q", "-b", "main", work], check=True)
+
+            def git(*args):
+                subprocess.run(["git", "-C", work, "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                               check=True, capture_output=True)
+
+            write(work, "Cargo.toml", "[workspace]\nmembers = []\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "one")
+            git("remote", "add", "origin", remote_dir)
+            git("push", "-q", "origin", "main")
+            git("commit", "-q", "--allow-empty", "-m", "two")
+            git("commit", "-q", "--allow-empty", "-m", "three")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = g.main(["--root", work, "--rev", "HEAD", "--offline"], today=datetime.date(2026, 10, 16))
+        self.assertEqual(code, 0)
+        self.assertIn("INFO   ahead-of-remote", buf.getvalue())
+        self.assertIn("领先 origin/main 2 个提交", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -343,3 +343,178 @@ def check_guard_source(remote: Remote, source_tag: str = SOURCE_TAG) -> list[Iss
                       f"本脚本 vendor 自 {CANONICAL_REPO} {source_tag},现在有 {latest};"
                       "如果 tools/shared-deps-guard 有更新,请重新 vendor")]
     return []
+
+
+# ---------------------------------------------------------------- 联网实现
+
+
+def parse_ls_remote(output: str) -> dict[str, str]:
+    refs: dict[str, str] = {}
+    for line in output.splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref:
+            refs[ref] = sha
+    return refs
+
+
+_MISSING_MARKERS = ("not our ref", "couldn't find remote ref", "no such remote ref")
+
+
+def classify_fetch_failure(stderr: str) -> bool | None:
+    """git fetch 失败的原因:明确"远端没有该提交" -> False;其他(网络、鉴权) -> None。"""
+    low = stderr.lower()
+    return False if any(m in low for m in _MISSING_MARKERS) else None
+
+
+class GitRemote:
+    """用 `git ls-remote` / `git fetch` 查询 github.com/byteboyai/<repo>。"""
+
+    def __init__(self, timeout: int = 30):
+        self.timeout = timeout
+        self._cache: dict[str, dict[str, str] | None] = {}
+        self._env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+    @staticmethod
+    def url(repo: str) -> str:
+        return f"https://github.com/byteboyai/{repo}.git"
+
+    def _git(self, args: list[str], cwd: str | None = None) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(["git", *args], cwd=cwd, env=self._env, capture_output=True,
+                                  text=True, timeout=self.timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def refs(self, repo: str) -> dict[str, str] | None:
+        if repo not in self._cache:
+            proc = self._git(["ls-remote", "--tags", "--heads", self.url(repo)])
+            ok = proc is not None and proc.returncode == 0
+            self._cache[repo] = parse_ls_remote(proc.stdout) if ok else None
+        return self._cache[repo]
+
+    def has_commit(self, repo: str, rev: str) -> bool | None:
+        if len(rev) != 40:  # 远端只按完整 sha 取提交;短 rev 无法确认
+            return None
+        with tempfile.TemporaryDirectory() as tmp:
+            if self._git(["init", "--bare", "-q", tmp]) is None:
+                return None
+            # tree:0 只取提交对象本身:Dozer 这样的大仓库从 15 秒降到 1.5 秒
+            proc = self._git(["fetch", "--depth=1", "--filter=tree:0", "-q", self.url(repo), rev], cwd=tmp)
+        if proc is None:
+            return None
+        if proc.returncode == 0:
+            return True
+        return classify_fetch_failure(proc.stderr)
+
+
+def ahead_of_remote(root: Path, branch: str = "main") -> Issue | None:
+    """本地 branch 领先 origin/branch 的提交数(只用本地引用,不联网)。"""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-list", "--count", f"origin/{branch}..{branch}"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip().isdigit() or int(proc.stdout) == 0:
+        return None
+    return Issue(INFO, "ahead-of-remote",
+                 f"本地 {branch} 领先 origin/{branch} {int(proc.stdout)} 个提交;"
+                 "被其他仓库依赖的提交要先推送,否则对方会引用到远端不存在的 rev")
+
+
+# ---------------------------------------------------------------- 入口
+
+_ORDER = {BLOCK: 0, WARN: 1, INFO: 2}
+
+
+def downgrade_blocks(issues: list[Issue]) -> list[Issue]:
+    return [Issue(WARN, i.rule, i.message + "(推送目标不是 main/tag,阻断降级为警告)")
+            if i.level == BLOCK else i for i in issues]
+
+
+def render(issues: list[Issue]) -> str:
+    lines = [f"{i.level.upper():5}  {i.rule:16}  {i.message}"
+             for i in sorted(issues, key=lambda i: _ORDER[i.level])]
+    blocks = sum(i.level == BLOCK for i in issues)
+    warns = sum(i.level == WARN for i in issues)
+    lines.append(f"shared-deps: {blocks} 个阻断, {warns} 个警告" if issues else "shared-deps: 没有发现问题")
+    return "\n".join(lines)
+
+
+WANTED_FILES = {"Cargo.toml", "Cargo.lock", "shared-deps.toml"}
+
+
+def export_rev(repo: Path, rev: str, dest: Path) -> bool:
+    """把某个提交里的 Cargo.toml / Cargo.lock / shared-deps.toml 取到 dest,用来检查"将被推送的内容"。"""
+    ls = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "-z", rev],
+                        capture_output=True, text=True)
+    if ls.returncode != 0:
+        return False
+    paths = [p for p in ls.stdout.split("\0") if p and p.rsplit("/", 1)[-1] in WANTED_FILES]
+    if not paths:
+        return True
+    arc = subprocess.run(["git", "-C", str(repo), "archive", rev, "--", *paths], capture_output=True)
+    if arc.returncode != 0:
+        return False
+    with tarfile.open(fileobj=io.BytesIO(arc.stdout)) as tf:
+        try:
+            tf.extractall(dest, filter="data")
+        except TypeError:  # Python < 3.11.4 没有 filter 参数
+            tf.extractall(dest)
+    return True
+
+
+def run(root: Path, remote: Remote | None, today: datetime.date,
+        git_root: Path | None = None) -> list[Issue]:
+    deps = collect_deps(root)
+    pins = load_pins(root)
+    issues = [
+        *check_local_patch(find_local_patches(root)),
+        *check_mismatch(deps),
+        *check_pins(deps, pins, today),
+    ]
+    for graph in sorted({d.graph for d in deps}):
+        lock_path = "Cargo.lock" if graph == "." else f"{graph}/Cargo.lock"
+        packages = load_lock(root / graph)
+        issues += check_lock([d for d in deps if d.graph == graph], packages, lock_path)
+        issues += check_lock_duplicates(packages, lock_path)
+    if remote is not None:
+        issues += check_remote(deps, pins, remote)
+        issues += check_guard_source(remote)
+    ahead = ahead_of_remote(git_root or root)
+    if ahead is not None:
+        issues.append(ahead)
+    return issues
+
+
+def main(argv: list[str] | None = None, remote: Remote | None = None,
+         today: datetime.date | None = None) -> int:
+    parser = argparse.ArgumentParser(description="byteboyai 共享库依赖守卫")
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--rev", help="检查该提交里的内容,而不是工作区(pre-push 用它检查将被推送的提交)")
+    parser.add_argument("--offline", action="store_true", help="跳过所有联网检查")
+    parser.add_argument("--downgrade-blocks", action="store_true",
+                        help="把阻断降级为警告(推送非 main/tag 时由 pre-push 使用)")
+    args = parser.parse_args(argv)
+
+    if remote is None and not args.offline:
+        remote = GitRemote()
+    root = args.root.resolve()
+    remote = None if args.offline else remote
+    today = today or datetime.date.today()
+    if args.rev:
+        with tempfile.TemporaryDirectory() as tmp:
+            if not export_rev(root, args.rev, Path(tmp)):
+                print(f"shared-deps: 无法读取提交 {args.rev}", file=sys.stderr)
+                return 2
+            issues = run(Path(tmp), remote, today, git_root=root)
+    else:
+        issues = run(root, remote, today)
+    if args.downgrade_blocks:
+        issues = downgrade_blocks(issues)
+    print(render(issues))
+    return 1 if any(i.level == BLOCK for i in issues) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
