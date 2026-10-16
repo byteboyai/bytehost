@@ -13,7 +13,7 @@ bytehost-desktop = { path = "../bytehost-desktop" }
 serde.workspace = true
 serde_json.workspace = true
 # 控件与度量读 byteui 的主题(几何、配色、外壳区域样式)。
-byteui = { git = "https://github.com/byteboyai/byteui", tag = "v0.4.3" }
+byteui = { git = "https://github.com/byteboyai/byteui", tag = "v0.4.4" }
 # 控件返回 `Element<'a, M, iced_widget::Theme, iced_renderer::Renderer>`(与 byteui 一致),不开渲染器 feature。
 iced_widget = { version = "0.14", default-features = false }
 iced_renderer = { version = "0.14", default-features = false }
