@@ -163,3 +163,87 @@ def load_pins(root: Path) -> dict[str, Pin]:
             review_by = datetime.date.fromisoformat(review_by)
         pins[name] = Pin(body.get("reason", ""), review_by)
     return pins
+
+
+# ---------------------------------------------------------------- 离线规则
+
+
+def check_local_patch(patches: list[tuple[str, str, str]]) -> list[Issue]:
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for manifest, repo, crate in patches:
+        grouped.setdefault((manifest, repo), []).append(crate)
+    return [
+        Issue(BLOCK, "local-patch",
+              f"{manifest} 的 [patch] 把 {repo} 的 {', '.join(sorted(crates))} 指向本地路径;"
+              "联调请改用不入库的 .cargo/config.toml(见 scripts/dev-patch.example.toml)")
+        for (manifest, repo), crates in sorted(grouped.items())
+    ]
+
+
+def check_lock(deps: list[Dep], packages: list[dict], lock_path: str = "Cargo.lock") -> list[Issue]:
+    shared = {d.crate for d in deps}
+    local = sorted({pkg["name"] for pkg in packages
+                    if pkg.get("name") in shared and not str(pkg.get("source", "")).startswith("git+")})
+    if not local:
+        return []
+    return [Issue(BLOCK, "lock-not-git",
+                  f"{lock_path} 里这些共享库不是来自远端 git(多半被本地 [patch] 覆盖):{', '.join(local)};"
+                  f"移除覆盖后执行 cargo update -p {local[0]}(其余同理)还原")]
+
+
+def check_lock_duplicates(packages: list[dict], lock_path: str = "Cargo.lock") -> list[Issue]:
+    """同一个共享 crate 在锁文件里有多个 git 来源:依赖图里有两份,同名类型互不兼容。
+
+    典型成因是传递依赖:本仓库用 bytehost v0.4.1,而依赖的 dozer-panel-* 自己用 v0.4.0。
+    只看 Cargo.toml 发现不了,只有 Cargo.lock 里看得到。
+    """
+    sources: dict[str, set[str]] = {}
+    for pkg in packages:
+        source = str(pkg.get("source", ""))
+        if repo_name(source) is not None:
+            sources.setdefault(pkg["name"], set()).add(source)
+    issues = []
+    for name, found in sorted(sources.items()):
+        if len(found) > 1:
+            detail = ", ".join(sorted(_short_source(s) for s in found))
+            issues.append(Issue(BLOCK, "lock-duplicate",
+                                f"{name} 在 {lock_path} 里有 {len(found)} 份:{detail};"
+                                "让传递依赖它的库和本仓库对齐到同一个 tag"))
+    return issues
+
+
+def _short_source(source: str) -> str:
+    """git+https://github.com/byteboyai/bytehost?tag=v0.4.1#79212c08... -> bytehost?tag=v0.4.1#79212c0"""
+    body = source.split("github.com/byteboyai/", 1)[-1]
+    head, _, sha = body.partition("#")
+    return f"{head}#{sha[:7]}" if sha else head
+
+
+def check_mismatch(deps: list[Dep]) -> list[Issue]:
+    # 只有同一个工作区(同一份 Cargo.lock)里的版本冲突才会拉进两份同名 crate
+    by_repo: dict[tuple[str, str], dict[tuple[str, str], set[str]]] = {}
+    for d in deps:
+        by_repo.setdefault((d.graph, d.repo), {}).setdefault((d.ref_kind, d.ref), set()).add(d.crate)
+    issues = []
+    for (graph, repo), refs in sorted(by_repo.items()):
+        if len(refs) > 1:
+            where = "" if graph == "." else f"(工作区 {graph})"
+            detail = "; ".join(
+                f"{kind}={ref or '(无)'} <- {', '.join(sorted(crates))}"
+                for (kind, ref), crates in sorted(refs.items()))
+            issues.append(Issue(BLOCK, "ref-mismatch",
+                                f"{repo}{where} 在同一依赖图里出现多个版本,会拉进两份同名 crate:{detail}"))
+    return issues
+
+
+def check_pins(deps: list[Dep], pins: dict[str, Pin], today: datetime.date) -> list[Issue]:
+    repos = {d.repo for d in deps}
+    issues = []
+    for name, pin in sorted(pins.items()):
+        if name not in repos:
+            issues.append(Issue(WARN, "manifest-stale",
+                                f"shared-deps.toml 里的 pin.{name} 在任何 Cargo.toml 中都已不存在"))
+        elif pin.review_by is not None and today > pin.review_by:
+            issues.append(Issue(WARN, "pin-expired",
+                                f"{name} 的 pin 已过 review_by({pin.review_by}):{pin.reason}"))
+    return issues

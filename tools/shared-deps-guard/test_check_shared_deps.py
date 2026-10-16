@@ -171,5 +171,106 @@ review_by = "2026-12-01"
 
 
 
+def dep(crate, repo="bytehost", kind="tag", ref="v0.4.0", manifest="Cargo.toml", graph="."):
+    return g.Dep(crate, repo, kind, ref, manifest, graph)
+
+
+class OfflineRuleTests(unittest.TestCase):
+    def test_local_patch_blocks(self):
+        issues = g.check_local_patch([("Cargo.toml", "bytehost", "bytehost-core")])
+        self.assertEqual([(i.level, i.rule) for i in issues], [("block", "local-patch")])
+        self.assertIn("bytehost-core", issues[0].message)
+        self.assertEqual(g.check_local_patch([]), [])
+
+    def test_local_patch_is_one_issue_per_manifest_and_repo(self):
+        patches = [("Cargo.toml", "bytehost", "bytehost-core"), ("Cargo.toml", "bytehost", "bytehost-apps"),
+                   ("Cargo.toml", "byteui", "byteui")]
+        issues = g.check_local_patch(patches)
+        self.assertEqual(len(issues), 2)
+        self.assertIn("bytehost-apps, bytehost-core", issues[0].message)
+
+    def test_lock_not_git_is_one_issue_listing_every_crate(self):
+        deps = [dep("bytehost-core"), dep("bytehost-apps")]
+        packages = [{"name": "bytehost-core", "version": "0.1.0"}, {"name": "bytehost-apps", "version": "0.1.0"}]
+        issues = g.check_lock(deps, packages)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("bytehost-apps, bytehost-core", issues[0].message)
+
+    def test_lock_not_git_flags_shared_crate_without_git_source(self):
+        deps = [dep("bytehost-core")]
+        packages = [
+            {"name": "bytehost-core", "version": "0.1.0"},  # 被本地 patch,没有 source
+            {"name": "serde", "version": "1.0.0", "source": "registry+https://github.com/rust-lang/crates.io-index"},
+            {"name": "digger-desktop", "version": "0.1.0"},  # 本仓库成员,不是共享库
+        ]
+        issues = g.check_lock(deps, packages)
+        self.assertEqual([(i.level, i.rule) for i in issues], [("block", "lock-not-git")])
+        self.assertIn("bytehost-core", issues[0].message)
+
+    def test_lock_with_git_source_passes(self):
+        packages = [{"name": "bytehost-core", "version": "0.1.0",
+                     "source": "git+https://github.com/byteboyai/bytehost?tag=v0.4.0#dc88133d"}]
+        self.assertEqual(g.check_lock([dep("bytehost-core")], packages), [])
+
+    def test_lock_duplicate_blocks_two_git_sources_for_one_crate(self):
+        packages = [
+            {"name": "bytehost-core", "version": "0.1.0",
+             "source": "git+https://github.com/byteboyai/bytehost?tag=v0.4.0#dc88133d2e959355bd7d1bd4c6138177074c168e"},
+            {"name": "bytehost-core", "version": "0.1.0",
+             "source": "git+https://github.com/byteboyai/bytehost?tag=v0.4.1#79212c08834ca946148fd7977d3d56d72b34c008"},
+            {"name": "byteui", "version": "0.4.4",
+             "source": "git+https://github.com/byteboyai/byteui?tag=v0.4.4#aaaaaaaaaaaaaaaa"},
+        ]
+        issues = g.check_lock_duplicates(packages)
+        self.assertEqual([(i.level, i.rule) for i in issues], [("block", "lock-duplicate")])
+        self.assertIn("bytehost-core", issues[0].message)
+        self.assertIn("bytehost?tag=v0.4.0#dc88133", issues[0].message)
+        self.assertIn("bytehost?tag=v0.4.1#79212c0", issues[0].message)
+
+    def test_lock_duplicate_ignores_registry_crates_and_single_sources(self):
+        packages = [
+            {"name": "syn", "version": "1.0.0", "source": "registry+https://github.com/rust-lang/crates.io-index"},
+            {"name": "syn", "version": "2.0.0", "source": "registry+https://github.com/rust-lang/crates.io-index"},
+            {"name": "byteui", "version": "0.4.4", "source": "git+https://github.com/byteboyai/byteui?tag=v0.4.4#abc"},
+        ]
+        self.assertEqual(g.check_lock_duplicates(packages), [])
+
+    def test_mismatch_blocks_when_one_repo_has_two_refs(self):
+        deps = [dep("dozer-model", "dozer", "rev", "aaa"), dep("dozer-services", "dozer", "rev", "bbb"),
+                dep("bytehost-core")]
+        issues = g.check_mismatch(deps)
+        self.assertEqual([(i.level, i.rule) for i in issues], [("block", "ref-mismatch")])
+        self.assertIn("dozer", issues[0].message)
+        self.assertNotIn("bytehost", issues[0].message)
+
+    def test_mismatch_passes_when_consistent_even_across_manifests(self):
+        deps = [dep("bytehost-core", manifest="a/Cargo.toml"), dep("bytehost-apps", manifest="b/Cargo.toml")]
+        self.assertEqual(g.check_mismatch(deps), [])
+
+    def test_pins_expired_and_stale(self):
+        deps = [dep("dozer-model", "dozer", "rev", "aaa")]
+        pins = {"dozer": g.Pin("等同步", datetime.date(2026, 11, 15)),
+                "gone": g.Pin("旧的", None)}
+        today = datetime.date(2026, 11, 16)
+        issues = g.check_pins(deps, pins, today)
+        self.assertEqual(sorted((i.level, i.rule) for i in issues),
+                         [("warn", "manifest-stale"), ("warn", "pin-expired")])
+
+    def test_pin_not_expired_on_the_review_day(self):
+        deps = [dep("dozer-model", "dozer", "rev", "aaa")]
+        pins = {"dozer": g.Pin("等同步", datetime.date(2026, 11, 15))}
+        self.assertEqual(g.check_pins(deps, pins, datetime.date(2026, 11, 15)), [])
+
+    def test_mismatch_is_per_workspace(self):
+        # 排除在主工作区之外的 spike 自带 [workspace]、自带 Cargo.lock,旧版本不会和主图冲突
+        deps = [dep("bytehost-apps", ref="v0.4.1"),
+                dep("bytehost-apps", ref="v0.2.0", manifest="spike/x/Cargo.toml", graph="spike/x")]
+        self.assertEqual(g.check_mismatch(deps), [])
+        deps.append(dep("bytehost-core", ref="v0.4.0", manifest="spike/x/Cargo.toml", graph="spike/x"))
+        issues = g.check_mismatch(deps)
+        self.assertEqual([i.rule for i in issues], ["ref-mismatch"])
+        self.assertIn("spike/x", issues[0].message)
+
+
 if __name__ == "__main__":
     unittest.main()
