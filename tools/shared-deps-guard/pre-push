@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# 共享库依赖守卫的 pre-push 钩子。启用(每个克隆一次):git config core.hooksPath .githooks
+#
+# git 通过 stdin 传入每个被推送的引用:<local ref> <local sha> <remote ref> <remote sha>
+# 推 main 或 tag:阻断类问题拦下推送;推其他分支:同样的检查,阻断降级为警告。
+# 确认要绕过时:git push --no-verify
+set -u
+root="$(git rev-parse --show-toplevel)"
+zero="0000000000000000000000000000000000000000"
+status=0
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue # 删除远端引用,没有内容可检查
+  args=(--rev "$local_sha")
+  case "$remote_ref" in
+    refs/heads/main | refs/tags/*) ;;
+    *) args+=(--downgrade-blocks) ;;
+  esac
+  echo "shared-deps: 检查 $remote_ref" >&2
+  "$root/scripts/check-shared-deps.sh" "${args[@]}" || status=1
+done
+if [ "$status" -ne 0 ]; then
+  echo "pre-push: 共享库依赖检查未通过,已拦下推送。修复后重试;确认要绕过时用 git push --no-verify" >&2
+fi
+exit "$status"

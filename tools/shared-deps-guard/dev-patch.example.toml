@@ -1,0 +1,22 @@
+# 本地联调共享库时的 [patch] 模板。
+#
+# 用法:复制到 .cargo/config.toml(已被 .gitignore 忽略,不会入库),
+#       取消注释并把路径改成你的本地 worktree。联调结束删掉即可。
+#
+# 不要把这些 [patch] 写进入库的 Cargo.toml:pre-push 会在推 main / tag 时拦下它。
+# 注意:cargo 会把被覆盖的共享库在 Cargo.lock 里记成本地路径。
+#       不要提交这样的 Cargo.lock(pre-push 同样会检查被推送提交里的 Cargo.lock)。
+
+# [patch."https://github.com/byteboyai/bytehost"]
+# bytehost-core = { path = "../bytehost-worktree/crates/bytehost-core" }
+# bytehost-desktop = { path = "../bytehost-worktree/crates/bytehost-desktop" }
+# bytehost-apps = { path = "../bytehost-worktree/crates/bytehost-apps" }
+
+# [patch."https://github.com/byteboyai/byteui"]
+# byteui = { path = "../byteui-worktree" }
+
+# [patch."https://github.com/byteboyai/dozer"]
+# # 同一个仓库的 crate 要一起指,否则依赖图里会有两份 dozer-model
+# dozer-model = { path = "../dozer-worktree/crates/dozer-model" }
+# dozer-services = { path = "../dozer-worktree/crates/dozer-services" }
+# dozer-store-project = { path = "../dozer-worktree/crates/dozer-store-project" }
