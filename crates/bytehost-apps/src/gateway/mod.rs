@@ -314,9 +314,8 @@ async fn accept_loop(
                                 req.headers().get_all(header::HOST).iter().count(),
                                 req.uri().authority().is_some(),
                             ) {
-                                return Ok::<_, Infallible>(proxy::boxed_reply(plain(
-                                    status,
-                                    "bad request",
+                                return Ok::<_, Infallible>(close_after(proxy::boxed_reply(
+                                    plain(status, "bad request"),
                                 )));
                             }
                             let method = req.method().clone();
@@ -362,14 +361,15 @@ async fn accept_loop(
                                     .await
                                 }
                             };
-                            Ok::<_, Infallible>(reply)
+                            Ok::<_, Infallible>(close_after(reply))
                         }
                     });
-                    // 每个应答之后就关连接(本机静态站点不需要 keep-alive),并给读请求头设超时
+                    // 每个非 101 应答之后就关连接(见 `close_after`),并给读请求头设超时。
+                    // 不能用 `.keep_alive(false)`:那是连接级开关,hyper 会给**所有**应答(含 101)的
+                    // `Connection` 头追加 `close`,WKWebView 会因此判定 WebSocket 握手失败。
                     let mut http = hyper::server::conn::http1::Builder::new();
                     http.timer(hyper_util::rt::TokioTimer::new())
-                        .header_read_timeout(limits.header_read_timeout)
-                        .keep_alive(false);
+                        .header_read_timeout(limits.header_read_timeout);
                     let _ = http
                         .serve_connection(TokioIo::new(stream), service)
                         .with_upgrades()
@@ -378,6 +378,16 @@ async fn accept_loop(
             }
         }
     }
+}
+
+/// 每个非 `101` 应答显式声明 `Connection: close`(hyper 据此在写完应答后关闭连接,空闲连接不堆积);
+/// `101 Switching Protocols` 保持上游给的 `Connection: Upgrade` 原样,否则浏览器的 WebSocket 握手校验失败。
+fn close_after<B>(mut resp: Response<B>) -> Response<B> {
+    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        resp.headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    resp
 }
 
 fn header_str(req: &Request<Incoming>, name: header::HeaderName) -> Option<String> {
@@ -1141,7 +1151,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn keep_alive_is_off_so_idle_connections_do_not_pile_up() {
+    async fn non_101_responses_close_the_connection_so_idle_ones_do_not_pile_up() {
         let gw = Gateway::start(GatewayConfig { port: 0 }).await.unwrap();
         let mut s = raw(gw.port());
         // 不带 `Connection: close`:服务端回完应答后必须自己关闭连接
@@ -1151,6 +1161,190 @@ mod tests {
             .unwrap();
         let n = read_until_closed(&mut s);
         assert!(n > 0, "先收到了应答(403),然后连接被关闭");
+        gw.shutdown().await;
+    }
+
+    /// 读到响应头结束(`\r\n\r\n`)为止,返回 `(状态码, 小写头名 → 值)` 列表。
+    fn read_head(s: &mut TcpStream) -> (u16, Vec<(String, String)>) {
+        let mut buf = Vec::new();
+        let mut b = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            s.read_exact(&mut b).expect("读响应头");
+            buf.push(b[0]);
+        }
+        let text = String::from_utf8_lossy(&buf).to_string();
+        let mut lines = text.split("\r\n");
+        let status = lines
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let headers = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        (status, headers)
+    }
+
+    /// 所有 `Connection` 头的值按逗号拆开、小写后的 token 列表。
+    fn connection_tokens(headers: &[(String, String)]) -> Vec<String> {
+        headers
+            .iter()
+            .filter(|(k, _)| k == "connection")
+            .flat_map(|(_, v)| v.split(',').map(|t| t.trim().to_ascii_lowercase()))
+            .collect()
+    }
+
+    const WS_101: &str = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n";
+    const UPGRADE_REQUIRED: &str = "HTTP/1.1 426 Upgrade Required\r\nConnection: upgrade\r\nUpgrade: websocket\r\nContent-Length: 0\r\n\r\n";
+
+    /// 假上游:读完请求头就回 `reply`,之后把收到的字节原样回显。
+    fn fake_upstream(reply: &'static str) -> std::net::SocketAddr {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for conn in l.incoming() {
+                let Ok(mut c) = conn else { break };
+                std::thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if c.read_exact(&mut b).is_err() {
+                            return;
+                        }
+                        head.push(b[0]);
+                    }
+                    let _ = c.write_all(reply.as_bytes());
+                    let mut buf = [0u8; 64];
+                    while let Ok(n) = c.read(&mut buf) {
+                        if n == 0 || c.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// 对 `id` 发一次同源、带会话 Cookie 的 WebSocket 升级请求,返回还没读响应的连接。
+    fn ws_handshake(gw: &Gateway, id: &AppId) -> TcpStream {
+        let port = gw.port();
+        let cookie = format!("bh_session={}", app_token(&gw.state.token, id));
+        let mut s = raw(port);
+        s.write_all(
+            format!(
+                "GET /ws HTTP/1.1\r\nHost: {id}.localhost:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: http://{id}.localhost:{port}\r\nCookie: {cookie}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        s
+    }
+
+    /// 验收 2.2:WKWebView 严格校验 101 的 `Connection` 头必须是 `Upgrade`;hyper 在 keep-alive 被禁用时会追加 `close`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_101_upgrade_keeps_connection_exactly_upgrade_and_still_tunnels_bytes() {
+        let gw = Gateway::start(GatewayConfig { port: 0 }).await.unwrap();
+        let id = AppId::new("wsapp").unwrap();
+        gw.add_upstream(&id, fake_upstream(WS_101));
+        let mut s = ws_handshake(&gw, &id);
+        let (status, headers) = read_head(&mut s);
+        assert_eq!(status, 101);
+        assert_eq!(
+            connection_tokens(&headers),
+            vec!["upgrade"],
+            "101 的 Connection 必须恰好是 Upgrade"
+        );
+        s.write_all(b"ping").unwrap();
+        let mut echo = [0u8; 4];
+        s.read_exact(&mut echo).unwrap();
+        assert_eq!(&echo, b"ping", "升级之后隧道仍然双向转发字节");
+        gw.shutdown().await;
+    }
+
+    /// 去掉全局 keep-alive 之后,非 101 的每种响应仍要自己声明并执行 `Connection: close`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_non_101_response_still_closes_the_connection() {
+        let (_tmp, root) = site_dir();
+        let gw = Gateway::start(GatewayConfig { port: 0 }).await.unwrap();
+        let (site, proxied) = (AppId::new("site1").unwrap(), AppId::new("proxied").unwrap());
+        gw.add_site(&site, root, None);
+        gw.add_upstream(&proxied, fake_upstream(UPGRADE_REQUIRED));
+        let port = gw.port();
+        let host = format!("site1.localhost:{port}");
+        let cookie = format!("bh_session={}", app_token(&gw.state.token, &site));
+        let launch = gw.launch_url(&site);
+        let target = launch
+            .strip_prefix(&format!("http://{host}"))
+            .unwrap()
+            .to_string();
+        let requests = [
+            ("403", format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n")),
+            (
+                "403 + 客户端要求 keep-alive",
+                format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n"),
+            ),
+            (
+                "421",
+                format!("GET / HTTP/1.1\r\nHost: evil.example\r\nCookie: {cookie}\r\n\r\n"),
+            ),
+            (
+                "302",
+                format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+            ),
+            (
+                "200",
+                format!("GET / HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\n\r\n"),
+            ),
+            (
+                "HEAD",
+                format!("HEAD / HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\n\r\n"),
+            ),
+        ];
+        let mut seen = Vec::new();
+        for (label, req) in requests {
+            let mut s = raw(port);
+            s.write_all(req.as_bytes()).unwrap();
+            let (status, headers) = read_head(&mut s);
+            seen.push(status);
+            assert!(
+                connection_tokens(&headers).contains(&"close".to_string()),
+                "{label}: 响应必须声明 Connection: close,实际 {headers:?}"
+            );
+            read_until_closed(&mut s);
+        }
+        for want in [200u16, 302, 403, 421] {
+            assert!(seen.contains(&want), "用例应覆盖 {want},实际 {seen:?}");
+        }
+
+        // 上游回了 `Connection: upgrade` 但状态是 426(不是 101):不能因为带 upgrade 就放过关连接
+        let cookie_p = format!("bh_session={}", app_token(&gw.state.token, &proxied));
+        let mut plain = raw(port);
+        plain
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: proxied.localhost:{port}\r\nCookie: {cookie_p}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut upgrade = ws_handshake(&gw, &proxied);
+        for (label, s) in [
+            ("反向代理 426", &mut plain),
+            ("升级请求得到 426", &mut upgrade),
+        ] {
+            let (status, headers) = read_head(s);
+            assert_eq!(status, 426, "{label}");
+            assert!(
+                connection_tokens(&headers).contains(&"close".to_string()),
+                "{label}: 必须声明 close,实际 {headers:?}"
+            );
+            read_until_closed(s);
+        }
         gw.shutdown().await;
     }
 

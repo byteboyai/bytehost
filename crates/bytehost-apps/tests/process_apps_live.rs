@@ -360,6 +360,12 @@ fn ws_echo(
             if status != 101 {
                 return Err((status, head_str));
             }
+            // WKWebView 严格校验:101 的 Connection 必须恰好是 Upgrade,不能被追加 close(验收 2.2)。
+            let lower = head_str.to_ascii_lowercase();
+            assert!(
+                lower.contains("connection: upgrade") && !lower.contains("upgrade, close"),
+                "101 的 Connection 头被改动: {head_str}"
+            );
             // 握手成功:发一帧文本(mask 位必须是客户端置的)
             let payload = b"hello";
             let frame = client_text_frame(payload);
