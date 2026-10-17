@@ -152,6 +152,21 @@ fn corrupt(e: impl fmt::Display) -> ArchiveError {
     ArchiveError::Corrupt(e.to_string())
 }
 
+/// 反复去掉开头的 `./`。macOS 的 `tar -czf x.tgz .` 产出的条目就是 `./manifest.toml` 这种形状。
+/// 只放宽**开头**:`a/./b`、`./../x`、`.//a`(去掉 `./` 后成了绝对路径)仍然由 `safe_segments` 拒绝。
+fn strip_leading_dot_slashes(mut name: &str) -> &str {
+    while let Some(rest) = name.strip_prefix("./") {
+        name = rest;
+    }
+    name
+}
+
+/// 条目名是归档的根目录本身(`./`、`.`、`././`):不是文件也不是子目录,跳过而不是报错。
+fn is_root_dot_entry(name: &str) -> bool {
+    !name.is_empty()
+        && (name.trim_end_matches('/') == "." || strip_leading_dot_slashes(name).is_empty())
+}
+
 /// 校验并规范化条目名 → 相对路径的各段(用 `/` 分隔,已确认无 traversal/绝对/反斜杠)。
 fn safe_segments(name: &str, max_depth: usize) -> Result<Vec<String>, ArchiveError> {
     let unsafe_entry = |why: &'static str| ArchiveError::UnsafeEntry {
@@ -164,7 +179,7 @@ fn safe_segments(name: &str, max_depth: usize) -> Result<Vec<String>, ArchiveErr
     if name.contains('\\') {
         return Err(unsafe_entry("含反斜杠(可能是 Windows 路径穿越)"));
     }
-    let trimmed = name.trim_end_matches('/');
+    let trimmed = strip_leading_dot_slashes(name).trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(unsafe_entry("空路径"));
     }
@@ -222,6 +237,11 @@ fn plan_entries(
     let mut has_manifest_at_root = false;
     let mut declared_total = 0u64;
     for raw in raws {
+        if is_root_dot_entry(&raw.name) {
+            // 根目录条目:占位(保持与解压遍历同序),落在根上,稍后 `rel = None` 跳过。
+            segs_list.push(Vec::new());
+            continue;
+        }
         let segs = safe_segments(&raw.name, limits.max_depth)?;
         let key = fold(&segs);
         if !seen.insert(key) {
@@ -256,6 +276,7 @@ fn plan_entries(
                     Some(join_path(&segs[1..]))
                 }
             }
+            None if segs.is_empty() => None, // 根目录条目
             None => Some(join_path(segs)),
         };
         if let Some(p) = &rel
@@ -285,7 +306,9 @@ fn shared_top(segs_list: &[Vec<String>]) -> Option<String> {
     let mut top: Option<&str> = None;
     let mut has_file = false;
     for segs in segs_list {
-        let first = segs.first()?.as_str();
+        let Some(first) = segs.first().map(String::as_str) else {
+            continue; // 根目录条目占位
+        };
         match top {
             None => top = Some(first),
             Some(t) if t == first => {}
@@ -774,6 +797,134 @@ mod tests {
         }
     }
 
+    /// 造一个条目名**原样**写入的 tar.gz(`tar::Builder::append_data` 会规范化路径、吞掉 `./`,
+    /// 造不出 macOS `tar -czf x.tgz .` 那种带 `./` 前缀的真实归档)。
+    fn make_targz_raw_names(path: &Path, entries: &[(&str, &[u8], bool)]) {
+        let file = fs::File::create(path).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut tb = tar::Builder::new(gz);
+        for (name, content, is_dir) in entries {
+            let mut h = tar::Header::new_gnu();
+            let bytes = name.as_bytes();
+            h.as_old_mut().name[..bytes.len()].copy_from_slice(bytes);
+            h.set_entry_type(if *is_dir {
+                tar::EntryType::Directory
+            } else {
+                tar::EntryType::Regular
+            });
+            h.set_size(if *is_dir { 0 } else { content.len() as u64 });
+            h.set_mode(if *is_dir { 0o755 } else { 0o644 });
+            h.set_cksum();
+            tb.append(&h, if *is_dir { &b""[..] } else { *content })
+                .unwrap();
+        }
+        tb.into_inner().unwrap().finish().unwrap();
+    }
+
+    /// 验收 A6h 的已知局限:条目路径不接受开头的 `./`(macOS 的 `tar -czf x.tgz .` 就是这种布局)。
+    #[test]
+    fn a_leading_dot_slash_is_stripped_from_entry_names() {
+        let d = tmp();
+        let tgz = d.path().join("a.tgz");
+        make_targz_raw_names(
+            &tgz,
+            &[
+                ("./manifest.toml", b"id=\"x\"", false),
+                ("././web/index.html", b"hi", false),
+            ],
+        );
+        let into = d.path().join("out");
+        extract(&tgz, ArchiveKind::TarGz, &into, &limits_small()).unwrap();
+        assert!(into.join("manifest.toml").exists());
+        assert!(into.join("web/index.html").exists());
+    }
+
+    #[test]
+    fn root_dot_entries_are_skipped_not_rejected() {
+        let d = tmp();
+        let tgz = d.path().join("a.tgz");
+        make_targz_raw_names(
+            &tgz,
+            &[
+                ("./", b"", true),
+                (".", b"", true),
+                ("./manifest.toml", b"id=\"x\"", false),
+            ],
+        );
+        let into = d.path().join("out");
+        extract(&tgz, ArchiveKind::TarGz, &into, &limits_small()).unwrap();
+        assert!(into.join("manifest.toml").exists());
+    }
+
+    #[test]
+    fn dot_segments_elsewhere_and_traversal_are_still_rejected() {
+        for bad in ["a/./b", "./../x", ".//a", "/a", "..", "a\\b"] {
+            let d = tmp();
+            let tgz = d.path().join("a.tgz");
+            make_targz_raw_names(
+                &tgz,
+                &[("manifest.toml", b"id=\"x\"", false), (bad, b"x", false)],
+            );
+            let into = d.path().join("out");
+            let err = extract(&tgz, ArchiveKind::TarGz, &into, &limits_small()).unwrap_err();
+            assert!(
+                matches!(err, ArchiveError::UnsafeEntry { .. }),
+                "{bad:?} 应被拒绝为 UnsafeEntry,实际 {err:?}"
+            );
+        }
+    }
+
+    /// `tar -czf x.tgz .` 在 macOS 上的真实布局:顶层 `./`、`./manifest.toml`、`./server.py`。
+    #[test]
+    fn a_macos_tar_with_dot_slash_entries_installs() {
+        let d = tmp();
+        let tgz = d.path().join("a.tgz");
+        make_targz_raw_names(
+            &tgz,
+            &[
+                ("./", b"", true),
+                ("./manifest.toml", b"id=\"x\"", false),
+                ("./server.py", b"print(1)", false),
+            ],
+        );
+        let into = d.path().join("out");
+        extract(&tgz, ArchiveKind::TarGz, &into, &limits_small()).unwrap();
+        assert!(into.join("manifest.toml").exists() && into.join("server.py").exists());
+    }
+
+    /// 真实的 `tar -czf x.tgz .`(系统 tar,没有就跳过):验证放宽针对的就是这种真实归档。
+    /// `COPYFILE_DISABLE=1`:macOS 的 tar 否则会塞 AppleDouble(`._*`)伴随文件,那是另一个已知局限。
+    #[test]
+    fn a_real_system_tar_of_a_directory_installs() {
+        let have_tar = std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !have_tar {
+            return;
+        }
+        let d = tmp();
+        let src = d.path().join("src");
+        fs::create_dir_all(src.join("web")).unwrap();
+        fs::write(src.join("manifest.toml"), b"id=\"x\"").unwrap();
+        fs::write(src.join("web/index.html"), b"hi").unwrap();
+        let tgz = d.path().join("a.tgz");
+        let status = std::process::Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
+            .args(["-czf"])
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&src)
+            .arg(".")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let into = d.path().join("out");
+        extract(&tgz, ArchiveKind::TarGz, &into, &limits_small()).unwrap();
+        assert!(into.join("manifest.toml").exists());
+        assert!(into.join("web/index.html").exists());
+    }
+
     #[test]
     fn github_style_single_top_dir_is_stripped() {
         let d = tmp();
@@ -827,7 +978,10 @@ mod tests {
             "C:\\evil",
             "web\\..\\..\\evil",
             "a//b",
-            "./a",
+            // 开头的 `./` 现在被接受(见 `a_leading_dot_slash_is_stripped_from_entry_names`);
+            // 其余带 `.` 的形状仍然拒绝。
+            ".//a",
+            "a/./b",
         ];
         for c in cases {
             let zip = d.path().join("a.zip");
