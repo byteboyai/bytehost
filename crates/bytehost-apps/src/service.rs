@@ -363,6 +363,9 @@ impl AppService {
                     .map_err(rt_failure)
             }
             AppRequest::Logs { id, max_lines } => {
+                // debug 级:GUI 的日志查看器每秒读一次,info 会刷屏;留这一条是为了能确认
+                // "关掉日志视图之后读取确实停了"(验收 3.5)。
+                tracing::debug!(target: "bytehost::service", app = %id, max_lines, "读取应用日志");
                 blocking(manager, move |m| m.logs(&id, max_lines))
                     .await
                     .map(|(text, truncated)| AppReply::Logs { text, truncated })
@@ -1412,6 +1415,82 @@ source = "web/"
         assert!(
             std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
             "gateway 已释放端口"
+        );
+    }
+
+    /// 只捕获 `bytehost::service` 事件的最小 `tracing` 订阅者(不引入 tracing-subscriber 依赖)。
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Capture {
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct FieldText(String);
+    impl tracing::field::Visit for FieldText {
+        fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, " {}={:?}", f.name(), v);
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
+            m.target() == "bytehost::service"
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, e: &tracing::Event<'_>) {
+            let mut text = FieldText(String::new());
+            e.record(&mut text);
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}{}", e.metadata().level(), text.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// 验收 3.5:dozerd 对"读日志"请求不留任何痕迹,没法确认关掉设置页后读取是否停止。
+    /// GUI 每秒读一次,所以必须是 debug 级(info 会刷屏)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_logs_request_leaves_a_debug_trace() {
+        use tracing::instrument::WithSubscriber;
+        let tmp = tempfile::tempdir().unwrap();
+        let svc =
+            AppService::start_with(&tmp.path().join("bytehost"), GatewayConfig { port: 0 }).await;
+        let cap = Capture::default();
+        // 没装的应用读日志返回 NotFound,但"有请求到达"本身要留下记录。
+        let _ = svc
+            .handle(AppRequest::Logs {
+                id: id("ghost"),
+                max_lines: 100,
+            })
+            .with_subscriber(cap.clone())
+            .await;
+        let _ = svc
+            .handle(AppRequest::Stop { id: id("ghost") })
+            .with_subscriber(cap.clone())
+            .await;
+        let lines = cap.lines();
+        let traces: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("读取应用日志"))
+            .collect();
+        assert_eq!(traces.len(), 1, "只有 Logs 请求留下记录: {lines:?}");
+        assert!(
+            traces[0].starts_with("DEBUG"),
+            "必须是 debug 级: {traces:?}"
+        );
+        assert!(
+            traces[0].contains("ghost") && traces[0].contains("max_lines=100"),
+            "要带应用 id 与行数: {traces:?}"
         );
     }
 
