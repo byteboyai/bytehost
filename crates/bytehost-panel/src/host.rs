@@ -171,8 +171,9 @@ enum Subscription {
     /// 还没发起第一次订阅。
     #[default]
     Idle,
-    /// 已发 `Subscribe`(或重订阅),等 `Subscribed` 确认。
-    Pending,
+    /// 已发 `Subscribe`(或重订阅),等 `Subscribed` 确认。`prev_attempt`:这是第几档退避之后的重订阅
+    /// (首次订阅为 `None`)——失败时据此接着往下一档,而不是从第 0 档重来。
+    Pending { prev_attempt: Option<usize> },
     /// 订阅就绪:变更靠推送失效信号驱动。
     Live,
     /// 订阅断了,到 `retry_at` 再试;`attempt` 是退避档位(封顶在最后一档)。
@@ -313,12 +314,13 @@ impl<K: AppKey> PanelState<K> {
     pub fn subscribe_if_due(&mut self, now: Instant) -> Vec<PanelEffect<K>> {
         match &self.subscription {
             Subscription::Idle => {
-                self.subscription = Subscription::Pending;
+                self.subscription = Subscription::Pending { prev_attempt: None };
                 vec![PanelEffect::Subscribe]
             }
-            Subscription::Pending | Subscription::Live => Vec::new(),
-            Subscription::Backoff { retry_at, .. } if now >= *retry_at => {
-                self.subscription = Subscription::Pending;
+            Subscription::Pending { .. } | Subscription::Live => Vec::new(),
+            Subscription::Backoff { attempt, retry_at } if now >= *retry_at => {
+                let prev_attempt = Some(*attempt);
+                self.subscription = Subscription::Pending { prev_attempt };
                 vec![PanelEffect::Subscribe]
             }
             Subscription::Backoff { .. } => Vec::new(),
@@ -392,10 +394,12 @@ impl<K: AppKey> PanelState<K> {
             PanelMessage::Changed => self.request_refetch(now),
             PanelMessage::SubscriptionLost => {
                 // 退避档位:第一次丢失用第 0 档,重订阅再失败逐档递增(封顶最后一档)。
+                // 重订阅一发起状态就从 `Backoff` 变成 `Pending`,所以"上一档"要从两种状态里取。
                 let attempt = match self.subscription {
-                    Subscription::Backoff { attempt, .. } => {
-                        (attempt + 1).min(RESUBSCRIBE_BACKOFF.len() - 1)
-                    }
+                    Subscription::Backoff { attempt, .. }
+                    | Subscription::Pending {
+                        prev_attempt: Some(attempt),
+                    } => (attempt + 1).min(RESUBSCRIBE_BACKOFF.len() - 1),
                     _ => 0,
                 };
                 self.subscription = Subscription::Backoff {
@@ -1766,6 +1770,52 @@ mod tests {
         s.update(PanelMessage::Subscribed, t0, &[]);
         s.update(PanelMessage::ListLoaded(Ok(vec![])), t0, &[]);
         (s, t0)
+    }
+
+    /// 验收复测发现:`subscribe_if_due` 一发起重订阅状态就从 `Backoff` 变成 `Pending`,下一次失败时档位
+    /// 又从 0 算起——真实流程里退避永远停在第 0 档(2 秒),dozerd 停 14 分钟被重连 298 次。
+    /// 这条测试**经过 `subscribe_if_due`** 走真实的重试流程。
+    #[test]
+    fn resubscribe_backoff_escalates_through_the_real_retry_flow() {
+        let (mut s, t0) = live_state();
+        let mut now = t0;
+        let mut gaps = Vec::new();
+        for _ in 0..5 {
+            s.update(PanelMessage::SubscriptionLost, now, &[]);
+            let retry_at = match s.subscription {
+                Subscription::Backoff { retry_at, .. } => retry_at,
+                ref other => panic!("{other:?}"),
+            };
+            gaps.push(retry_at.duration_since(now));
+            now = retry_at;
+            assert_eq!(s.subscribe_if_due(now), vec![PanelEffect::Subscribe]);
+        }
+        let b = RESUBSCRIBE_BACKOFF;
+        assert_eq!(gaps, vec![b[0], b[1], b[2], b[3], b[3]], "逐档拉长并封顶");
+    }
+
+    #[test]
+    fn a_recovered_subscription_starts_the_backoff_over() {
+        let (mut s, t0) = live_state();
+        let mut now = t0;
+        for _ in 0..2 {
+            s.update(PanelMessage::SubscriptionLost, now, &[]);
+            if let Subscription::Backoff { retry_at, .. } = s.subscription {
+                now = retry_at;
+            }
+            s.subscribe_if_due(now);
+        }
+        s.update(PanelMessage::Subscribed, now, &[]);
+        s.update(PanelMessage::SubscriptionLost, now, &[]);
+        let retry_at = match s.subscription {
+            Subscription::Backoff { retry_at, .. } => retry_at,
+            ref other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            retry_at.duration_since(now),
+            RESUBSCRIBE_BACKOFF[0],
+            "恢复之后再断线,退避从第 0 档重新开始"
+        );
     }
 
     #[test]
