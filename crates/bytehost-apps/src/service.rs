@@ -1412,10 +1412,26 @@ source = "web/"
         assert_eq!(failure.kind, AppErrorKind::Unavailable);
         assert!(failure.message.contains("无法保存"), "{failure}");
         assert!(svc.gateway_stopped());
+        // `free_port()` 取到的是临时端口:gateway 释放它之后,并行的别的测试可能恰好抢走。
+        // 单次绑定断言会偶发失败(整仓约 1/20),所以在一个很短的窗口内重试。
         assert!(
-            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            bind_eventually(port, std::time::Duration::from_secs(2)),
             "gateway 已释放端口"
         );
+    }
+
+    /// `within` 内任一次能绑上 `port` 即返回 `true`(每 50ms 重试)。
+    fn bind_eventually(port: u16, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// 只捕获 `bytehost::service` 事件的最小 `tracing` 订阅者(不引入 tracing-subscriber 依赖)。
