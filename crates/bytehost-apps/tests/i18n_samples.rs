@@ -152,3 +152,84 @@ fn node_notes_reuses_the_bridge() {
         "未知语言回落 default(en)"
     );
 }
+
+// ---- CSP 门禁:静态样例不得有内联可执行脚本 ----
+//
+// 网关给静态应用的 CSP 是 `script-src 'self' 'wasm-unsafe-eval'`,内联 `<script>` 会被拦(验收 6.1:
+// 样例页面停在占位状态)。数据块(`type="application/json"` / `ld+json`)不执行,CSP 不拦。
+
+/// 返回 `html` 里所有"内联可执行脚本"的行号(从 1 起)。
+fn inline_executable_scripts(html: &str) -> Vec<usize> {
+    let lower = html.to_ascii_lowercase();
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("<script") {
+        let start = from + rel;
+        let after = lower.as_bytes().get(start + "<script".len()).copied();
+        let end = lower[start..].find('>').map_or(lower.len(), |i| start + i);
+        from = end.max(start + 1);
+        // `<scripts…` 之类不是脚本标签
+        if !matches!(after, Some(b'>' | b' ' | b'\t' | b'\n' | b'\r')) {
+            continue;
+        }
+        let tag = &lower[start..end];
+        let external = tag.contains("src=");
+        let data_block = tag.contains("application/json") || tag.contains("application/ld+json");
+        if !external && !data_block {
+            found.push(html[..start].matches('\n').count() + 1);
+        }
+    }
+    found
+}
+
+fn html_files_under(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            html_files_under(&path, out);
+        } else if path.extension().is_some_and(|e| e == "html") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn inline_script_scan_flags_only_executable_inline_scripts() {
+    assert_eq!(
+        inline_executable_scripts("<p>\n<script>x()</script>"),
+        vec![2]
+    );
+    assert_eq!(inline_executable_scripts("<SCRIPT>x()</SCRIPT>"), vec![1]);
+    assert_eq!(
+        inline_executable_scripts("<script type=\"module\">x()</script>"),
+        vec![1]
+    );
+    assert!(inline_executable_scripts("<script src=\"app.js\"></script>").is_empty());
+    assert!(
+        inline_executable_scripts("<script type=\"module\" src=\"/a.js\"></script>").is_empty()
+    );
+    assert!(inline_executable_scripts("<script type=\"application/json\">{}</script>").is_empty());
+    assert!(inline_executable_scripts("<scripts>not a tag</scripts>").is_empty());
+}
+
+#[test]
+fn static_samples_have_no_inline_executable_scripts() {
+    let mut files = Vec::new();
+    html_files_under(&samples_dir(), &mut files);
+    assert!(!files.is_empty(), "应当至少找到一个样例页面");
+    let mut violations = Vec::new();
+    for f in files {
+        // 只管静态应用(`web/` 目录);进程型样例的页面在 server 代码里,不走静态 CSP
+        if !f.components().any(|c| c.as_os_str() == "web") {
+            continue;
+        }
+        let html = std::fs::read_to_string(&f).unwrap();
+        for line in inline_executable_scripts(&html) {
+            violations.push(format!("{}:{line}", f.display()));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "静态样例里有被 CSP 拦截的内联脚本,请挪到外部 .js 文件: {violations:#?}"
+    );
+}
