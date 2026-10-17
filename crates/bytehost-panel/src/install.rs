@@ -874,7 +874,7 @@ fn normalize_sha256_client(input: &str) -> Result<String, String> {
 
 pub fn provenance_label(p: Provenance) -> &'static str {
     match p {
-        Provenance::Local => "本地目录",
+        Provenance::Local => "本机",
         Provenance::AgentGenerated => "Agent 生成",
         Provenance::ThirdParty => "第三方来源",
     }
@@ -1073,7 +1073,7 @@ pub fn plan_view(plan: &InstallPlan, running: bool) -> PlanView {
         title: format!("{}({})", plan.name, plan.app_id.as_str()),
         facts: vec![
             ("版本", version),
-            ("来源", provenance_label(plan.provenance).to_owned()),
+            ("来源渠道", provenance_label(plan.provenance).to_owned()),
             ("信任", trust_label(plan.trust).to_owned()),
             ("运行方式", plan.runtime_kind.clone()),
         ],
@@ -1650,13 +1650,39 @@ mod tests {
         assert_eq!(s.probes, Load::Failed("连不上".into()));
     }
 
+    /// 验收 5.2:压缩包的审批卡上第一行写着"来源 本地目录",下面又有"来源 本机压缩包"。
+    /// 渠道(Provenance)与具体来源类型是两个字段,不能共用"来源"这个标签,也不能把渠道叫"目录"。
+    #[test]
+    fn the_provenance_fact_is_a_channel_label_and_never_says_directory() {
+        for p in [
+            Provenance::Local,
+            Provenance::AgentGenerated,
+            Provenance::ThirdParty,
+        ] {
+            assert!(
+                !provenance_label(p).contains("目录"),
+                "{p:?} 的渠道标签不应含\"目录\""
+            );
+            let mut pl = plan();
+            pl.provenance = p;
+            let v = plan_view(&pl, false);
+            let rows: Vec<_> = v.facts.iter().filter(|(k, _)| *k == "来源渠道").collect();
+            assert_eq!(rows.len(), 1, "恰有一行来源渠道");
+            assert_eq!(rows[0].1, provenance_label(p));
+            assert!(
+                v.facts.iter().all(|(k, _)| *k != "来源"),
+                "\"来源\"这个项名留给来源区块(本机目录/本机压缩包/网络)"
+            );
+        }
+    }
+
     #[test]
     fn the_plan_view_shows_every_requested_change_with_its_real_enforcement() {
         let v = plan_view(&plan(), false);
         assert!(v.notices.is_empty(), "全新安装不该有升级提示");
         assert_eq!(v.title, "Excalidraw(excalidraw)");
         assert!(v.facts.contains(&("版本", "0.17.0".to_string())));
-        assert!(v.facts.contains(&("来源", "本地目录".to_string())));
+        assert!(v.facts.contains(&("来源渠道", "本机".to_string())));
         assert!(v.facts.contains(&("信任", "受信任".to_string())));
         assert_eq!(v.will_run, vec!["不执行任何命令".to_string()]);
         assert_eq!(
