@@ -9,7 +9,10 @@
 //!   过期地址);地址只经 `PanelEffect::SetUrl` 进内存里的 `AppViews`,不进日志、不落盘;
 //! - **瞬时失败走 Notice,持久状态留在面板里**:启停/取地址失败是"刚发生的一件事"→ Notice;宿主不可用
 //!   (`AppErrorKind::Unavailable`)是"当前处于某状态"→ 面板里显示原因,不弹 Notice;
-//! - 列表请求的传输层失败(连不上 dozerd)不清空已知的应用、不弹 Notice——顶栏的 dozerd 徽标负责告知。
+//! - 列表请求的传输层失败(连不上 dozerd)不清空已知的应用、不弹 Notice。启动连不上/用户主动停止由宿主自己的
+//!   "dozerd 不可用"状态(顶栏徽标)告知;**运行中已建立的订阅连续失败**由 `ConnectionLost`/`ConnectionRestored`
+//!   告知(验收 3.2:此前被 kill -9 后界面完全静默),宿主自行决定映射成 Toast 还是徽标——"dozerd 断着"
+//!   既是事件也是状态,两种映射都说得通;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -93,6 +96,12 @@ pub enum PanelEffect<K: AppKey> {
     OpenSettingsApps,
     /// 建立应用变更订阅(`AppHostApi::subscribe`)。
     Subscribe,
+    /// 一个**已经建立过**的订阅连续失败(第二次起):dozerd 大概率断了。持续断线期间只发这一次,
+    /// 下一次 [`PanelEffect::ConnectionRestored`] 之后才会重新告知。启动时就连不上的情形不发
+    /// (那由宿主自己的"dozerd 不可用"状态负责)。宿主决定映射成 Toast 还是徽标。
+    ConnectionLost,
+    /// 告知过 [`PanelEffect::ConnectionLost`] 之后订阅重新建立。只在确实告知过断线时发,抖动不发。
+    ConnectionRestored,
     /// 瞬时提示(宿主映射到自己的 Notice;`key` 用于去重)。
     Notice {
         level: NoticeLevel,
@@ -217,6 +226,13 @@ pub struct PanelState<K: AppKey> {
     synced_once: bool,
     /// 变更订阅的状态(推送取代轮询的主力)。
     subscription: Subscription,
+    /// 订阅至少成功建立过一次(区分"启动就连不上"与"建立后断了")。
+    was_live: bool,
+    /// 自上次 `Subscribed` 以来连续的 `SubscriptionLost` 次数。不能用退避档位:重订阅一发起状态就从
+    /// `Backoff` 变成 `Pending`,下一次失败时档位又从 0 算起。
+    consecutive_losses: u32,
+    /// 已经告知过 `ConnectionLost`,恢复前不再重复。
+    connection_lost_announced: bool,
     /// 订阅/推送期间又来了变更,但当时有 `List` 在途:等它回来再补发一次(合并风暴)。
     dirty: bool,
 }
@@ -236,6 +252,9 @@ impl<K: AppKey> Default for PanelState<K> {
             logs: HashMap::new(),
             synced_once: false,
             subscription: Subscription::default(),
+            was_live: false,
+            consecutive_losses: 0,
+            connection_lost_announced: false,
             dirty: false,
         }
     }
@@ -360,8 +379,15 @@ impl<K: AppKey> PanelState<K> {
             PanelMessage::OpenRuntimeSettings => vec![PanelEffect::OpenSettingsApps],
             PanelMessage::Subscribed => {
                 self.subscription = Subscription::Live;
+                self.was_live = true;
+                self.consecutive_losses = 0;
+                let mut effects = Vec::new();
+                if std::mem::take(&mut self.connection_lost_announced) {
+                    effects.push(PanelEffect::ConnectionRestored);
+                }
                 // 刚订上:断线/退避期间可能漏了变更,立刻重拉一次(有在途则合并)。
-                self.request_refetch(now)
+                effects.extend(self.request_refetch(now));
+                effects
             }
             PanelMessage::Changed => self.request_refetch(now),
             PanelMessage::SubscriptionLost => {
@@ -376,6 +402,13 @@ impl<K: AppKey> PanelState<K> {
                     attempt,
                     retry_at: now + RESUBSCRIBE_BACKOFF[attempt],
                 };
+                self.consecutive_losses += 1;
+                // 第一次丢失可能只是抖动,不打扰;连续第二次起才告知,且只告知一次。
+                if self.was_live && self.consecutive_losses >= 2 && !self.connection_lost_announced
+                {
+                    self.connection_lost_announced = true;
+                    return vec![PanelEffect::ConnectionLost];
+                }
                 Vec::new()
             }
         }
@@ -1724,6 +1757,108 @@ mod tests {
     }
 
     /// 丢订阅后回到 2s 快速轮询,并按退避重订阅;连续失败退避停在 30s。
+    /// 验收 3.2:运行中 dozerd 被 kill -9,界面完全静默。已建立的订阅连续失败要告知一次。
+    /// 建好一个已 `Live` 的状态机,返回 `(state, now)`。
+    fn live_state() -> (PanelState<TestKey>, Instant) {
+        let mut s = PanelState::<TestKey>::default();
+        let t0 = Instant::now();
+        s.subscribe_if_due(t0);
+        s.update(PanelMessage::Subscribed, t0, &[]);
+        s.update(PanelMessage::ListLoaded(Ok(vec![])), t0, &[]);
+        (s, t0)
+    }
+
+    #[test]
+    fn the_second_consecutive_loss_of_a_live_subscription_announces_connection_lost_once() {
+        let (mut s, t0) = live_state();
+        assert!(
+            s.update(PanelMessage::SubscriptionLost, t0, &[]).is_empty(),
+            "第一次丢失可能只是抖动,不告知"
+        );
+        let retry0 = t0 + RESUBSCRIBE_BACKOFF[0] + Duration::from_millis(1);
+        assert_eq!(s.subscribe_if_due(retry0), vec![PanelEffect::Subscribe]);
+        assert_eq!(
+            s.update(PanelMessage::SubscriptionLost, retry0, &[]),
+            vec![PanelEffect::ConnectionLost],
+            "重订阅又失败:连续第二次,告知"
+        );
+        let mut now = retry0;
+        for i in 0..5 {
+            now += Duration::from_secs(60);
+            assert!(
+                s.update(PanelMessage::SubscriptionLost, now, &[])
+                    .is_empty(),
+                "持续断线只告知一次(第 {i} 次重试失败)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subscription_that_never_became_live_does_not_announce_a_loss() {
+        // 启动时就连不上 dozerd:由顶栏的 daemon_unavailable 徽标负责,不能再叠一条提示。
+        let mut s = PanelState::<TestKey>::default();
+        let t0 = Instant::now();
+        s.subscribe_if_due(t0);
+        let mut now = t0;
+        for _ in 0..6 {
+            assert!(
+                s.update(PanelMessage::SubscriptionLost, now, &[])
+                    .is_empty()
+            );
+            now += Duration::from_secs(60);
+        }
+    }
+
+    #[test]
+    fn a_single_blip_is_not_announced_either_way() {
+        let (mut s, t0) = live_state();
+        let lost = s.update(PanelMessage::SubscriptionLost, t0, &[]);
+        let retry0 = t0 + RESUBSCRIBE_BACKOFF[0] + Duration::from_millis(1);
+        s.subscribe_if_due(retry0);
+        let back = s.update(PanelMessage::Subscribed, retry0, &[]);
+        for e in lost.iter().chain(back.iter()) {
+            assert!(
+                !matches!(
+                    e,
+                    PanelEffect::ConnectionLost | PanelEffect::ConnectionRestored
+                ),
+                "抖动不应告知: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resubscribing_after_an_announced_loss_announces_restored_once_and_resets() {
+        let (mut s, t0) = live_state();
+        s.update(PanelMessage::SubscriptionLost, t0, &[]);
+        let retry0 = t0 + RESUBSCRIBE_BACKOFF[0] + Duration::from_millis(1);
+        s.subscribe_if_due(retry0);
+        assert_eq!(
+            s.update(PanelMessage::SubscriptionLost, retry0, &[]),
+            vec![PanelEffect::ConnectionLost]
+        );
+        let back = retry0 + Duration::from_secs(10);
+        assert_eq!(
+            s.update(PanelMessage::Subscribed, back, &[]),
+            vec![PanelEffect::ConnectionRestored, PanelEffect::FetchList],
+            "恢复:先告知、再照常重拉一次列表"
+        );
+        s.update(PanelMessage::ListLoaded(Ok(vec![])), back, &[]);
+        assert!(
+            !s.update(PanelMessage::Subscribed, back, &[])
+                .contains(&PanelEffect::ConnectionRestored),
+            "没有新的丢失就不再告知恢复"
+        );
+        // 第二轮断线:标志位已复位,要重新告知。
+        s.update(PanelMessage::SubscriptionLost, back, &[]);
+        let retry = back + RESUBSCRIBE_BACKOFF[0] + Duration::from_millis(1);
+        s.subscribe_if_due(retry);
+        assert_eq!(
+            s.update(PanelMessage::SubscriptionLost, retry, &[]),
+            vec![PanelEffect::ConnectionLost]
+        );
+    }
+
     #[test]
     fn losing_the_subscription_goes_back_to_fast_polling_and_retries_with_backoff() {
         let mut s = PanelState::<TestKey>::default();
