@@ -1,13 +1,10 @@
 //! macOS 窗口装饰胶水(移植自 Dozer `platform/window.rs`):窗口用"透明标题栏 + 全尺寸内容视图",顶栏取代系统标题栏后,
-//! 要自己处理两件事:
+//! 要自己处理三件事:
 //! 1. 红绿灯垂直居中到顶栏里(系统仍按 28pt 旧标题栏排版,会贴着顶栏上沿);
-//! 2. 原生全屏不绘制标题栏,红绿灯会跟着移出窗口:全屏期间把同一组原生按钮临时挂到内容视图。
+//! 2. 原生全屏不绘制标题栏,红绿灯会跟着移出窗口:全屏期间把同一组原生按钮临时挂到内容视图;
+//! 3. 顶栏可交互控件不被原生拖窗吞掉([`install_topbar_drag_guard`] + [`set_topbar_control_hovered`])。
 //!
 //! 与 Dozer 的区别:Dozer 自己持有 winit 窗口;这里经 iced 的 `window::run` 拿 `&dyn HasWindowHandle`。
-//!
-//! **没有移植 Dozer 的"顶栏拖窗保护"**(覆写 `mouseDownCanMoveWindow`):透明标题栏保留 ~28pt 的原生拖窗带,落在带内的
-//! 按下事件在送到 iced 之前就被 AppKit 当拖窗,顶栏上可交互的页签 / 按钮会被吞。S1 的顶栏没有任何可交互控件
-//! (标题只是展示,"＋"置灰),不需要它;顶栏有了项目页签(S5)时再移植,并在那时加真实窗口验证。
 
 use objc2::rc::Retained;
 use objc2_app_kit::{NSButton, NSView, NSWindow, NSWindowButton};
@@ -71,6 +68,76 @@ pub fn center_traffic_lights(window: &dyn HasWindowHandle, top_bar_height: f32) 
             superview.isFlipped(),
         );
         button.setFrameOrigin(origin);
+    }
+}
+
+// ---- 顶栏拖窗保护 ----
+
+/// 当前帧鼠标是否悬停在顶栏的可交互控件(页签 / "＋" / 关闭按钮)上——由产品在每个
+/// `on_enter` / `on_exit` 里调 [`set_topbar_control_hovered`] 维护,
+/// [`install_topbar_drag_guard`] 装的覆写读它决定是否放行原生拖窗。
+static TOPBAR_CONTROL_HOVERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 进程级读取:仅测试与覆写内部使用。
+pub(crate) fn topbar_control_hovered() -> bool {
+    TOPBAR_CONTROL_HOVERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 标记顶栏上是否有可交互控件被悬停。悬停时原生拖窗让路,按下事件交给 iced;
+/// 未悬停时保持默认的"顶栏空白处可拖窗"。
+pub fn set_topbar_control_hovered(hovered: bool) {
+    TOPBAR_CONTROL_HOVERED.store(hovered, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 给窗口内容 NSView 挂一个 `mouseDownCanMoveWindow` 覆写。
+///
+/// 根因:透明标题栏保留了 ~28pt 的原生拖窗带,落在这条带内的按下事件无论下面画的是什么,
+/// AppKit 都当"标题栏背景"处理并直接原生拖窗——这一步发生在事件送到 iced 之前,控件层
+/// 拦不住。覆写后:悬停在可交互控件上(`TOPBAR_CONTROL_HOVERED`)返回 `NO`,按下事件正常
+/// 交给 iced;悬停在真正空白的顶栏时保持默认 `YES`,原生拖窗照常。
+///
+/// 只把方法加到内容视图**自己的**运行时类上(`class_addMethod` 对已注册类添加全新
+/// selector,不覆盖 `NSView` 继承来的实现),不影响其它 NSView 实例。幂等;selector 已存在
+/// 时返回 `false`,记一条日志而不 panic。
+pub fn install_topbar_drag_guard(window: &dyn HasWindowHandle) {
+    use objc2::encode::Encode;
+    use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
+    use objc2::{ffi, sel};
+
+    let Some(content) = content_view(window) else {
+        return;
+    };
+    // SAFETY: 同 `content_view`——只借已装进窗口的合法对象拿运行时类指针,不持有 / 释放。
+    let class: &AnyClass = unsafe { &*(content as *const NSView as *const AnyObject) }.class();
+
+    unsafe extern "C-unwind" fn mouse_down_can_move_window(_this: &AnyObject, _cmd: Sel) -> Bool {
+        Bool::new(!topbar_control_hovered())
+    }
+
+    // `-(BOOL)mouseDownCanMoveWindow` 无额外参数:返回值 + self + _cmd 三段编码。
+    let types = std::ffi::CString::new(format!(
+        "{}{}{}",
+        Bool::ENCODING,
+        <*mut AnyObject>::ENCODING,
+        Sel::ENCODING
+    ))
+    .expect("type encoding 不含 NUL");
+    let imp: Imp = unsafe {
+        core::mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(
+            mouse_down_can_move_window,
+        )
+    };
+    let added = unsafe {
+        ffi::class_addMethod(
+            class as *const AnyClass as *mut AnyClass,
+            sel!(mouseDownCanMoveWindow),
+            imp,
+            types.as_ptr(),
+        )
+    };
+    if !added.as_bool() {
+        eprintln!("bytehost-chrome: 挂 mouseDownCanMoveWindow 覆写失败(selector 可能已存在于该类)");
     }
 }
 
@@ -202,6 +269,15 @@ pub fn install_fullscreen_guard(window: &dyn HasWindowHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hovered_flag_round_trips() {
+        // 真实拖窗行为只能真机验;这里只锁住覆写读取的那个开关。
+        set_topbar_control_hovered(true);
+        assert!(topbar_control_hovered());
+        set_topbar_control_hovered(false);
+        assert!(!topbar_control_hovered());
+    }
 
     #[test]
     fn traffic_lights_are_centered_in_the_top_bar_in_both_coordinate_systems() {
