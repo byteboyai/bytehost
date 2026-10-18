@@ -1238,22 +1238,50 @@ source = "web/"
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("bytehost");
         std::fs::create_dir_all(&root).unwrap();
-        let free = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let free = if free < 1024 { 20000 } else { free };
-        std::fs::write(root.join("gateway.json"), format!("{{\"port\": {free}}}")).unwrap();
+        // 先 bind 再释放得到的"空闲端口"有竞争窗口:并行的其他测试(`port: 0` 的 gateway、首次运行随机选端口)
+        // 随时可能抢走它(32 线程下约 1/40)。被抢走就换一个重来;这条测试要证明的是"持久化的端口跨重启不变",
+        // 不是"这个端口一定空着"。
+        let mut chosen = None;
+        for _ in 0..10 {
+            // 动态端口段(20000–32767)在系统临时端口段之下:别的测试的出站连接不会占到它。
+            let candidate = crate::port::pick_port();
+            std::fs::write(
+                root.join("gateway.json"),
+                format!("{{\"port\": {candidate}}}"),
+            )
+            .unwrap();
+            let svc = AppService::start(&root).await;
+            match svc.handle(AppRequest::List).await {
+                Ok(_) => {
+                    svc.shutdown().await;
+                    chosen = Some(candidate);
+                    break;
+                }
+                Err(e) if e.message.contains("已被占用") => svc.shutdown().await,
+                Err(e) => panic!("启动失败:{e}"),
+            }
+        }
+        let free = chosen.expect("10 次都没抢到空闲端口");
 
         install_and_run_on(&root, tmp.path(), free).await;
         install_and_run_on(&root, tmp.path(), free).await;
     }
 
     async fn install_and_run_on(root: &Path, scratch: &Path, expected_port: u16) {
-        let svc = AppService::start(root).await;
-        let AppReply::Apps { .. } = svc.handle(AppRequest::List).await.unwrap() else {
-            panic!()
+        // 端口是持久化的、不能换;上一轮刚释放,并行的别的测试(首次运行随机选端口)偶尔会短暂占着它,
+        // 所以"已被占用"时有界地等一等再起,而不是把一次碰撞当成失败。
+        let mut attempts = 0;
+        let svc = loop {
+            let svc = AppService::start(root).await;
+            match svc.handle(AppRequest::List).await {
+                Ok(AppReply::Apps { .. }) => break svc,
+                Err(e) if e.message.contains("已被占用") && attempts < 40 => {
+                    attempts += 1;
+                    svc.shutdown().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                other => panic!("启动失败:{other:?}"),
+            }
         };
         install_if_missing(&svc, scratch).await;
         let url = match svc
@@ -1375,11 +1403,23 @@ source = "web/"
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("bytehost");
         let (_held, taken) = squat();
-        let good = free_port();
-        let mut picks = vec![taken, good].into_iter();
+        // 第一次给被占的端口,之后每次现取一个空闲端口(单次探测的"空闲"可能在使用前被并行测试抢走)。
+        let last = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let recorder = last.clone();
+        let mut first = true;
         let lock = crate::service_lock::ServiceLock::acquire(&root).unwrap();
-        let svc = AppService::first_run(&root, lock, move || picks.next().unwrap()).await;
+        let svc = AppService::first_run(&root, lock, move || {
+            if std::mem::take(&mut first) {
+                return taken;
+            }
+            let port = free_port();
+            recorder.store(port, std::sync::atomic::Ordering::SeqCst);
+            port
+        })
+        .await;
         assert!(svc.handle(AppRequest::List).await.is_ok(), "服务可用");
+        let good = last.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(good, taken);
         assert_eq!(persisted_port(&root), Some(good));
         svc.shutdown().await;
     }
@@ -1405,9 +1445,17 @@ source = "web/"
         let root = tmp.path().join("bytehost");
         // 目录能建、锁能拿,但 `gateway.json` 处先建一个**目录**:原子改名会失败(写不进盘)。
         std::fs::create_dir_all(root.join("gateway.json")).unwrap();
-        let port = free_port();
+        // 每次现取空闲端口:单次探测的端口若在使用前被抢走,固定返回它会把一次碰撞变成"连续 5 次被占用"。
+        let last = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let recorder = last.clone();
         let lock = crate::service_lock::ServiceLock::acquire(&root).unwrap();
-        let svc = AppService::first_run(&root, lock, move || port).await;
+        let svc = AppService::first_run(&root, lock, move || {
+            let port = free_port();
+            recorder.store(port, std::sync::atomic::Ordering::SeqCst);
+            port
+        })
+        .await;
+        let port = last.load(std::sync::atomic::Ordering::SeqCst);
         let failure = svc.handle(AppRequest::List).await.unwrap_err();
         assert_eq!(failure.kind, AppErrorKind::Unavailable);
         assert!(failure.message.contains("无法保存"), "{failure}");
@@ -1711,7 +1759,14 @@ port_env = "APP_PORT"
             panic!("期望 Logs 应答")
         };
         assert!(text.contains("listening on"), "{text:?}");
-        let upstream_port: u16 = url
+        // 应用自己打印的端口(`APP_PORT`),才是进程型应用真正监听的上游端口;`url` 里的是 gateway 端口。
+        let app_port: u16 = text
+            .split("listening on")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("日志里没有应用端口:{text:?}"));
+        let gateway_port: u16 = url
             .strip_prefix("http://")
             .unwrap()
             .split(':')
@@ -1725,11 +1780,18 @@ port_env = "APP_PORT"
 
         svc.shutdown().await;
 
-        // 应用跟随 dozerd:进程已被收掉,端口不再应答
-        assert!(
-            std::net::TcpStream::connect(("127.0.0.1", upstream_port)).is_err(),
-            "dozerd 停了,应用进程也该没了"
-        );
+        // 应用跟随 dozerd:进程已被收掉,gateway 与应用端口都不再应答。进程收掉是异步落地的,给一个有界等待;
+        // 一直连得上才算没收掉。
+        for (what, port) in [("gateway", gateway_port), ("应用", app_port)] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "dozerd 停了 5 秒后,{what}端口 {port} 仍有应答"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
 
         // 同根目录重建:desired 仍是 Running(应用随上次 dozerd 停止,但想要的还在);reconcile 会把它重新拉起
         let again = AppService::start_with(&root, GatewayConfig { port: 0 }).await;

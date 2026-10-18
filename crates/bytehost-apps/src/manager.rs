@@ -5153,7 +5153,24 @@ source = "web/"
         wait_for(&rig, &a, 15, is_running);
         assert_eq!(rig.fetch(&a, "/").status, 200);
 
-        let events = drain(&mut rx);
+        // 状态先落盘、事件随后才广播,`wait_for` 看到 Running 时 Running 事件可能还在路上:有界等待而不是立刻 drain。
+        let mut events = drain(&mut rx);
+        let running_event = |events: &[AppEvent]| {
+            events.iter().any(|e| {
+                matches!(
+                    e,
+                    AppEvent::StateChanged {
+                        state: ObservedState::Running,
+                        ..
+                    }
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !running_event(&events) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            events.extend(drain(&mut rx));
+        }
         assert!(
             events.contains(&AppEvent::StateChanged {
                 app: a.clone(),
@@ -5161,13 +5178,7 @@ source = "web/"
             }),
             "{events:?}"
         );
-        assert!(events.iter().any(|e| matches!(
-            e,
-            AppEvent::StateChanged {
-                state: ObservedState::Running,
-                ..
-            }
-        )));
+        assert!(running_event(&events), "{events:?}");
         assert!(
             events
                 .iter()
