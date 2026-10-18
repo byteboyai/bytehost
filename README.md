@@ -40,6 +40,7 @@ let host = InProcess::new(svc.clone());
 - **wire 协议只追加**:`AppRequest`/`AppReply`/`AppEvent` 的 JSON 形状只增字段、不改有字段;新字段解析方给默认值。
 - **落盘格式带版本**:应用记录 `RECORD_FORMAT_VERSION`、应用目录布局 `apps/<id>/package/<version>`、`data/`、`logs/`、受管运行时目录、端口持久化文件均按版本演进。
 - **tag 即发布**:消费方用 git tag 引用(`bytehost-* = { git = "…/bytehost", tag = "vX.Y.Z" }`),同一仓库多个 crate 用同一个 tag。各 crate 的 `Cargo.toml` 里 `version` 固定为 `0.1.0`、不随 tag 变化;**以 git tag 为准**,tag 版本与宿主能力版本(`HOST_VERSION`)也是两回事,不要用 crate 版本号判断依赖是否过期。
+- **发版前同步共享库钉版**:byteui/bytegit 发新版后,bytehost 里**所有** crate(含 `bytehost-chrome`、`bytehost-desktop`)的钉版要一起升到同一个 tag,`scripts/check-deps.sh` 会拦下不一致(含 `Cargo.lock` 里出现两份)。漏一个 crate,消费方(dozer/digger)升级时依赖图里就有两份 byteui,类型不兼容、无法编译;dozer 自己不依赖 chrome,看不出来。
 - **每应用数据存储标识算法不改**:`data_store_identifier(app_id)` 的输出一旦改动即破坏用户的 webview 数据归属。
 
 ## 开发

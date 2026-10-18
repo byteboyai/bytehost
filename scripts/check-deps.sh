@@ -103,6 +103,25 @@ else
   echo "note: bytehost-desktop 尚未创建,跳过 desktop 组(Task 07 起自动纳入)" >&2
 fi
 
+# ---- group: pins(共享库钉版一致)----
+# 同一个外部共享库(byteui/bytegit)在所有 crate 里必须钉同一个 tag,Cargo.lock 里只能有一份:
+# 否则消费方升级其中一个时会在依赖图里得到两份,类型互不兼容(v0.4.7 的 chrome 曾因此滞留在 byteui v0.4.4)。
+for lib in byteui bytegit; do
+  tags=$(grep -rhE "github.com/byteboyai/${lib}\"" Cargo.toml crates/*/Cargo.toml 2>/dev/null \
+    | sed -E 's/.*tag = "([^"]+)".*/\1/' | sort -u || true)
+  n=$(echo "$tags" | grep -c . || true)
+  if [ "$n" -gt 1 ]; then
+    echo "各 crate 对 $lib 钉了不同的 tag(必须一致,发版前一起升):" >&2
+    grep -rnE "github.com/byteboyai/${lib}\"" Cargo.toml crates/*/Cargo.toml >&2
+    exit 1
+  fi
+  copies=$(grep -c "^name = \"${lib}\"\$" Cargo.lock || true)
+  if [ "$copies" -gt 1 ]; then
+    echo "Cargo.lock 里有 $copies 份 $lib" >&2
+    exit 1
+  fi
+done
+
 echo "bytehost deps check: ok"
 
 # ---- 可选:门禁变异测试 ----
@@ -160,6 +179,21 @@ PYEOF
   fi
   cp "$apps_bak" crates/bytehost-apps/Cargo.toml
   echo "  变异 2 通过:apps→digger-* 被拦下" >&2
+
+  # 变异 3:chrome 的 byteui 钉到另一个 tag → 必须失败。
+  chrome_bak="$(mktemp)"
+  cp crates/bytehost-chrome/Cargo.toml "$chrome_bak"
+  trap 'cp "$chrome_bak" crates/bytehost-chrome/Cargo.toml; rm -f "$chrome_bak"' EXIT
+  sed -i.bak -E '/byteboyai\/byteui"/ s/tag = "[^"]+"/tag = "v0.0.1"/' crates/bytehost-chrome/Cargo.toml
+  rm -f crates/bytehost-chrome/Cargo.toml.bak
+  if bash "$0" >/dev/null 2>&1; then
+    echo "变异测试失败:chrome 钉了不同的 byteui tag 后门禁仍然通过" >&2
+    exit 1
+  fi
+  cp "$chrome_bak" crates/bytehost-chrome/Cargo.toml
+  trap - EXIT
+  rm -f "$chrome_bak"
+  echo "  变异 3 通过:byteui 钉版不一致被拦下" >&2
 
   # 恢复后必须通过。
   cleanup
