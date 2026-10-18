@@ -103,14 +103,18 @@ else
   echo "note: bytehost-desktop 尚未创建,跳过 desktop 组(Task 07 起自动纳入)" >&2
 fi
 
-# ---- group: pins(共享库钉版一致)----
-# 同一个外部共享库(byteui/bytegit)在所有 crate 里必须钉同一个 tag,Cargo.lock 里只能有一份:
-# 否则消费方升级其中一个时会在依赖图里得到两份,类型互不兼容(v0.4.7 的 chrome 曾因此滞留在 byteui v0.4.4)。
+# ---- group: pins(共享库钉版)----
+# 1) 同一个外部共享库(byteui/bytegit)在所有 crate 里必须钉同一个 tag,Cargo.lock 里只能有一份。
+# 2) `--check-latest`(联网,发版前用):钉的 tag 必须是该库远程的最新 `vX.Y.Z`。
+#    消费方(dozer/digger)总是跟着最新 byteui;bytehost 里任何一个 crate 落后,消费方依赖图里就会有两份 byteui、
+#    类型不兼容、无法编译(v0.4.7 的 `bytehost-chrome` 曾钉在 byteui v0.4.4 上,dozer 不依赖 chrome 所以看不出来)。
+check_latest=0
+for arg in "$@"; do [ "$arg" = "--check-latest" ] && check_latest=1; done
 for lib in byteui bytegit; do
-  tags=$(grep -rhE "github.com/byteboyai/${lib}\"" Cargo.toml crates/*/Cargo.toml 2>/dev/null \
-    | sed -E 's/.*tag = "([^"]+)".*/\1/' | sort -u || true)
-  n=$(echo "$tags" | grep -c . || true)
-  if [ "$n" -gt 1 ]; then
+  lines=$(grep -rhE "github.com/byteboyai/${lib}\"" Cargo.toml crates/*/Cargo.toml 2>/dev/null || true)
+  [ -z "$lines" ] && continue
+  tags=$(echo "$lines" | sed -E 's/.*tag = "([^"]+)".*/\1/' | sort -u)
+  if [ "$(echo "$tags" | grep -c .)" -gt 1 ]; then
     echo "各 crate 对 $lib 钉了不同的 tag(必须一致,发版前一起升):" >&2
     grep -rnE "github.com/byteboyai/${lib}\"" Cargo.toml crates/*/Cargo.toml >&2
     exit 1
@@ -119,6 +123,19 @@ for lib in byteui bytegit; do
   if [ "$copies" -gt 1 ]; then
     echo "Cargo.lock 里有 $copies 份 $lib" >&2
     exit 1
+  fi
+  if [ "$check_latest" = 1 ]; then
+    remote=$(echo "$lines" | head -1 | sed -E 's/.*git = "([^"]+)".*/\1/')
+    if ! listing=$(git ls-remote --tags "$remote" 2>/dev/null); then
+      echo "note: 联不上 $remote,跳过 $lib 的最新版检查" >&2
+      continue
+    fi
+    latest=$(echo "$listing" | awk '{print $2}' | grep -v '\^{}' | sed 's|refs/tags/||' \
+      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    if [ -n "$latest" ] && [ "$tags" != "$latest" ]; then
+      echo "bytehost 钉的 $lib 是 $tags,但远程最新是 $latest:发版前把所有 crate 的 $lib 钉到 $latest" >&2
+      exit 1
+    fi
   fi
 done
 
@@ -180,20 +197,32 @@ PYEOF
   cp "$apps_bak" crates/bytehost-apps/Cargo.toml
   echo "  变异 2 通过:apps→digger-* 被拦下" >&2
 
-  # 变异 3:chrome 的 byteui 钉到另一个 tag → 必须失败。
-  chrome_bak="$(mktemp)"
-  cp crates/bytehost-chrome/Cargo.toml "$chrome_bak"
-  trap 'cp "$chrome_bak" crates/bytehost-chrome/Cargo.toml; rm -f "$chrome_bak"' EXIT
-  sed -i.bak -E '/byteboyai\/byteui"/ s/tag = "[^"]+"/tag = "v0.0.1"/' crates/bytehost-chrome/Cargo.toml
-  rm -f crates/bytehost-chrome/Cargo.toml.bak
-  if bash "$0" >/dev/null 2>&1; then
-    echo "变异测试失败:chrome 钉了不同的 byteui tag 后门禁仍然通过" >&2
-    exit 1
+  # 变异 3:chrome 的 byteui 钉回旧 tag → `--check-latest` 必须失败(联不上远程时跳过这一条,并说明)。
+  # 必须用**真实存在**的旧 tag:不存在的 tag 会让 cargo 拉取失败,那样"失败"并不是这条检查拦下的。
+  if git ls-remote --tags https://github.com/byteboyai/byteui >/dev/null 2>&1; then
+    chrome_bak="$(mktemp)"
+    lock_bak="$(mktemp)"
+    cp crates/bytehost-chrome/Cargo.toml "$chrome_bak"
+    cp Cargo.lock "$lock_bak"
+    trap 'cp "$chrome_bak" crates/bytehost-chrome/Cargo.toml; cp "$lock_bak" Cargo.lock; rm -f "$chrome_bak" "$lock_bak"' EXIT
+    sed -i.bak -E '/byteboyai\/byteui"/ s/tag = "[^"]+"/tag = "v0.4.4"/' crates/bytehost-chrome/Cargo.toml
+    rm -f crates/bytehost-chrome/Cargo.toml.bak
+    out=$(bash "$0" --check-latest 2>&1) && {
+      echo "变异测试失败:chrome 钉着旧 byteui 后 --check-latest 仍然通过" >&2
+      exit 1
+    }
+    echo "$out" | grep -q "远程最新是" || {
+      echo "变异测试失败:失败了,但不是最新版检查拦下的:$out" >&2
+      exit 1
+    }
+    cp "$chrome_bak" crates/bytehost-chrome/Cargo.toml
+    cp "$lock_bak" Cargo.lock
+    trap - EXIT
+    rm -f "$chrome_bak" "$lock_bak"
+    echo "  变异 3 通过:byteui 钉版落后于远程最新被拦下" >&2
+  else
+    echo "  变异 3 跳过:联不上 byteui 远程" >&2
   fi
-  cp "$chrome_bak" crates/bytehost-chrome/Cargo.toml
-  trap - EXIT
-  rm -f "$chrome_bak"
-  echo "  变异 3 通过:byteui 钉版不一致被拦下" >&2
 
   # 恢复后必须通过。
   cleanup

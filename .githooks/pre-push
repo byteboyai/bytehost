@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# 发版前的依赖门禁:推 main 或 tag 时跑 scripts/check-deps.sh(解耦规则 + byteui/bytegit 钉版一致且是最新)。
+# 启用(每个克隆一次):git config core.hooksPath .githooks
+# 其他分支不拦。确认要绕过时:git push --no-verify
+#
+# check-deps.sh 检查的是工作区,所以被推的提交必须就是当前 HEAD;否则结果和被推的内容无关,宁可拦下。
+set -u
+root="$(git rev-parse --show-toplevel)"
+zero="0000000000000000000000000000000000000000"
+head="$(git rev-parse HEAD)"
+need=0
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue # 删除远端引用
+  case "$remote_ref" in
+    refs/heads/main | refs/tags/*) ;;
+    *) continue ;;
+  esac
+  commit="$(git rev-parse "${local_sha}^{commit}" 2>/dev/null || echo "$local_sha")"
+  if [ "$commit" != "$head" ]; then
+    echo "pre-push: $remote_ref 要推的提交不是当前 HEAD,依赖门禁检查的是工作区,没法代表它。先 checkout 要推的提交再推;确认要绕过时用 git push --no-verify" >&2
+    exit 1
+  fi
+  need=1
+done
+[ "$need" = 1 ] || exit 0
+echo "pre-push: 运行 scripts/check-deps.sh --check-latest" >&2
+if ! "$root/scripts/check-deps.sh" --check-latest >&2; then
+  echo "pre-push: 依赖门禁未通过,已拦下推送。修复后重试;确认要绕过时用 git push --no-verify" >&2
+  exit 1
+fi
