@@ -18,10 +18,12 @@ use iced_wgpu::graphics::{Shell, Viewport};
 use iced_wgpu::{Engine, Renderer, wgpu};
 use iced_winit::Clipboard;
 use iced_winit::conversion;
+use iced_winit::core::input_method::InputMethod;
 use iced_winit::core::time::Instant;
 use iced_winit::core::window;
 use iced_winit::core::{Color, Element, Event, Font, Pixels, Size, mouse};
 use iced_winit::runtime::user_interface::{self, UserInterface};
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::WindowEvent;
 use winit::keyboard::ModifiersState;
 use winit::window::Window;
@@ -41,6 +43,35 @@ pub fn apply_cursor(window: &Window, interaction: mouse::Interaction) {
         window.set_cursor_visible(true);
     } else {
         window.set_cursor_visible(false);
+    }
+}
+
+/// iced 本帧算出的输入法请求 → 候选条的锚点矩形(窗口逻辑坐标)。
+///
+/// 只有 `Enabled`(有 `text_input` 聚焦、要输入法)才有锚点,锚点就是 iced 算出的文本光标矩形;
+/// 空输入框里的插入点宽度是 0,宽度至少取 1,否则部分输入法会把候选条放到窗口原点。
+/// `Disabled` 返回 `None`:没有锚点可给,候选条位置不动。
+pub fn ime_cursor_area(
+    input_method: &InputMethod,
+) -> Option<(LogicalPosition<f32>, LogicalSize<f32>)> {
+    match input_method {
+        InputMethod::Enabled { cursor, .. } => Some((
+            LogicalPosition::new(cursor.x, cursor.y),
+            LogicalSize::new(cursor.width.max(1.0), cursor.height),
+        )),
+        InputMethod::Disabled => None,
+    }
+}
+
+/// 把本帧的输入法请求写进 overlay 窗口,让系统的输入法候选条跟着文本光标走。
+///
+/// 这扇窗口是独立原生窗口,主窗口那套"界面更新后设置候选条位置"的逻辑不覆盖它;缺了这步,
+/// 候选条会落在系统默认位置(整个窗口左上角)。`OverlayGpu::redraw`/`dispatch` 内部已自动调用;
+/// 自己手写 `UserInterface::build`/`update` 的消费方需在 `update` 拿到 `State::Updated` 后自行调用,
+/// 与 [`apply_cursor`] 一起。窗口还需要 `set_ime_allowed(true)`(建窗时设)。
+pub fn apply_input_method(window: &Window, input_method: &InputMethod) {
+    if let Some((position, size)) = ime_cursor_area(input_method) {
+        window.set_ime_cursor_area(position, size);
     }
 }
 
@@ -179,10 +210,13 @@ impl OverlayGpu {
             &mut Vec::new(),
         );
         if let user_interface::State::Updated {
-            mouse_interaction, ..
+            mouse_interaction,
+            input_method,
+            ..
         } = state
         {
             apply_cursor(window, mouse_interaction);
+            apply_input_method(window, &input_method);
         }
         interface.draw(
             &mut self.renderer,
@@ -237,10 +271,13 @@ impl OverlayGpu {
             &mut messages,
         );
         if let user_interface::State::Updated {
-            mouse_interaction, ..
+            mouse_interaction,
+            input_method,
+            ..
         } = state
         {
             apply_cursor(window, mouse_interaction);
+            apply_input_method(window, &input_method);
         }
         self.cache = interface.into_cache();
         window.request_redraw();
@@ -329,4 +366,44 @@ pub fn backdrop_card_shrink<'a, Message: 'a>(
         ..container::Style::default()
     })
     .into()
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+    use iced_winit::core::input_method::{InputMethod, Purpose};
+    use iced_winit::core::{Point, Rectangle};
+
+    /// 有 text_input 聚焦要输入法时,候选条锚点就是 iced 算出的文本光标矩形(逻辑坐标)。
+    #[test]
+    fn an_enabled_input_method_anchors_the_candidate_bar_at_the_text_cursor() {
+        let im = InputMethod::Enabled {
+            cursor: Rectangle::new(Point::new(120.0, 340.0), Size::new(2.0, 18.0)),
+            purpose: Purpose::Normal,
+            preedit: None,
+        };
+        let (pos, size) = ime_cursor_area(&im).expect("Enabled 必须给出锚点");
+        assert_eq!((pos.x, pos.y), (120.0, 340.0));
+        assert_eq!((size.width, size.height), (2.0, 18.0));
+    }
+
+    /// iced 的光标矩形宽度可以是 0(空输入框里的插入点):给系统一个宽度为 0 的矩形,
+    /// 部分输入法会把候选条放到窗口原点,所以宽度至少取 1。
+    #[test]
+    fn a_zero_width_cursor_gets_a_one_pixel_wide_anchor() {
+        let im = InputMethod::Enabled {
+            cursor: Rectangle::new(Point::new(10.0, 20.0), Size::new(0.0, 18.0)),
+            purpose: Purpose::Normal,
+            preedit: None,
+        };
+        let (_, size) = ime_cursor_area(&im).unwrap();
+        assert_eq!(size.width, 1.0);
+        assert_eq!(size.height, 18.0);
+    }
+
+    /// 没有任何 text_input 要输入法时不动候选条位置(没有锚点可给)。
+    #[test]
+    fn a_disabled_input_method_gives_no_anchor() {
+        assert!(ime_cursor_area(&InputMethod::Disabled).is_none());
+    }
 }

@@ -51,7 +51,10 @@ pub use overlay::{
     window_logical_size,
 };
 #[cfg(feature = "overlay")]
-pub use overlay_gpu::{OverlayGpu, apply_cursor, backdrop_card, backdrop_card_shrink};
+pub use overlay_gpu::{
+    OverlayGpu, apply_cursor, apply_input_method, backdrop_card, backdrop_card_shrink,
+    ime_cursor_area,
+};
 pub use panes::{
     PaneDims, PaneDragInput, PaneDragOutcome, PaneSpec, PaneStore, RailItems, apply_pane_split_drag,
 };
