@@ -2,6 +2,8 @@
 
 > 状态:**部分完成**。V2 与全部"能自动验证"的项已验证(下表给出命令与结果);**需要真实 GUI 的手工项尚未执行**——
 > 执行会话无法操作 Dozer 窗口,这些项写成了待办清单,**不得据此把 A5 标成"已完成"**。
+> 2026-10-18 对账:**仍为部分完成**。§3 的 9 项里只有第 5 项(`Host` 伪造)勾选;第 7 项的行为(dozerd 停/重启、退出整个 GUI 后网关仍在)已用 `py-notes`/`node-notes` 验证,
+> 但字面写的是 Excalidraw,没有勾。其余 Excalidraw 本体相关项(1、2、3、4、6、8 与 V2 手工补项)没做:2026-10-18 决定先不做 Excalidraw。
 > 对应计划:`docs/superpowers/plans/2026-10-05-bytehost-a5-excalidraw-acceptance.md`。
 
 ## 1. V2(真实 Excalidraw 静态构建)——已验证
@@ -48,7 +50,8 @@
 - [ ] 6(GUI 侧):在 `manifest.toml` 里加 `[permissions] telepathy = "allow"` → 安装流程内红字失败。
   **2026-10-17 手工验收:** 未做。
 - [ ] 7:运行中退出 Dozer → `curl -i -H 'Host: excalidraw.localhost:<端口>' http://127.0.0.1:<端口>/` 仍有响应(端口在服务);停 dozerd 后连接失败;重启 dozerd 后应用自动恢复。
-  **2026-10-17 手工验收:** 只验了一半:用 `py-notes` 验证了 dozerd 停止(SIGTERM 与 `kill -9`)后网关端口立刻关闭,重启后应用恢复 Running、端口不变;"退出整个 GUI"那一半没验。
+  **2026-10-17 手工验收:** 用 `py-notes` 验证了 dozerd 停止(SIGTERM 与 `kill -9`)后网关端口立刻关闭,重启后应用恢复 Running、端口不变。
+  **2026-10-18 手工验收:** "退出整个 GUI"那一半用 `node-notes` 做完:⌘Q 退出后 dozerd、应用进程、网关仍在且应答,重启 GUI 后端口不变、应用直接 Running、计数续上。**为什么仍不勾:** 本项字面写的是 `excalidraw.localhost`,行为是网关层的、与具体应用无关,已用 py/node 应用代验,但 Excalidraw 本体没做。
 - [ ] 8(GUI 侧):把清单 `[runtime]` 改成 `kind = "container"` → 安装流程内显示"暂不支持 container 类型的应用"。
   **2026-10-17 手工验收:** 未做。
 - [ ] V2 手工补项:① `⌘C`/`⌘V` 复制粘贴图形;② 导出 PNG/保存(预期不可用,A4b1 拒绝下载);③ 切换主题、画英文字(手写体字形);④ 画中文(Xiaolai 按需加载)。

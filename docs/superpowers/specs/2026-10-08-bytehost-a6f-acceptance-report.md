@@ -1,7 +1,7 @@
 # bytehost A6f 验收报告(状态推送、依赖安装失败页、实时日志)
 
-> 状态:**部分完成**。§1 的全部自动化项已实跑通过并给出逐条证据;**需要真实 GUI 的项(§2)尚未执行**——
-> 执行会话无法操作 Dozer 窗口,这些项写成了待办清单,**不得据此把 A6f 标成"已完成"**。
+> 状态:**完成**(2026-10-18 对账)。§1 的全部自动化项已实跑通过并给出逐条证据;§2 需要真实 GUI 的 4 项已于 2026-10-17 全部手工验收并勾选。
+> 两处与原文措辞的差异见 §2 逐项说明:"dozerd 被 kill -9 后 2 秒内提示"实际约 3 秒(要等第二次重订阅失败才判定真断线,并且这一提示是验收中发现缺失后补的);"关闭设置页后不再有 `Logs` 请求"在 GUI 层面无法观测,靠代码与单测确认。
 > 对应计划:`docs/superpowers/plans/2026-10-08-bytehost-a6f-live-observation.md`。
 
 ## 0. 环境与对象
@@ -62,10 +62,9 @@ Task 4 相关 filter 单跑(证据):
 | `cargo clippy -p dozer-app -p dozer-client --all-targets` | A6f 触碰的文件(`app_logs.rs`/`settings_apps.rs`/`app_host.rs`/`view.rs`/`app.rs`/`window_events.rs`)**无新警告** |
 | `cargo clippy --all-targets` | 审阅后全树无 error(`dozer-core` 测试初始化已补齐,见 §3 缺陷 1) |
 
-## 2. 待人工在真实 GUI 里完成(**未执行**)
+## 2. 真实 GUI 手工验收(2026-10-17 已完成)
 
-> 执行会话无法操作 Dozer 窗口。以下各项**不得**据此标成完成。
-> 2026-10-17 已在真实 GUI 里手工验收了其中一部分,结果见 dozer `docs/superpowers/manual_tests/2026-10-16-bytehost-manual-acceptance.md`。下面勾选的是已验证的项;**未勾选的是仍未做或只验了一半的项**(逐项附有说明)。
+> 初版由无法操作 Dozer 窗口的会话写成,当时全部未执行。2026-10-17 已在真实 GUI 里手工验收,结果见 dozer `docs/superpowers/manual_tests/2026-10-16-bytehost-manual-acceptance.md`。逐项附有说明。
 
 - [x] (Task 2 Step 5)**推送即时性**:装 `py-notes` → 点它的 `/crash` → 面板应在 <1s 内进入"启动中…",而不是等下一次 2s 轮询;`kill -9 $(pgrep dozerd)` 后 2s 内显示 dozerd 不可用,重启 dozerd 后自动恢复订阅(日志里能看到重订阅)。
   **2026-10-17 手工验收:** `/crash` 后 **0.34 秒**内面板进入"启动中…"(推送,不是等 2 秒轮询)✅。`kill -9` dozerd 后**原先界面完全静默**(25 秒内没有任何提示):状态机在订阅断开时只回退轮询、不写 `daemon_unavailable`。已补:bytehost `v0.4.6` 新增 `ConnectionLost`/`ConnectionRestored` 效果,dozer 映射成 Toast(`d6800f3c`),复测约 3 秒后提示、重启后约 3 秒提示已恢复,主动停止 dozerd 时不重复提示。这里写的"2s 内"略放宽为约 3 秒(要等第二次重订阅失败才判定为真断线)。

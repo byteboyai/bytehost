@@ -1,7 +1,7 @@
 # bytehost A6g 验收报告(升级、试用期自动回滚、手动回滚)
 
-> 状态:**部分完成**。§1 的全部自动化项已实跑通过并给出逐条证据;**需要真实 GUI 的项(§2)尚未执行**——
-> 执行会话无法操作 Dozer 窗口,这些项写成了待办清单,**不得据此把 A6g 标成"已完成"**。
+> 状态:**完成**(2026-10-18 对账)。§1 的全部自动化项已实跑通过并给出逐条证据;§2 需要真实 GUI 的 3 项已于 2026-10-17 全部手工验收并勾选。
+> 注意 §2 的说明:界面文案是用户肉眼确认后口头反馈,没有逐步截图;状态变化、版本与计数来自 dozerd 事件日志、`state.json`、`counter.txt`。
 > 对应计划:`docs/superpowers/plans/2026-10-08-bytehost-a6g-upgrade-and-rollback.md`。
 
 ## 0. 环境与对象
@@ -66,10 +66,9 @@ cargo test -p dozerd --test process_apps_live -- --ignored --nocapture
 | `cargo fmt --check` | ok |
 | `cargo clippy -p dozerd -p bytehost-apps --all-targets` | A6g 触碰的文件无新警告(唯一 warning 是既有的 `dozerd/src/preview_commands.rs:152` `let_underscore_future`,非本切片) |
 
-## 2. 待人工在真实 GUI 里完成(**未执行**)
+## 2. 真实 GUI 手工验收(2026-10-17 已完成)
 
-> 执行会话无法操作 Dozer 窗口。以下各项**不得**据此标成完成。对应计划 Task 4 Step 5。
-> 2026-10-17 已在真实 GUI 里手工验收了其中一部分,结果见 dozer `docs/superpowers/manual_tests/2026-10-16-bytehost-manual-acceptance.md`。下面勾选的是已验证的项;**未勾选的是仍未做或只验了一半的项**(逐项附有说明)。
+> 对应计划 Task 4 Step 5。初版由无法操作 Dozer 窗口的会话写成,当时全部未执行。2026-10-17 已在真实 GUI 里手工验收,结果见 dozer `docs/superpowers/manual_tests/2026-10-16-bytehost-manual-acceptance.md`。逐项附有说明。
 
 - [x] 装 `py-notes` 1.0.0 并启动、点几次让计数增加 → 把样例 `manifest.toml` 版本改成 1.1.0 并改页面文字后再装 → 审批卡显示"正在运行,会短暂中断" → 批准后面板**自动**显示新页面、计数还在。
   **2026-10-17 手工验收:** 用自制样例 `py-ver`(1.0.0/1.1.0/1.2.0)。升级 1.0.0→1.1.0:审批卡文案、面板自动显示新页面、计数保留(界面文案由用户肉眼确认并口头反馈;`Upgraded 1.0.0→1.1.0` 与计数来自 dozerd 事件日志)。
