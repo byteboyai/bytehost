@@ -80,7 +80,11 @@ pub enum PanelMessage<K: AppKey> {
 }
 
 /// 状态机要 `App` 去做的事。
+///
+/// `non_exhaustive`:以后新增效果(如连接提示)不应让消费方的穷尽 `match` 编译失败;
+/// 消费方需要一个兜底分支。
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum PanelEffect<K: AppKey> {
     FetchList,
     FetchLaunchUrl(K),
