@@ -343,6 +343,40 @@ impl WebPool {
     }
 }
 
+/// 当前 key window 的 first responder 是不是**某个池里的** webview(任何一个 `WebPool` 的任何页签)。
+/// ⌘F 菜单项靠它决定启用与否:宿主自己的可信 webview(Dozer 的预览)也是 `WKWebView`,它们的 ⌘F 由页面脚本处理,
+/// 菜单项不能抢。主线程;池表正被修改(同步过程中)时保守地返回 `false`。
+#[cfg(target_os = "macos")]
+pub(crate) fn first_responder_is_pool_view() -> bool {
+    use objc2::MainThreadMarker;
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::NSApplication;
+    use wry::WebViewExtMacOS;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let Some(responder) = NSApplication::sharedApplication(mtm)
+        .keyWindow()
+        .and_then(|window| window.firstResponder())
+    else {
+        return false;
+    };
+    let target = Retained::as_ptr(&responder).cast::<AnyObject>();
+    POOLS.with(|pools| {
+        let Ok(pools) = pools.try_borrow() else {
+            return false;
+        };
+        pools.values().any(|state| {
+            state.tabs.values().any(|tab| {
+                let web_view = tab.view.webview();
+                std::ptr::eq(Retained::as_ptr(&web_view).cast::<AnyObject>(), target)
+            })
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_sync(
     slot: u64,
