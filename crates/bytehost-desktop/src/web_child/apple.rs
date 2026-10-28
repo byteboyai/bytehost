@@ -4,12 +4,17 @@
 //! `digger/docs/superpowers/reviews/2026-10-28-browser-panel-spikes.md`。
 
 use super::edit_menu::standard_edit_menu_items;
+use objc2::ClassType;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, NSObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_foundation::NSObjectProtocol;
-use objc2_web_kit::{WKFrameInfo, WKPermissionDecision, WKSecurityOrigin, WKUIDelegate};
-use std::cell::Cell;
+use objc2_web_kit::{
+    WKFindConfiguration, WKFindResult, WKFrameInfo, WKPermissionDecision, WKSecurityOrigin,
+    WKUIDelegate, WKWebView,
+};
+use std::cell::{Cell, RefCell};
+use std::ptr::NonNull;
 
 /// 保活句柄:`WKWebView` 对 `UIDelegate` 是 **weak** 引用,代理必须由我们自己活着(放进页签记录里,
 /// 页签销毁时一起释放)。
@@ -149,6 +154,124 @@ pub fn install_standard_edit_menu() -> bool {
     true
 }
 
+/// 在页面里查找 `query`(`WKWebView.findString:withConfiguration:completionHandler:`):命中就选中并滚动到那里,
+/// 下一次同样的查找从当前选区之后继续;`wraps` 恒开。`done(matched)` 在查找结束时回调(主线程)。
+/// 拿不到主线程标记时直接回调 `done(false)`。
+pub fn find_string(
+    view: &wry::WebView,
+    query: &str,
+    backwards: bool,
+    case_sensitive: bool,
+    done: impl Fn(bool) + 'static,
+) {
+    use wry::WebViewExtMacOS;
+    let Some(mtm) = MainThreadMarker::new() else {
+        done(false);
+        return;
+    };
+    let wk = view.webview();
+    let query = objc2_foundation::NSString::from_str(query);
+    unsafe {
+        let config = WKFindConfiguration::new(mtm);
+        config.setWraps(true);
+        config.setBackwards(backwards);
+        config.setCaseSensitive(case_sensitive);
+        let handler = block2::RcBlock::new(move |result: NonNull<WKFindResult>| {
+            done(result.as_ref().matchFound());
+        });
+        wk.findString_withConfiguration_completionHandler(&query, Some(&config), &handler);
+    }
+}
+
+struct FindIvars {
+    on_find: Box<dyn Fn()>,
+}
+
+define_class!(
+    /// ⌘F 的菜单项目标。`WKWebView` **不**响应 `performTextFinderAction:`(实测 `responds(to:) == false`),所以
+    /// 不能用响应链上的标准「查找」动作,要自己当目标。只在 first responder 是 `WKWebView` 时启用——
+    /// 否则 ⌘F 会被这个菜单项吃掉,宿主自己的 ⌘F(Dozer 的预览查找)就收不到了。
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = FindIvars]
+    struct FindTarget;
+
+    unsafe impl NSObjectProtocol for FindTarget {}
+
+    impl FindTarget {
+        #[unsafe(method(browserFind:))]
+        fn browser_find(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().on_find)();
+        }
+
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, _item: Option<&AnyObject>) -> Bool {
+            Bool::new(first_responder_is_web_view())
+        }
+    }
+);
+
+/// 当前 key window 的 first responder 是不是 `WKWebView`(wry 的子类也算)。
+fn first_responder_is_web_view() -> bool {
+    use objc2_app_kit::NSApplication;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.keyWindow()
+        .and_then(|window| window.firstResponder())
+        .is_some_and(|responder| responder.isKindOfClass(WKWebView::class()))
+}
+
+thread_local! {
+    static FIND_INSTALLED: Cell<bool> = const { Cell::new(false) };
+    // 菜单项对 target 是 weak 引用:target 必须由我们自己活着。
+    static FIND_TARGET: RefCell<Option<Retained<FindTarget>>> = const { RefCell::new(None) };
+}
+
+/// 在 Edit 菜单里加一项「Find…」(⌘F),按下时调 `on_find`;只在 first responder 是 `WKWebView` 时启用。
+/// 必须在 [`install_standard_edit_menu`] 之后调(要往已有的 Edit 菜单里加);主线程、幂等。返回是否这次真的装了。
+pub fn install_find_shortcut(on_find: impl Fn() + 'static) -> bool {
+    use objc2::sel;
+    use objc2_app_kit::{NSApplication, NSMenuItem};
+    use objc2_foundation::NSString;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    if FIND_INSTALLED.with(|flag| flag.get()) {
+        return false;
+    }
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(main) = app.mainMenu() else {
+        return false;
+    };
+    let edit = main.itemArray().iter().find_map(|item| {
+        item.submenu()
+            .filter(|submenu| submenu.title().to_string() == "Edit")
+    });
+    let Some(edit) = edit else {
+        return false;
+    };
+    FIND_INSTALLED.with(|flag| flag.set(true));
+    let target = mtm.alloc::<FindTarget>().set_ivars(FindIvars {
+        on_find: Box::new(on_find),
+    });
+    let target: Retained<FindTarget> = unsafe { msg_send![super(target), init] };
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(),
+            &NSString::from_str("Find…"),
+            Some(sel!(browserFind:)),
+            &NSString::from_str("f"),
+        )
+    };
+    unsafe { item.setTarget(Some(&target)) };
+    edit.addItem(&item);
+    FIND_TARGET.with(|slot| *slot.borrow_mut() = Some(target));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     /// 代理的决定必须是 `Deny`,且整个文件里绝不能出现 `Grant`:这是整个代理存在的理由。
@@ -199,5 +322,27 @@ mod tests {
             install.contains("already_has_edit"),
             "已有 Edit 菜单不得重复追加"
         );
+    }
+
+    /// ⌘F 菜单项只能在 first responder 是 `WKWebView` 时启用,否则会把 Dozer 自己的 ⌘F(预览查找)吃掉;
+    /// 目标对象必须被我们保活(菜单项对 target 是 weak 引用)。
+    #[test]
+    fn the_find_shortcut_is_enabled_only_when_a_web_view_has_focus_and_its_target_is_kept_alive() {
+        let src = include_str!("apple.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        for required in [
+            "validateMenuItem:",
+            "first_responder_is_web_view()",
+            "isKindOfClass(WKWebView::class())",
+            "FIND_TARGET.with(",
+            "sel!(browserFind:)",
+        ] {
+            assert!(prod.contains(required), "缺少 {required}");
+        }
+        // 不得用标准的 performTextFinderAction:(WKWebView 不响应,菜单项会永远禁用)。
+        assert!(!prod.contains("sel!(performTextFinderAction:)"));
+        // 查找必须开 wraps、并回调 matchFound。
+        assert!(prod.contains("config.setWraps(true)"));
+        assert!(prod.contains("matchFound()"));
     }
 }

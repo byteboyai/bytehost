@@ -222,6 +222,36 @@ impl WebPool {
         })
     }
 
+    /// 在页签 `tab` 的页面里查找 `query`(命中就选中并滚动过去;`backwards` 往前找,恒回绕)。返回有没有这个页签;
+    /// 查找结束时 `done(是否命中)` 回调(主线程)。同一个 `query` 再调一次就是「下一个」。主线程。
+    pub fn find(
+        &self,
+        generation: u64,
+        tab: usize,
+        query: &str,
+        backwards: bool,
+        case_sensitive: bool,
+        done: impl Fn(bool) + 'static,
+    ) -> bool {
+        self.with_view(generation, tab, |view| {
+            #[cfg(target_os = "macos")]
+            super::apple::find_string(view, query, backwards, case_sensitive, done);
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (view, query, backwards, case_sensitive);
+                done(false);
+            }
+        })
+        .is_some()
+    }
+
+    /// 关掉查找条时清掉页面里的命中选区(宿主侧 `evaluate_script`,不向页面注入任何持久脚本)。主线程。
+    pub fn clear_find(&self, generation: u64, tab: usize) {
+        self.with_view(generation, tab, |view| {
+            let _ = view.evaluate_script("window.getSelection().removeAllRanges()");
+        });
+    }
+
     /// 把全局界面缩放同步给池里已有的全部视图(新建的视图在 `sync` / `apply` 里已按当前缩放建好)。主线程。
     pub fn zoom_all(&self, generation: u64, scale: f64) {
         if self.epoch.load(Ordering::SeqCst) != generation {
