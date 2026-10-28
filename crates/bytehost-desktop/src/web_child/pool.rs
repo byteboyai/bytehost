@@ -131,19 +131,48 @@ impl WebPool {
         failed: impl FnOnce(String) -> E + Send + 'static,
         done: E,
     ) -> Task<E> {
-        let (slot, epoch) = (self.slot, self.epoch.clone());
-        let (events, tracker) = (self.events.clone(), self.tracker.clone());
+        let pool = self.handle();
         window::run(id, move |window| {
-            if epoch.load(Ordering::SeqCst) != generation {
-                return done;
-            }
-            match apply_sync(
-                slot, &window, generation, &desired, rect, scale, &events, &tracker,
-            ) {
+            match pool.apply(&window, generation, &desired, rect, scale) {
                 Ok(()) => done,
                 Err(error) => failed(error),
             }
         })
+    }
+
+    /// 同步版的 [`sync`](Self::sync):调用方自己握着窗口、并且**就在主线程**(自带 winit 事件循环、不执行 iced `Task`
+    /// 的宿主,如 Dozer)。`generation` 不是当前有效的代就什么都不做。
+    pub fn apply(
+        &self,
+        window: &dyn window::Window,
+        generation: u64,
+        desired: &[WebTabSpec],
+        rect: LogicalRect,
+        scale: f64,
+    ) -> Result<(), String> {
+        if self.epoch.load(Ordering::SeqCst) != generation {
+            return Ok(());
+        }
+        apply_sync(
+            self.slot,
+            window,
+            generation,
+            desired,
+            rect,
+            scale,
+            &self.events,
+            &self.tracker,
+        )
+    }
+
+    /// 池的轻量句柄(`Task` 版本把它搬进 `window::run` 的闭包里)。
+    fn handle(&self) -> Self {
+        Self {
+            slot: self.slot,
+            epoch: self.epoch.clone(),
+            events: self.events.clone(),
+            tracker: self.tracker.clone(),
+        }
     }
 
     /// 对页签 `tab` 发后退 / 前进 / 刷新。
@@ -155,44 +184,84 @@ impl WebPool {
         nav: WebNav,
         done: E,
     ) -> Task<E> {
-        let (slot, epoch) = (self.slot, self.epoch.clone());
+        let pool = self.handle();
         window::run(id, move |_| {
-            if epoch.load(Ordering::SeqCst) == generation {
-                POOLS.with(|pools| {
-                    let pools = pools.borrow();
-                    let Some(state) = pools.get(&slot).filter(|s| s.generation == generation)
-                    else {
-                        return;
-                    };
-                    if let Some(tab) = state.tabs.get(&tab) {
-                        let _ = match nav {
-                            WebNav::Back => tab.view.evaluate_script("window.history.back()"),
-                            WebNav::Forward => tab.view.evaluate_script("window.history.forward()"),
-                            WebNav::Refresh => tab.view.reload(),
-                        };
-                    }
-                });
-            }
+            pool.navigate_now(generation, tab, nav);
             done
         })
     }
 
+    /// 同步版的 [`nav`](Self::nav)(主线程)。
+    pub fn navigate_now(&self, generation: u64, tab: usize, nav: WebNav) {
+        self.with_view(generation, tab, |view| {
+            let _ = match nav {
+                WebNav::Back => view.evaluate_script("window.history.back()"),
+                WebNav::Forward => view.evaluate_script("window.history.forward()"),
+                WebNav::Refresh => view.reload(),
+            };
+        });
+    }
+
+    /// 对页签 `tab` 的 wry 视图做一件事(主线程;`generation` 过期或页签不在就返回 `None`)。给宿主做池没有封装的
+    /// 原生动作用:设焦点、原生查找条等。**不要**借它装脚本 / IPC / 协议——不可信内容的设置是钉死的。
+    pub fn with_view<R>(
+        &self,
+        generation: u64,
+        tab: usize,
+        f: impl FnOnce(&WebView) -> R,
+    ) -> Option<R> {
+        if self.epoch.load(Ordering::SeqCst) != generation {
+            return None;
+        }
+        POOLS.with(|pools| {
+            let pools = pools.borrow();
+            let state = pools
+                .get(&self.slot)
+                .filter(|s| s.generation == generation)?;
+            state.tabs.get(&tab).map(|t| f(&t.view))
+        })
+    }
+
+    /// 把全局界面缩放同步给池里已有的全部视图(新建的视图在 `sync` / `apply` 里已按当前缩放建好)。主线程。
+    pub fn zoom_all(&self, generation: u64, scale: f64) {
+        if self.epoch.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        POOLS.with(|pools| {
+            if let Some(state) = pools
+                .borrow_mut()
+                .get_mut(&self.slot)
+                .filter(|s| s.generation == generation)
+            {
+                for tab in state.tabs.values() {
+                    let _ = tab.view.zoom(scale);
+                }
+                state.scale = scale;
+            }
+        });
+    }
+
     /// 销毁池里全部视图(面板被关闭 / 项目被关闭)。
     pub fn destroy_all<E: Send + 'static>(&self, id: window::Id, done: E) -> Task<E> {
-        let slot = self.slot;
+        let pool = self.handle();
+        window::run(id, move |_| {
+            pool.destroy_all_now();
+            done
+        })
+    }
+
+    /// 同步版的 [`destroy_all`](Self::destroy_all)(主线程)。
+    pub fn destroy_all_now(&self) {
         if let Ok(mut tracker) = self.tracker.lock() {
             *tracker = NavTracker::new(NAV_STALL_TIMEOUT);
         }
-        window::run(id, move |_| {
-            POOLS.with(|pools| {
-                if let Some(state) = pools.borrow_mut().remove(&slot) {
-                    for tab in state.tabs.values() {
-                        restore_focus(&tab.view);
-                    }
+        POOLS.with(|pools| {
+            if let Some(state) = pools.borrow_mut().remove(&self.slot) {
+                for tab in state.tabs.values() {
+                    restore_focus(&tab.view);
                 }
-            });
-            done
-        })
+            }
+        });
     }
 
     /// 把等得太久的导航作为 [`WebEvent::NavigationStalled`] 送出。宿主在自己的定时 tick 里调,
@@ -472,6 +541,10 @@ mod tests {
             "wry_target(",
             ".on_page_load(id, &url)",
             "remember_page_url(slot, generation, id, &url)",
+            // `Task` 版本必须委托给同步版本:两套实现分叉的话,iced 宿主(Digger)和自带事件循环的宿主(Dozer)行为会不一致。
+            "pool.apply(&window, generation, &desired, rect, scale)",
+            "pool.navigate_now(generation, tab, nav)",
+            "pool.destroy_all_now()",
             // 必须是**调用点**:非 macOS 的空实现定义里也有 `install_media_deny_proxy(`,只认函数名会漏掉"删掉调用"。
             "= install_media_deny_proxy(&view)",
             "build_as_child(",
