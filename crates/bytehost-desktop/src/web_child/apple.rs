@@ -90,8 +90,11 @@ thread_local! {
 }
 
 /// 安装标准 Edit 菜单(见 [`standard_edit_menu_items`] 的文档):没有它,webview 里 ⌘A/⌘C/⌘V/⌘X 全都不能用。
-/// 仅主线程;**幂等**(装过就不再装)。应用自己没有主菜单时会新建一个只含 Edit 的主菜单;
-/// 返回是否这次真的装了。
+/// 仅主线程;**幂等**(装过就不再装)。
+///
+/// **不替换主菜单**:winit 在 macOS 上默认装了带「退出 ⌘Q」「隐藏 ⌘H」的应用菜单,整个换掉会让这些快捷键失效。
+/// 这里只在现有主菜单后面**追加** Edit;应用确实没有主菜单时才新建一个(带一个空的应用菜单占位)。
+/// 已经有名为 `Edit` 的菜单(应用自己装过)就不再追加。返回是否这次真的装了。
 pub fn install_standard_edit_menu() -> bool {
     use objc2::sel;
     use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
@@ -104,9 +107,23 @@ pub fn install_standard_edit_menu() -> bool {
         return false;
     }
     let app = NSApplication::sharedApplication(mtm);
-    let main = NSMenu::new(mtm);
-    // 主菜单的第一项是应用菜单的位置,留一个空的占位。
-    main.addItem(&NSMenuItem::new(mtm));
+    let main = match app.mainMenu() {
+        Some(existing) => existing,
+        None => {
+            let created = NSMenu::new(mtm);
+            // 主菜单的第一项是应用菜单的位置,留一个空的占位。
+            created.addItem(&NSMenuItem::new(mtm));
+            app.setMainMenu(Some(&created));
+            created
+        }
+    };
+    let already_has_edit = main.itemArray().iter().any(|item| {
+        item.submenu()
+            .is_some_and(|submenu| submenu.title().to_string() == "Edit")
+    });
+    if already_has_edit {
+        return false;
+    }
     let edit_holder = NSMenuItem::new(mtm);
     main.addItem(&edit_holder);
     let edit = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Edit"));
@@ -116,6 +133,7 @@ pub fn install_standard_edit_menu() -> bool {
             "copy:" => sel!(copy:),
             "paste:" => sel!(paste:),
             "selectAll:" => sel!(selectAll:),
+            "performTextFinderAction:" => sel!(performTextFinderAction:),
             other => unreachable!("未知的 Edit 菜单选择器 {other}"),
         };
         let menu_item = unsafe {
@@ -126,10 +144,10 @@ pub fn install_standard_edit_menu() -> bool {
                 &NSString::from_str(item.key),
             )
         };
+        menu_item.setTag(item.tag);
         edit.addItem(&menu_item);
     }
     edit_holder.setSubmenu(Some(&edit));
-    app.setMainMenu(Some(&main));
     true
 }
 
@@ -159,5 +177,29 @@ mod tests {
         ] {
             assert!(prod.contains(required), "缺少 {required}");
         }
+    }
+
+    /// 不得整个替换应用主菜单(会丢掉 winit 默认装的「退出 ⌘Q」「隐藏 ⌘H」);只有应用没有主菜单时才新建。
+    #[test]
+    fn the_edit_menu_is_appended_to_the_existing_main_menu_not_replacing_it() {
+        let src = include_str!("apple.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let install = &prod[prod.find("pub fn install_standard_edit_menu").unwrap()..];
+        assert!(install.contains("app.mainMenu()"), "必须先读现有主菜单");
+        assert_eq!(
+            install.matches("setMainMenu(").count(),
+            1,
+            "setMainMenu 只能出现一次(新建分支里)"
+        );
+        let set_at = install.find("setMainMenu(").unwrap();
+        let none_at = install.find("None =>").unwrap();
+        assert!(
+            set_at > none_at,
+            "setMainMenu 只能在「没有主菜单」的分支里调用"
+        );
+        assert!(
+            install.contains("already_has_edit"),
+            "已有 Edit 菜单不得重复追加"
+        );
     }
 }
