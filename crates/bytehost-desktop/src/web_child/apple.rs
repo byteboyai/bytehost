@@ -133,7 +133,6 @@ pub fn install_standard_edit_menu() -> bool {
             "copy:" => sel!(copy:),
             "paste:" => sel!(paste:),
             "selectAll:" => sel!(selectAll:),
-            "performTextFinderAction:" => sel!(performTextFinderAction:),
             other => unreachable!("未知的 Edit 菜单选择器 {other}"),
         };
         let menu_item = unsafe {
@@ -144,7 +143,6 @@ pub fn install_standard_edit_menu() -> bool {
                 &NSString::from_str(item.key),
             )
         };
-        menu_item.setTag(item.tag);
         edit.addItem(&menu_item);
     }
     edit_holder.setSubmenu(Some(&edit));
