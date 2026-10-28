@@ -77,6 +77,13 @@ pub enum WebEvent {
         id: usize,
         url: String,
     },
+    /// 一次页内查找结束:`query` 是当时查的词(宿主用它丢弃慢的旧结果),`matched` 是有没有命中。
+    FindResult {
+        generation: u64,
+        id: usize,
+        query: String,
+        matched: bool,
+    },
 }
 
 struct Tab {
@@ -222,8 +229,8 @@ impl WebPool {
         })
     }
 
-    /// 在页签 `tab` 的页面里查找 `query`(命中就选中并滚动过去;`backwards` 往前找,恒回绕)。返回有没有这个页签;
-    /// 查找结束时 `done(是否命中)` 回调(主线程)。同一个 `query` 再调一次就是「下一个」。主线程。
+    /// 在页签 `tab` 的页面里查找 `query`(命中就选中并滚动过去;`backwards` 往前找,恒回绕)。返回有没有这个页签。
+    /// 查找结束时经池的事件通道送出 [`WebEvent::FindResult`]。同一个 `query` 再调一次就是「下一个」。主线程。
     pub fn find(
         &self,
         generation: u64,
@@ -231,8 +238,17 @@ impl WebPool {
         query: &str,
         backwards: bool,
         case_sensitive: bool,
-        done: impl Fn(bool) + 'static,
     ) -> bool {
+        let events = self.events.clone();
+        let asked = query.to_owned();
+        let done = move |matched: bool| {
+            let _ = events.send(WebEvent::FindResult {
+                generation,
+                id: tab,
+                query: asked.clone(),
+                matched,
+            });
+        };
         self.with_view(generation, tab, |view| {
             #[cfg(target_os = "macos")]
             super::apple::find_string(view, query, backwards, case_sensitive, done);
@@ -243,6 +259,38 @@ impl WebPool {
             }
         })
         .is_some()
+    }
+
+    /// `Task` 版的 [`find`](Self::find)(iced 宿主,在 `window::run` 里跑)。
+    pub fn find_task<E: Send + 'static>(
+        &self,
+        id: window::Id,
+        generation: u64,
+        tab: usize,
+        query: String,
+        backwards: bool,
+        done: E,
+    ) -> Task<E> {
+        let pool = self.handle();
+        window::run(id, move |_| {
+            pool.find(generation, tab, &query, backwards, false);
+            done
+        })
+    }
+
+    /// `Task` 版的 [`clear_find`](Self::clear_find)。
+    pub fn clear_find_task<E: Send + 'static>(
+        &self,
+        id: window::Id,
+        generation: u64,
+        tab: usize,
+        done: E,
+    ) -> Task<E> {
+        let pool = self.handle();
+        window::run(id, move |_| {
+            pool.clear_find(generation, tab);
+            done
+        })
     }
 
     /// 关掉查找条时清掉页面里的命中选区(宿主侧 `evaluate_script`,不向页面注入任何持久脚本)。主线程。
@@ -609,6 +657,9 @@ mod tests {
             "pool.apply(&window, generation, &desired, rect, scale)",
             "pool.navigate_now(generation, tab, nav)",
             "pool.destroy_all_now()",
+            "pool.find(generation, tab, &query, backwards, false)",
+            "pool.clear_find(generation, tab)",
+            "WebEvent::FindResult {",
             // 必须是**调用点**:非 macOS 的空实现定义里也有 `install_media_deny_proxy(`,只认函数名会漏掉"删掉调用"。
             "= install_media_deny_proxy(&view)",
             "build_as_child(",
