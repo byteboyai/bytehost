@@ -10,6 +10,8 @@
 //! - [`shell`]:`HostMessage<M>`、`Product<M>` trait 与窗口壳;
 //! - [`panel`]:窗口生命周期与 wry 子视图的创建/驱动(主线程 thread_local 句柄);
 //! - [`app_webview`]:应用 webview 的**受限 builder**(唯一一份 wry 应用初始化代码);
+//! - [`native_child`]:**可信**原生子 webview(按 URL 导航、固定可信 origin)的执行器——
+//!   与 [`panel`](推 HTML + 脚本的面板 surface)是两种模型;
 //! - [`dispatch`]:Tokio 执行器与 iced 结果投递适配;
 //! - [`surface`]:Surface 生命周期状态机执行、`(instance, slot, generation)` 路由与几何。
 //! - [`layout`]:产品历史布局 → 稳定 `Layout` 的迁移流程(版本闸门 / 未知保留 / 原子落盘)。
@@ -26,6 +28,7 @@ pub mod dispatch;
 pub mod focus;
 pub mod hover;
 pub mod layout;
+pub mod native_child;
 pub mod overlay;
 #[cfg(feature = "overlay")]
 pub mod overlay_gpu;
