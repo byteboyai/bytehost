@@ -7,8 +7,11 @@
 //! - 应用语言桥的只读快照/脚本纯策略([`i18n`]);
 //! - 卸载"连数据一起删"时数据存储清除的排队([`StoreRemovals`])与系统版本门槛([`supports_store_removal`])。
 //!
+//! - 浏览器面板里**任意网页**的导航白名单([`browse::allows_browse_navigation`]):页面内容是不可信的,与上面按应用 origin 圈定的策略不是一回事;
+//!
 //! **不**依赖 wry/iced/objc2/tauri:真正创建 webview、取系统版本号、画界面都在宿主里。
 
+pub mod browse;
 pub mod i18n;
 
 use std::collections::HashMap;
