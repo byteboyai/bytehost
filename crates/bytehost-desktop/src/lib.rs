@@ -36,6 +36,7 @@ pub mod panel;
 pub mod panes;
 pub mod shell;
 pub mod surface;
+pub mod web_child;
 
 pub use app_webview::{
     AppSurfaceBuilt, AppSurfaceIpc, AppSurfaceSpec, app_handle_count, build_app_child, destroy_app,
