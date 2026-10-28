@@ -287,7 +287,8 @@ fn apply_sync(
                 PoolAction::Create { id, url, visible } => {
                     let target = target_or_block(events, generation, id, &url);
                     let (view, guard) = build_tab(
-                        window, generation, id, &target, visible, rect, scale, events, tracker,
+                        window, slot, generation, id, &target, visible, rect, scale, events,
+                        tracker,
                     )?;
                     state.tabs.insert(
                         id,
@@ -357,6 +358,29 @@ fn target_or_block(events: &Sender<WebEvent>, generation: u64, id: usize, url: &
     })
 }
 
+/// 页面自己跳转(点链接、重定向)之后,池里记的"这个页签现在在哪"要跟着变:宿主收到 `PageLoaded` 会把
+/// 页签网址改成页面实际所在的地址再回灌,如果池还记着旧地址,下一次同步会把**同一页**再导航一遍(白刷新)。
+/// 回调可能在持有池表的同步过程中被触发,拿不到借用就跳过(那一轮同步本来就在对齐网址)。
+fn remember_page_url(slot: u64, generation: u64, id: usize, url: &str) {
+    POOLS.with(|pools| {
+        let Ok(mut pools) = pools.try_borrow_mut() else {
+            return;
+        };
+        if let Some(tab) = pools
+            .get_mut(&slot)
+            .filter(|s| s.generation == generation)
+            .and_then(|s| s.tabs.get_mut(&id))
+        {
+            // 被挡下的网址显示的是 `about:blank`:这次空白页加载**不是**页面自己跳转,记录要保持"要求的网址"
+            // 不变,否则下一次同步看到记录 ≠ 期望,会把同一个被挡的网址再挡一遍、再报一次。
+            if url == "about:blank" && wry_target(&tab.url).is_none() {
+                return;
+            }
+            tab.url = url.to_owned();
+        }
+    });
+}
+
 fn note_navigation(tracker: &Arc<Mutex<NavTracker>>, id: usize, target: &str, now: Instant) {
     // `about:blank` 不走网络,页面提交很快但不一定触发 Started——不追踪,免得误报"没有响应"。
     if target == "about:blank" {
@@ -370,6 +394,7 @@ fn note_navigation(tracker: &Arc<Mutex<NavTracker>>, id: usize, target: &str, no
 #[allow(clippy::too_many_arguments)]
 fn build_tab(
     window: &dyn window::Window,
+    slot: u64,
     generation: u64,
     id: usize,
     target: &str,
@@ -409,6 +434,7 @@ fn build_tab(
                 .map(|mut t| t.on_page_load(id, &url))
                 .unwrap_or(LoadVerdict::Forward);
             if verdict == LoadVerdict::Forward && matches!(event, wry::PageLoadEvent::Finished) {
+                remember_page_url(slot, generation, id, &url);
                 let _ = load_tx.send(WebEvent::PageLoaded {
                     generation,
                     id,
@@ -445,6 +471,7 @@ mod tests {
             "wry::NewWindowResponse::Deny",
             "wry_target(",
             ".on_page_load(id, &url)",
+            "remember_page_url(slot, generation, id, &url)",
             // 必须是**调用点**:非 macOS 的空实现定义里也有 `install_media_deny_proxy(`,只认函数名会漏掉"删掉调用"。
             "= install_media_deny_proxy(&view)",
             "build_as_child(",
