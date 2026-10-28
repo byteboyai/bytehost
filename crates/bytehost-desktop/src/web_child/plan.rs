@@ -1,5 +1,6 @@
 //! 浏览器页签池的**纯逻辑**:动作规划与"导航迟迟没有响应"的追踪。不依赖 wry/iced,可以直接单测。
 
+use bytehost_webview::browse::{allows_browse_navigation, encode_for_wry};
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -85,6 +86,15 @@ pub fn plan_pool(existing: &[ExistingTab], desired: &[WebTabSpec]) -> Vec<PoolAc
     actions
 }
 
+/// 页签的网址 → 真正交给 wry 的地址:先百分号编码([`encode_for_wry`]),再过导航白名单
+/// ([`allows_browse_navigation`])。**不被允许的返回 `None`**,池把它换成 `about:blank` 并报告
+/// `NavigationBlocked`。必须在池这一层挡一道,因为地址栏会原样接受带单冒号 scheme 的输入
+/// (`javascript:`、`data:`、`mailto:`…),库因此会建出这样的页签。
+pub fn wry_target(url: &str) -> Option<String> {
+    let encoded = encode_for_wry(url);
+    allows_browse_navigation(&encoded).then_some(encoded)
+}
+
 /// 带"换代"的规划。`generation_changed` 为真(切项目 / 关项目)时,**全部销毁再重建**——
 /// 页签 id 是每个 `Tabs` 自己的计数器,不同项目会撞号,按 id 复用会把 A 项目的页面当成 B 项目的。
 pub fn plan_sync(
@@ -101,6 +111,15 @@ pub fn plan_sync(
         .collect();
     actions.extend(plan_pool(&[], desired));
     actions
+}
+
+/// [`NavTracker::on_page_load`] 的结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadVerdict {
+    /// 真实的页面加载:清掉挂起的导航,回报宿主。
+    Forward,
+    /// 不可达地址带来的初始空白文档:不清追踪、不回报。
+    Ignore,
 }
 
 /// wry 没有"导航失败"回调:访问不可达地址时 `Started`/`Finished` 都不会触发(探针 S1 实测),
@@ -130,6 +149,21 @@ impl NavTracker {
     /// 页签 `id` 的页面开始加载(`on_page_load` 的 `Started`):清掉挂起的导航。没有挂起的就忽略。
     pub fn started(&mut self, id: usize) {
         self.pending.remove(&id);
+    }
+
+    /// 页面加载事件(`Started` 和 `Finished` 都走这里)到达:决定它算不算"导航真的开始了"、要不要回报宿主。
+    ///
+    /// **空白文档是个陷阱**:访问不可达地址时 WebKit 先落一个初始 `about:blank` 文档,wry 为它发
+    /// `Started`/`Finished about:blank`(探针 S1、池冒烟实测)。若把它当成导航开始,真正的失败就被掩盖了;
+    /// 若把它当成 `PageLoaded` 回报,库会把页签网址覆盖成空白,用户敲的地址就悄悄消失、也没有任何错误。
+    /// 所以:有真实导航挂起时,`about:blank` 一律忽略;其它地址(含重定向后的、与发出的不同的)才算开始。
+    /// 没有挂起的导航时 `about:blank` 是真的(空白页签、链接指向空白页),照常回报。
+    pub fn on_page_load(&mut self, id: usize, url: &str) -> LoadVerdict {
+        if url == "about:blank" && self.pending.contains_key(&id) {
+            return LoadVerdict::Ignore;
+        }
+        self.pending.remove(&id);
+        LoadVerdict::Forward
     }
 
     /// 页签被销毁。
@@ -489,5 +523,73 @@ mod tests {
             ]
         );
         tracker.started(9); // 没有挂起的导航:忽略,不 panic
+    }
+
+    // —— wry_target:交给 wry 的最终地址 ——
+
+    #[test]
+    fn wry_target_encodes_allowed_urls_and_blocks_the_rest() {
+        assert_eq!(
+            wry_target("file:///Users/me/My File.html").as_deref(),
+            Some("file:///Users/me/My%20File.html")
+        );
+        assert_eq!(
+            wry_target("https://a.com").as_deref(),
+            Some("https://a.com/")
+        );
+        assert_eq!(wry_target("about:blank").as_deref(), Some("about:blank"));
+        // 地址栏会原样接受带单冒号 scheme 的输入(`javascript:`、`data:`、`mailto:`…),
+        // 库因此会建出这样的页签——池绝不能把它们交给 wry。
+        for url in [
+            "javascript:alert(1)",
+            "data:text/html,<script>1</script>",
+            "mailto:a@b.c",
+            "dozer://a/b",
+            "file://evil/share/x.html",
+            "",
+            "not a url",
+        ] {
+            assert_eq!(wry_target(url), None, "{url:?}");
+        }
+    }
+
+    // —— 不可达地址会先提交一个初始 about:blank 文档(探针 S1 与池冒烟实测) ——
+
+    #[test]
+    fn the_initial_blank_document_does_not_clear_a_pending_navigation() {
+        let t0 = Instant::now();
+        let mut tracker = NavTracker::new(T);
+        tracker.navigate(1, "http://127.0.0.1:9/never".into(), t0);
+        // 不可达的导航会先落一个空白文档,wry 为它发 `Started`/`Finished about:blank`。
+        assert_eq!(tracker.on_page_load(1, "about:blank"), LoadVerdict::Ignore);
+        assert_eq!(
+            tracker.poll(t0 + T),
+            vec![(1, "http://127.0.0.1:9/never".to_string())],
+            "空白文档不算'导航开始了',必须仍然报告没有响应"
+        );
+    }
+
+    #[test]
+    fn a_real_page_load_clears_the_pending_navigation_and_is_forwarded() {
+        let t0 = Instant::now();
+        let mut tracker = NavTracker::new(T);
+        tracker.navigate(1, "https://a.com/".into(), t0);
+        // 重定向后地址可以和发出的不同,所以不比较 URL,只看不是空白文档。
+        assert_eq!(
+            tracker.on_page_load(1, "https://www.a.com/home"),
+            LoadVerdict::Forward
+        );
+        assert!(tracker.poll(t0 + T * 3).is_empty());
+    }
+
+    #[test]
+    fn about_blank_is_forwarded_when_no_navigation_is_pending() {
+        // 例如用户点了一个指向 about:blank 的链接,或者刚建好的空白页签:这时空白是真的。
+        let mut tracker = NavTracker::new(T);
+        assert_eq!(tracker.on_page_load(1, "about:blank"), LoadVerdict::Forward);
+        // 另一个页签有挂起的导航,不影响这个页签的判断。
+        tracker.navigate(2, "https://dead.example/".into(), Instant::now());
+        assert_eq!(tracker.on_page_load(1, "about:blank"), LoadVerdict::Forward);
+        assert_eq!(tracker.on_page_load(2, "about:blank"), LoadVerdict::Ignore);
     }
 }

@@ -40,6 +40,13 @@ iced_winit = { version = "0.14", optional = true }
 iced_widget = { version = "0.14", optional = true, features = ["wgpu", "canvas", "svg", "markdown", "highlighter", "image"] }
 iced_renderer = { version = "0.14", optional = true }
 
+# 浏览器页面池(`web_child`)在 macOS 上的两处原生胶水:拒绝媒体捕获的 UI 委托代理(wry 对所有来源
+# 无条件 Grant)与标准 Edit 菜单。仅 Apple 平台;features 与 wry 自己用的那一套对齐,不开 `all`。
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "WKWebView", "WKUIDelegate", "WKFrameInfo", "WKSecurityOrigin"] }
+
 [features]
 default = []
 overlay = [

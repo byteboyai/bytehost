@@ -5,8 +5,16 @@
 //! 不注册任何自定义协议、不注入脚本、不装 IPC 处理器(页面看不到 `window.ipc`);导航与新窗口只放行
 //! `bytehost_webview::browse` 的白名单;下载一律拒绝;开发者工具关闭。
 
+#[cfg(target_os = "macos")]
+mod apple;
 pub mod edit_menu;
 pub mod plan;
+mod pool;
 
+#[cfg(target_os = "macos")]
+pub use apple::install_standard_edit_menu;
 pub use edit_menu::{EditItem, standard_edit_menu_items};
-pub use plan::{ExistingTab, NavTracker, PoolAction, WebTabSpec, plan_pool, plan_sync};
+pub use plan::{
+    ExistingTab, LoadVerdict, NavTracker, PoolAction, WebTabSpec, plan_pool, plan_sync, wry_target,
+};
+pub use pool::{NAV_STALL_TIMEOUT, WebEvent, WebNav, WebPool};

@@ -323,7 +323,7 @@ pub struct Probe {
     pub handles: usize,
 }
 #[cfg(target_os = "macos")]
-fn inspect(view: &wry::WebView, probe: &mut Probe) {
+pub(crate) fn inspect(view: &wry::WebView, probe: &mut Probe) {
     use wry::WebViewExtMacOS;
     let ns = view.webview();
     let frame = ns.frame();
@@ -339,7 +339,7 @@ fn inspect(view: &wry::WebView, probe: &mut Probe) {
     probe.visible = !ns.isHidden();
 }
 #[cfg(not(target_os = "macos"))]
-fn inspect(view: &wry::WebView, probe: &mut Probe) {
+pub(crate) fn inspect(view: &wry::WebView, probe: &mut Probe) {
     // wry exposes no cross-platform native visibility getter.
     probe.bounds = view.bounds().ok().map(|r| {
         let p = r.position.to_logical::<f64>(1.);
@@ -348,7 +348,7 @@ fn inspect(view: &wry::WebView, probe: &mut Probe) {
     });
 }
 #[cfg(target_os = "macos")]
-fn restore_focus(view: &wry::WebView) {
+pub(crate) fn restore_focus(view: &wry::WebView) {
     use wry::WebViewExtMacOS;
     // window::run supplies main-thread execution; the child is still alive here.
     if let Some(window) = view.webview().window()
@@ -358,7 +358,7 @@ fn restore_focus(view: &wry::WebView) {
     }
 }
 #[cfg(not(target_os = "macos"))]
-fn restore_focus(_: &wry::WebView) {}
+pub(crate) fn restore_focus(_: &wry::WebView) {}
 fn parked_bounds(mut rect: LogicalRect) -> wry::Rect {
     rect.x = -100_000.;
     rect.y = -100_000.;

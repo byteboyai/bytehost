@@ -291,6 +291,7 @@ dependencies = [
 name = "bytehost-desktop"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "bytehost-core",
  "bytehost-webview",
  "iced",
@@ -298,8 +299,10 @@ dependencies = [
  "iced_wgpu",
  "iced_widget",
  "iced_winit",
+ "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "objc2-web-kit",
  "raw-window-handle",
  "serde",
  "serde_json",
