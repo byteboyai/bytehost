@@ -51,6 +51,12 @@ zip = { version = "8.6", default-features = false, features = ["deflate"], optio
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", default-features = false, optional = true }
 
+[[example]]
+# gateway 基准(Tier4 Task0):需要 `server`(gateway 本身在 server feature 里)。
+name = "gateway_bench"
+path = "examples/gateway_bench.rs"
+required-features = ["server"]
+
 [dev-dependencies]
 tempfile = "3"
 # 测试里用 tokio 的 `#[tokio::test]`;`tokio` 本身在 `server` feature 下才是依赖
