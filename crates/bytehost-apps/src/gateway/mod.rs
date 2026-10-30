@@ -329,6 +329,11 @@ async fn accept_loop(
                                 .path_and_query()
                                 .map(|p| p.as_str().to_string())
                                 .unwrap_or_else(|| "/".to_string());
+                            // Tier4 Task2 调查结论:**保留**。`route` → `serve_static` 里的
+                            // `std::fs::read` 是真正的阻塞文件 I/O(整文件读入),放回 async
+                            // worker 会占住 executor 线程;闭包内其余步骤(Host/令牌校验、
+                            // 按应用派生令牌的 sha256 比较、路径解析)都是微秒级纯 CPU,
+                            // 拆成两段调度只会多一次开销。
                             let routing_state = state.clone();
                             let routed = tokio::task::spawn_blocking(move || {
                                 route(
