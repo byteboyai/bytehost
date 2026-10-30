@@ -177,17 +177,23 @@ impl From<ManifestError> for ManagerError {
 /// 抽出来是为了让监管线程能持有 `Arc<Core>`(Task 5 的 `AppTransitions`),`AppManager` 本身经 `Deref` 直接用它。
 ///
 /// `AppManager` 不再 `Deref` 到它(Tier3 Task1):对外只有 `AppManager` 的显式方法,
-/// `Core` 由本 crate 私有,宿主层拿不到锁与字段。内部方法(`guard`/`try_guard`/`*_locked` 等)
+/// `Core` 由本 crate 私有,宿主层拿不到锁与字段。内部方法(`lock_app`/`try_lock_app`/`lock_all`/`*_locked` 等)
 /// 为 `pub(crate)`。
 pub(crate) struct Core {
     registry: Registry,
     gateway: Arc<Gateway>,
     host_version: Version,
     events: broadcast::Sender<AppEvent>,
-    /// 单写者锁:所有改状态的方法都先拿它。
-    lock: Mutex<()>,
-    /// 等锁通知(与 `lock` 分开的独立小锁):`WriteGuard` 释放锁、或 `stop`/`suspend_all`
-    /// 取消监管线程时 `notify_all`。等待者**不能**阻塞在 `lock` 上——持锁方 join 监管线程,
+    /// **全局生命周期闸**:per-app 操作持读锁,`reconcile`/`suspend_all` 持写锁。
+    /// 不同应用的 per-app 操作因此可以并行;整体对账/停机仍与所有 per-app 操作互斥。
+    lifecycle: std::sync::RwLock<()>,
+    /// per-app 写锁的分片表(按 `AppId` 哈希取一片):同一应用串行,不同应用基本并行。
+    /// 用固定分片而不是 `HashMap<AppId, Mutex>` 是为了让 guard 直接借用 `&self` 里的
+    /// 稳定地址(`MutexGuard` 不能从临时 `Arc` 借出并返回)。代价是哈希碰撞的两个应用
+    /// 会偶尔串行——只是少一点并行度,不影响正确性。
+    app_locks: Vec<Mutex<()>>,
+    /// 等锁通知(与上面两把锁分开的独立小锁):guard 释放锁、或 `stop`/`suspend_all`
+    /// 取消监管线程时 `notify_all`。等待者**不能**阻塞在锁上——持锁方 join 监管线程,
     /// 那样必死锁;这里等的是"锁可能已释放 / 已取消"的通知。
     lock_released_mutex: Mutex<()>,
     lock_released: std::sync::Condvar,
@@ -195,7 +201,6 @@ pub(crate) struct Core {
     /// 一个恰好排在锁后面的 `Start` 不能在撤站点之后又把站点注册回已停止的 gateway。
     closed: std::sync::atomic::AtomicBool,
     /// 把解释器名解析成绝对路径(进程型应用)。
-    #[allow(dead_code)]
     resolver: Arc<dyn RuntimeResolver>,
     /// 探解释器版本(进程型应用的版本要求校验)。
     version_probe: Arc<dyn VersionProbe>,
@@ -203,17 +208,14 @@ pub(crate) struct Core {
     /// 按应用登记 `(解释器路径, 输出)`,启动检查取走即删;`start` 返回时一律清掉,避免陈旧结果被下次启动复用。
     prefetched_versions: Mutex<HashMap<AppId, (PathBuf, Option<String>)>>,
     /// 每个应用当前"看得懂的问题"(运行时缺失/版本不符);只存内存,只在应用 `Failed` 时经 `list` 带出。
-    #[allow(dead_code)]
     issues: Mutex<HashMap<AppId, AppIssue>>,
     /// 进程型应用崩溃后的重启策略(默认 `RestartPolicy::default()`;测试里注入小退避)。
     policy: crate::process::restart::RestartPolicy,
     /// 运行中周期健康检查的参数(默认 `DEFAULT_MONITOR_*`;测试里调小以便观察)。
     monitor: MonitorConfig,
     /// 下载 URL 来源的归档(默认 `CurlFetcher`;测试里注入假实现)。
-    #[allow(dead_code)]
     fetcher: Arc<dyn Fetcher>,
     /// 每个应用当前那条监管线程(`cancel` 标志 + 句柄)。静态应用不登记。
-    #[allow(dead_code)]
     supervisions: Mutex<HashMap<AppId, Supervision>>,
     /// 指向自己的 `Arc`(经 `Arc::new_cyclic` 装填):监管线程需要一份 `Arc<Core>` 才能回报状态,
     /// 而 `start_process_locked` 只有 `&Core`。用 `Weak` 打破强引用环。
@@ -275,13 +277,13 @@ struct AppTransitions {
 
 impl AppTransitions {
     /// 拿单写者锁(尝试循环),拿到后核对取消标志。返回 `None` = 已取消,调用方必须放弃写入。
-    fn acquire(&self) -> Option<WriteGuard<'_>> {
+    fn acquire(&self) -> Option<AppWriteGuard<'_>> {
         use std::sync::atomic::Ordering;
         let g = loop {
             if self.cancel.load(Ordering::SeqCst) {
                 return None;
             }
-            if let Some(g) = self.core.try_guard() {
+            if let Some(g) = self.core.try_lock_app(&self.id) {
                 break g;
             }
             // 等"锁已释放 / 已被取消"的通知(取消时 `stop`/`suspend_all` 会主动唤醒)。
@@ -700,7 +702,8 @@ impl AppManager {
                 gateway,
                 host_version,
                 events,
-                lock: Mutex::new(()),
+                lifecycle: std::sync::RwLock::new(()),
+                app_locks: (0..APP_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
                 lock_released_mutex: Mutex::new(()),
                 lock_released: std::sync::Condvar::new(),
                 closed: std::sync::atomic::AtomicBool::new(false),
@@ -862,43 +865,109 @@ impl AppManager {
     }
 }
 
-/// 等锁通知的兜底间隔。正常路径由 [`WriteGuard`] 的 Drop 或取消时主动唤醒(微秒级);
+/// 等锁通知的兜底间隔。正常路径由 guard 的 Drop 或取消时主动唤醒(微秒级);
 /// 这个超时只兜"通知刚好错过"的竞态(通知不是粘性的)。
 const LOCK_WAIT_FALLBACK: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// 单写者锁的 guard:Drop 时唤醒正在等锁的监管线程。
+/// per-app 锁的分片数。远大于并发改状态的应用数;碰撞只降低并行度。
+const APP_LOCK_SHARDS: usize = 64;
+
+/// 一个 per-app 写锁 + 全局读锁的组合 guard。
 ///
-/// 返回这个(而不是裸 `MutexGuard`)是为了让"释放锁"自动带一次通知——等待者不能轮询
-/// (见 [`Core::lock_released`] 的注释),只能靠通知;漏掉任何一条释放路径都会让监管线程
-/// 白等到兜底超时。
-struct WriteGuard<'a> {
-    inner: Option<std::sync::MutexGuard<'a, ()>>,
+/// Drop 顺序:先放 app 锁、再放全局读锁,最后通知等待者——等待者被唤醒后会立刻
+/// `try_lock`,此时两把锁都必须已经可用。
+struct AppWriteGuard<'a> {
+    app: Option<std::sync::MutexGuard<'a, ()>>,
+    lifecycle: Option<std::sync::RwLockReadGuard<'a, ()>>,
     released: &'a std::sync::Condvar,
 }
 
-impl Drop for WriteGuard<'_> {
+impl Drop for AppWriteGuard<'_> {
     fn drop(&mut self) {
-        // 先放锁再通知:等待者被唤醒后会立刻 `try_lock`,此时锁必须已经可用。
-        drop(self.inner.take());
+        drop(self.app.take());
+        drop(self.lifecycle.take());
+        self.released.notify_all();
+    }
+}
+
+/// 全局写锁 guard(`reconcile`/`suspend_all`),与所有 per-app 操作互斥。
+struct AllWriteGuard<'a> {
+    lifecycle: Option<std::sync::RwLockWriteGuard<'a, ()>>,
+    released: &'a std::sync::Condvar,
+}
+
+impl Drop for AllWriteGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.lifecycle.take());
         self.released.notify_all();
     }
 }
 
 impl Core {
-    /// 单写者锁。持锁线程 panic 会毒化它,但它保护的是 `()`(锁住的是"同一时刻只有一个改状态的操作",
-    /// 没有需要保持的数据不变量),所以取回内部数据继续用,不能让此后每个加锁的调用都跟着 panic。
-    fn guard(&self) -> WriteGuard<'_> {
-        let inner = self
-            .lock
+    /// 某应用落到哪一片锁上(同一应用恒定同一片,不同应用尽量不同片)。
+    fn app_lock(&self, id: &AppId) -> &Mutex<()> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut hasher);
+        &self.app_locks[(hasher.finish() as usize) % self.app_locks.len()]
+    }
+
+    /// per-app 写锁(阻塞):同一应用串行,不同应用并行;持有全局读锁,
+    /// 因此不会与 `reconcile`/`suspend_all` 并发。
+    ///
+    /// 锁保护的只是"同一时刻只有一个改状态的操作",没有需要保持的数据不变量;
+    /// 持锁线程 panic 毒化后取回内部数据继续用,不能让此后每个调用都跟着 panic。
+    fn lock_app(&self, id: &AppId) -> AppWriteGuard<'_> {
+        let lifecycle = self
+            .lifecycle
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let app = self.app_lock(id);
+        let guard = app
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        WriteGuard {
-            inner: Some(inner),
+        AppWriteGuard {
+            app: Some(guard),
+            lifecycle: Some(lifecycle),
             released: &self.lock_released,
         }
     }
 
-    /// 等一次等锁通知(超时返回)。调用方在 `try_guard` 失败后用它代替 sleep 轮询。
+    /// 非阻塞取 per-app 锁(毒化时同样取回内部数据)。监管线程用它"拿锁 + 查取消"
+    /// 循环,绝不阻塞在锁上——`stop`(持有该 app 锁)/`suspend_all`(持有全局写锁)
+    /// 会 `join` 监管线程,线程若阻塞等锁就是死锁。
+    fn try_lock_app(&self, id: &AppId) -> Option<AppWriteGuard<'_>> {
+        let lifecycle = match self.lifecycle.try_read() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let app = self.app_lock(id);
+        let guard = match app.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(AppWriteGuard {
+            app: Some(guard),
+            lifecycle: Some(lifecycle),
+            released: &self.lock_released,
+        })
+    }
+
+    /// 全局写锁:`reconcile`/`suspend_all` 用,排除所有 per-app 操作。
+    fn lock_all(&self) -> AllWriteGuard<'_> {
+        let lifecycle = self
+            .lifecycle
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        AllWriteGuard {
+            lifecycle: Some(lifecycle),
+            released: &self.lock_released,
+        }
+    }
+
+    /// 等一次等锁通知(超时返回)。调用方在 `try_lock_app` 失败后用它代替 sleep 轮询。
     fn wait_for_lock_release(&self, timeout: std::time::Duration) {
         let mutex = self
             .lock_released_mutex
@@ -908,24 +977,9 @@ impl Core {
         drop(self.lock_released.wait_timeout(mutex, timeout));
     }
 
-    /// 唤醒所有正在等单写者锁的监管线程(取消时调用,让它们立刻看到 `cancel`)。
+    /// 唤醒所有正在等锁的监管线程(取消时调用,让它们立刻看到 `cancel`)。
     fn wake_lock_waiters(&self) {
         self.lock_released.notify_all();
-    }
-
-    /// 非阻塞取锁(毒化时同样取回内部数据)。监管线程用它"拿锁 + 查取消"循环,绝不阻塞在锁上——
-    /// `stop_locked`/`suspend_all` 会持着锁 `join` 监管线程,线程若阻塞等锁就是死锁。
-    #[allow(dead_code)]
-    fn try_guard(&self) -> Option<WriteGuard<'_>> {
-        let inner = match self.lock.try_lock() {
-            Ok(g) => g,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
-        Some(WriteGuard {
-            inner: Some(inner),
-            released: &self.lock_released,
-        })
     }
 
     fn emit(&self, event: AppEvent) {
@@ -1047,7 +1101,7 @@ impl Core {
                 #[cfg(test)]
                 self.prepared
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let _guard = self.guard();
+                let _guard = self.lock_app(&approved.plan().app_id);
                 self.install_staged(approved, &staging, package, info, source, now_ms)
             });
         // 成功时 staging 已经改名走了,这里是空操作;失败时清掉
@@ -1357,7 +1411,7 @@ impl Core {
         // 版本探测可能阻塞数秒,放在锁外做;结果在锁内的检查里取用。
         self.prefetch_version_output(id);
         let result = {
-            let _guard = self.guard();
+            let _guard = self.lock_app(id);
             self.start_locked(id)
         };
         self.take_prefetched_version(id);
@@ -1809,7 +1863,7 @@ impl Core {
 
     /// 停止(也用来把 `Failed` 复位成 `Stopped`)。对已经停止的应用是空操作。
     pub(crate) fn stop(&self, id: &AppId) -> Result<(), ManagerError> {
-        let _guard = self.guard();
+        let _guard = self.lock_app(id);
         self.stop_locked(id)
     }
 
@@ -1841,7 +1895,7 @@ impl Core {
     }
     /// 用户手动回滚到上一版(wire `AppRequest::Rollback` 的落点)。
     pub(crate) fn rollback(&self, id: &AppId) -> Result<(), ManagerError> {
-        let _guard = self.guard();
+        let _guard = self.lock_app(id);
         self.rollback_locked(id, "用户手动回滚".to_string(), false, wall_now_ms())
     }
 
@@ -1918,14 +1972,14 @@ impl Core {
     }
 
     /// 试用期内应用进入 `Failed` 时,从**新线程**触发自动回滚。
-    /// 线程里用 `guard()` 阻塞取锁(它不是监管线程,不会与 `stop` 的持锁 `join` 自锁),
+    /// 线程里用 `lock_app()` 阻塞取锁(它不是监管线程,不会与 `stop` 的持锁 `join` 自锁),
     /// 拿到锁后**重新核对**才回滚(Review Focus 2)。
     fn spawn_auto_rollback(&self, id: AppId, failed_version: Version) {
         let core = self.self_arc();
         let _ = std::thread::Builder::new()
             .name(format!("bytehost-rollback-{id}"))
             .spawn(move || {
-                let _g = core.guard();
+                let _g = core.lock_app(&id);
                 // 重新核对:试用期还在、当前版本仍是失败的那个、确实处于 Failed、没在关闭。
                 if core.closed.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
@@ -1970,7 +2024,7 @@ impl Core {
 
     /// 卸载(不存在不算错误)。运行中先停。
     pub(crate) fn uninstall(&self, id: &AppId, mode: UninstallMode) -> Result<(), ManagerError> {
-        let _guard = self.guard();
+        let _guard = self.lock_app(id);
         if self.registry.load(id)?.is_none() {
             self.registry.uninstall(id, mode)?;
             self.clear_issue(id);
@@ -1989,7 +2043,7 @@ impl Core {
     /// 带令牌的启动地址,**只给正在运行的应用**(没运行的应用打开只会是 404)。在锁内判断并构造,
     /// 不会出现"刚判断完它在运行、构造地址前它被停掉"的空档。**秘密:不要写日志、不要广播。**
     pub(crate) fn launch_url_if_running(&self, id: &AppId) -> Result<String, ManagerError> {
-        let _guard = self.guard();
+        let _guard = self.lock_app(id);
         let record = self.load_record(id)?;
         match record.observed {
             ObservedState::Running => Ok(self.gateway.launch_url(id)),
@@ -2003,7 +2057,7 @@ impl Core {
     /// 读某应用日志的末尾(有界、已清洗)。未安装 → `NotInstalled`;日志不存在 → 空文本。
     /// 只在本机返回给 GUI,不写 dozerd 日志、不广播事件。
     pub(crate) fn logs(&self, id: &AppId, max_lines: u32) -> Result<(String, bool), ManagerError> {
-        let _guard = self.guard();
+        let _guard = self.lock_app(id);
         let _ = self.load_record(id)?;
         let tail = crate::logs::read_tail(&self.registry.paths().logs_dir(id), max_lines as usize)
             .map_err(|e| ManagerError::Io(io::Error::other(format!("读取应用日志失败:{e}"))))?;
@@ -2087,7 +2141,7 @@ impl Core {
     /// supervisor 退出前调用:撤下所有站点,把运行中的应用的观察态落成 `Stopped`,但**保留 `desired`**——
     /// 下次启动时 `reconcile` 会按 `desired = Running` 把它们重新拉起("应用跟随 dozerd")。
     pub(crate) fn suspend_all(&self) -> ReconcileReport {
-        let _guard = self.guard();
+        let _guard = self.lock_all();
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         // 第一阶段:置取消并收集所有监管线程句柄。线程拿锁用尝试循环,所以持锁 join 不会死锁;
         // 每个线程的收尾是并行的,总耗时 ≈ 最长的一个宽限,不是 N×宽限。
@@ -2140,7 +2194,7 @@ impl Core {
     /// supervisor 启动时调用:把持久化的观察态修正为现实(应用随 supervisor 一起停了),再按 `desired` 对账。
     /// 一个应用失败不影响其他应用;读不出来的记录(损坏的 `state.json`)单独报告,不会被悄悄忽略。
     pub(crate) fn reconcile(&self) -> ReconcileReport {
-        let _guard = self.guard();
+        let _guard = self.lock_all();
         // reconcile 代表 supervisor(重新)开始工作
         self.closed
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -3976,11 +4030,12 @@ source = "web/"
         let rig = rig().await;
         let core = rig.manager.core.clone();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let guard = core.guard();
+        let a = id("excalidraw");
+        let guard = core.lock_app(&a);
         let (tx, rx) = std::sync::mpsc::channel();
         let transitions = AppTransitions {
             core: core.clone(),
-            id: id("excalidraw"),
+            id: a.clone(),
             cancel: cancel.clone(),
         };
         let waiter = std::thread::spawn(move || {
@@ -4003,6 +4058,55 @@ source = "web/"
         );
     }
 
+    /// Tier3 Task1 的核心目标:锁粒度从"全局单写者"降到"每应用一把"。
+    /// 不同应用可以同时改状态;同一应用仍然串行。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_app_locks_let_different_apps_run_in_parallel() {
+        let rig = rig().await;
+        let core = rig.manager.core.clone();
+        let a = id("alpha");
+        // 分片哈希可能碰撞;挑一个落在不同分片上的 id 才算"不同应用"。
+        let b = (0..200)
+            .map(|i| id(&format!("app{i}")))
+            .find(|candidate| !std::ptr::eq(core.app_lock(&a), core.app_lock(candidate)))
+            .expect("64 个分片里应能找到不同片的应用");
+        let held = core.lock_app(&a);
+        assert!(
+            core.try_lock_app(&b).is_some(),
+            "不同应用不应被同一个写锁串行化"
+        );
+        assert!(
+            core.try_lock_app(&a).is_none(),
+            "同一应用的改状态操作仍必须串行"
+        );
+        drop(held);
+        assert!(core.try_lock_app(&a).is_some(), "释放后同应用可再取锁");
+    }
+
+    /// `reconcile`/`suspend_all` 走全局写锁:必须等所有 per-app 操作结束,
+    /// 期间新的 per-app 操作也不能插进来。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_operations_exclude_per_app_operations() {
+        let rig = rig().await;
+        let core = rig.manager.core.clone();
+        let a = id("alpha");
+        let held = core.lock_app(&a);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let global_core = core.clone();
+        let waiter = std::thread::spawn(move || {
+            let _g = global_core.lock_all();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "全局操作必须等 per-app 操作完成"
+        );
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("per-app 锁释放后全局锁应立刻可得");
+        waiter.join().unwrap();
+    }
+
     /// 取消必须能唤醒**正在等锁**的监管线程——`stop`/`suspend_all` 持着锁 join 线程,
     /// 线程若只等释放通知就永远看不到 cancel(旧实现的 5ms 轮询会迟到但最终退出)。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4010,11 +4114,12 @@ source = "web/"
         let rig = rig().await;
         let core = rig.manager.core.clone();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let guard = core.guard();
+        let a = id("excalidraw");
+        let guard = core.lock_app(&a);
         let (tx, rx) = std::sync::mpsc::channel();
         let transitions = AppTransitions {
             core: core.clone(),
-            id: id("excalidraw"),
+            id: a.clone(),
             cancel: cancel.clone(),
         };
         let waiter = std::thread::spawn(move || {
@@ -4073,7 +4178,7 @@ source = "web/"
             };
             rig.manager.core.registry.save(&record).unwrap();
 
-            let guard = rig.manager.core.guard();
+            let guard = rig.manager.core.lock_app(&a);
             rig.manager
                 .core
                 .spawn_auto_rollback(a.clone(), failed_version);
@@ -4438,7 +4543,12 @@ source = "web/"
         let src = write_app(&rig.src_dir("a"), "alpha", "1.0.0", "", "A");
         let approved = rig.approve(&src);
         let apps_dir = rig.manager.core.registry.paths().apps_dir();
-        let guard = rig.manager.core.lock.lock().unwrap();
+        let guard = rig
+            .manager
+            .core
+            .app_lock(&approved.plan().app_id)
+            .lock()
+            .unwrap();
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| rig.manager.install(&approved, &src, 1));
             let started = std::time::Instant::now();
@@ -5126,12 +5236,12 @@ source = "web/"
         let _ = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let _g = rig.manager.core.lock.lock().unwrap();
+                    let _g = rig.manager.core.app_lock(&a).lock().unwrap();
                     panic!("故意毒化");
                 })
                 .join()
         });
-        assert!(rig.manager.core.lock.is_poisoned());
+        assert!(rig.manager.core.app_lock(&a).is_poisoned());
         rig.manager.start(&a).unwrap();
         rig.manager.stop(&a).unwrap();
         assert!(rig.manager.reconcile().is_clean());
@@ -5620,7 +5730,7 @@ source = "web/"
             write_py_app_with_req,
             ">=3.12",
         );
-        let guard = rig.manager.core.lock.lock().unwrap();
+        let guard = rig.manager.core.app_lock(&a).lock().unwrap();
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| rig.manager.start(&a));
             let started = std::time::Instant::now();
@@ -5955,7 +6065,7 @@ source = "web/"
 
         let stopped = ObservedState::Stopped;
         {
-            let _g = rig.manager.core.guard();
+            let _g = rig.manager.core.lock_app(&a);
             let mut record = rig.manager.core.load_record(&a).unwrap();
             rig.manager
                 .core
