@@ -68,7 +68,7 @@ fn body_area<M: Clone + 'static, H: ShellHost<M>>(
     rects: &crate::geometry::ShellRects,
     m: &ChromeMetrics,
 ) -> Option<BodyArea> {
-    use bytehost_desktop::PaneDims;
+    use bytehost_core::panes::PaneDims;
     let rect = rects.content(side)?;
     let panel = model.selected(side);
     let rules = host.rules(panel);
@@ -208,7 +208,7 @@ pub fn map_event(event: &iced_widget::core::Event) -> Option<ShellMsg> {
 mod tests {
     use super::*;
     use crate::model::{Ctx, PaneRules};
-    use bytehost_desktop::PaneSpec;
+    use bytehost_core::panes::PaneSpec;
 
     #[test]
     fn the_root_paints_the_window_background_so_margins_do_not_show_the_iced_default() {

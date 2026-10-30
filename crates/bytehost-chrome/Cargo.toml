@@ -8,8 +8,7 @@ description = "bytehost 共享窗口骨架:顶栏、左右图标栏、左右面�
 
 [dependencies]
 bytehost-core.workspace = true
-# 配对分割的存储与拖拽换算(`PaneStore` / `apply_pane_split_drag`)复用 bytehost-desktop 已有实现。
-bytehost-desktop = { path = "../bytehost-desktop" }
+# 配对分割的存储与拖拽换算(`PaneStore` / `apply_pane_split_drag`)在 core::panes(Tier3 Task3 下沉)。
 serde.workspace = true
 serde_json.workspace = true
 # 控件与度量读 byteui 的主题(几何、配色、外壳区域样式)。

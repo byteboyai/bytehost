@@ -12,7 +12,7 @@
 | `bytehost-client` | 与传输无关的客户端 API:`AppHostApi` trait、统一失败类型、进程内实现 `InProcess`、以及「两种实现都必须通过」的契约测试 `conformance`。 | `bytehost-apps` |
 | `bytehost-webview` | 应用 webview 的**纯安全策略**:origin 导航白名单(`AppOrigin`)、每应用存储标识(`data_store_identifier`)、IPC nonce 与注入脚本(`AppIpc`)、数据存储清除排队。不建 webview,只做决策。 | `bytehost-apps`、`url`、`uuid` |
 | `bytehost-panel` | 应用面板 / 安装审批流程 / 日志查看器的**状态机**:与界面框架无关,以 `AppKey` 泛型标识应用,失败走 `Notice`(不弹具体 UI)。 | `bytehost-apps`、`bytehost-client` |
-| `bytehost-core` | 桌面宿主的**纯契约层**:稳定身份(`PanelId` 等)、注册元数据、布局 DTO;产品组合根把它们映射到自己的业务枚举,Host 不解释业务含义。 | 仅 serde |
+| `bytehost-core` | 桌面宿主的**纯契约层**:稳定身份(`PanelId` 等)、注册元数据、布局 DTO,以及产品中立的布局状态(`panes`/`hover`)与历史布局迁移(`layout_migrate`);产品组合根把它们映射到自己的业务枚举,Host 不解释业务含义。 | 仅 serde |
 | `bytehost-desktop` | 共享桌面宿主:iced 窗口壳 + wry 子视图执行 + 产品泛型回调(Surface 生命周期、几何、浮层)。 | `bytehost-core`、`bytehost-webview`;允许 iced/wry |
 | `bytehost-chrome` | 共享窗口骨架:顶栏、左右图标栏与面板区、分隔线、放大态、布局持久化;以 `PanelId` 为键,不理解具体面板。 | `bytehost-core`、`bytehost-desktop`、`byteui` |
 | `bytehost-settings` | 产品中立的**设置页身份与导航状态**:设置页注册表、当前页、通用选择保存状态;不建窗口、不读路径。 | 仅 serde |

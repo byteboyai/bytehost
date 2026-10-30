@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 
 use bytehost_core::id::PanelId;
-use bytehost_desktop::{PaneDims, PaneStore};
+use bytehost_core::panes::{PaneDims, PaneStore};
 use serde::{Deserialize, Serialize};
 
 use crate::geometry::Side;

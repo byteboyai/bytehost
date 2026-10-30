@@ -26,18 +26,24 @@
 pub mod app_webview;
 pub mod dispatch;
 pub mod focus;
-pub mod hover;
-pub mod layout;
 pub mod native_child;
 pub mod overlay;
 #[cfg(feature = "overlay")]
 pub mod overlay_gpu;
 pub mod panel;
-pub mod panes;
 pub mod shell;
 pub mod surface;
 pub mod web_child;
 mod wry_common;
+
+// 已下沉到 `bytehost-core`(Tier3 Task3):`panes`/`hover`/`layout_migrate` 是纯 std+serde 逻辑,
+// 留在 desktop 会把 wry/winit/objc2 拖进只想要布局状态的消费方(如 `bytehost-chrome`)。
+// 这里保留同名转发,既有 `bytehost_desktop::panes::…` 路径继续可用;
+// `layout` 名字在 core 已被 DTO 模块占用,迁移逻辑在 core 叫 `layout_migrate`。
+pub use bytehost_core::{hover, panes};
+pub mod layout {
+    pub use bytehost_core::layout_migrate::*;
+}
 
 pub use app_webview::{
     AppSurfaceBuilt, AppSurfaceIpc, AppSurfaceSpec, app_handle_count, build_app_child, destroy_app,

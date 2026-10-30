@@ -126,12 +126,12 @@ check_direct_allowed() {
 # 共享窗口骨架(bytehost-chrome):只理解 PanelId,不理解具体面板与产品。
 # 允许 byteui/iced 与平台绑定(objc2/winit 经 iced/byteui 传递引入),
 # 但不得依赖产品 crate,也不得依赖 bytehost 应用平台层(apps/client/webview/panel/settings*)。
-# 注:wry 目前仍经 bytehost-desktop 传递引入(取 PaneStore/分割拖拽实现);
-# Tier3 Task3 把 panes/hover/layout 下沉到 core 后,本组追加 `^wry$` 禁令。
-chrome_direct='^(bytehost-core|bytehost-desktop|byteui|iced_widget|iced_renderer|serde|serde_json|objc2|objc2-app-kit|objc2-foundation|block2|raw-window-handle)$'
+# panes/hover/layout 已下沉到 core(Tier3 Task3),chrome 不再经 desktop 拖进 webview 执行层。
+# objc2 允许:窗口骨架要操作 NSWindow 的交通灯按钮,那是直接使用的平台绑定,不是 wry/winit 的传递依赖。
+chrome_direct='^(bytehost-core|byteui|iced_widget|iced_renderer|serde|serde_json|objc2|objc2-app-kit|objc2-foundation|block2|raw-window-handle)$'
 check_forbidden bytehost-chrome "$product_banned" "产品 crate,共享窗口骨架不得依赖"
-check_forbidden bytehost-chrome '^tauri.*' "tauri 不在共享窗口骨架的依赖白名单"
-check_direct_allowed bytehost-chrome "$chrome_direct" "骨架只依赖 bytehost-core/desktop、byteui/iced 与平台绑定"
+check_forbidden bytehost-chrome '^(tauri.*|wry|winit)$' "webview/窗口循环/tauri,窗口骨架不得依赖"
+check_direct_allowed bytehost-chrome "$chrome_direct" "骨架只依赖 bytehost-core、byteui/iced 与平台绑定"
 
 # ---- group: settings ----
 # 设置页身份 / 注册表 / 导航状态(bytehost-settings):与 core 同级的纯数据层,

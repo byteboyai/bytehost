@@ -257,7 +257,6 @@ version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
  "bytehost-core",
- "bytehost-desktop",
  "byteui",
  "iced_renderer",
  "iced_widget",

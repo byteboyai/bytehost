@@ -2,7 +2,7 @@
 //! 告诉调用方"要不要落盘 / 哪个面板刚被切入";文件读写与面板切入动作由产品决定。
 
 use bytehost_core::id::PanelId;
-use bytehost_desktop::{PaneDims, PaneDragInput, PaneSpec, PaneStore, apply_pane_split_drag};
+use bytehost_core::panes::{PaneDims, PaneDragInput, PaneSpec, PaneStore, apply_pane_split_drag};
 
 use std::collections::HashMap;
 

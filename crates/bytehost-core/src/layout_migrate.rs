@@ -16,8 +16,8 @@
 
 use std::path::Path;
 
-use bytehost_core::registry::PanelCatalog;
-use bytehost_core::{LAYOUT_SCHEMA_VERSION, Layout, LayoutError, PanelId, Rail};
+use crate::registry::PanelCatalog;
+use crate::{LAYOUT_SCHEMA_VERSION, Layout, LayoutError, PanelId, Rail};
 
 /// 产品侧的历史布局适配器。实现者只做"切栏 + 映射 token",其余流程归宿主。
 pub trait LegacyPanelAdapter {

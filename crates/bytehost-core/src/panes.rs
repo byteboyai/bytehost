@@ -3,7 +3,7 @@
 //! 本模块只承载**与 GUI 无关的状态与几何换算**:某条 rail 上有哪些面板(顺序)、
 //! 每个配对面板的内部分栏比例与列表列收起态、以及"把分栏拖到某个 x 之后的新
 //! 状态"。产品提供默认值、图标/标题/业务排序与命令路由;宿主不理解任何具体
-//! 面板含义。键是 `bytehost_core::id::PanelId`,与 `Layout`/`Rail` DTO 共用同一
+//! 面板含义。键是 `crate::id::PanelId`,与 `Layout`/`Rail` DTO 共用同一
 //! 份稳定身份(规格 §5.1)。
 //!
 //! 迁移自 Dozer 的 `RailLayout` + `PanelDims`(后者原来是逐面板具名字段 + 巨型
@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use bytehost_core::id::PanelId;
+use crate::id::PanelId;
 use serde::{Deserialize, Serialize};
 
 /// 单个配对面板的内部分栏状态。
