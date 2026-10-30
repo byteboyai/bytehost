@@ -100,7 +100,10 @@ struct Site {
 struct State {
     port: u16,
     token: String,
-    sites: RwLock<HashMap<String, Site>>,
+    /// 按应用 id 索引的静态站点。表里存 `Arc<Site>`:每个请求都要按 host 找到站点,
+    /// 直接 `clone` 一个 `Site`(PathBuf + 可选 CSP 字符串)是每请求两次堆分配;
+    /// `Arc` 克隆只加一次原子计数(Tier4 Task1)。
+    sites: RwLock<HashMap<String, Arc<Site>>>,
     /// 进程型应用:`<app-id>` → 应用监听的回环地址(反向代理的目标)。与 `sites` 互斥(同一个应用只有一种)。
     upstreams: RwLock<HashMap<String, SocketAddr>>,
 }
@@ -120,13 +123,13 @@ impl State {
 
     /// 站点表的读/写锁:持锁线程 panic 会毒化它,但表里没有需要保持的不变量,
     /// 后续请求不能因此全部 panic——取回内部数据继续用。
-    fn sites_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Site>> {
+    fn sites_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<Site>>> {
         self.sites
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn sites_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Site>> {
+    fn sites_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Arc<Site>>> {
         self.sites
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -222,7 +225,7 @@ impl Gateway {
         self.state.upstreams_write().remove(id.as_str());
         self.state
             .sites_write()
-            .insert(id.as_str().to_string(), Site { root, csp });
+            .insert(id.as_str().to_string(), Arc::new(Site { root, csp }));
     }
 
     /// 注册(或替换)一个进程型应用:请求通过校验后反向代理到 `upstream`(应用监听的 `127.0.0.1:<端口>`)。
@@ -561,6 +564,7 @@ fn serve_static(
     path: &str,
     query: Option<&str>,
 ) -> Reply {
+    // 只克隆 `Arc`(一次原子自增),不克隆 `Site` 本身(Tier4 Task1)。
     let Some(site) = state.sites_read().get(app.as_str()).cloned() else {
         return plain(StatusCode::NOT_FOUND, "no such app");
     };
@@ -660,10 +664,10 @@ mod tests {
         for (id, root, csp) in apps {
             sites.insert(
                 id.to_string(),
-                Site {
+                Arc::new(Site {
                     root: root.to_path_buf(),
                     csp: csp.clone(),
-                },
+                }),
             );
         }
         State {
