@@ -12,10 +12,13 @@ use bytehost_core::SurfaceSlot;
 
 /// 宿主通用事件:与业务无关的窗口/子视图事件。
 ///
+/// 名字带 `Host` 是为了和 `bytehost_core::SurfaceEvent`(Surface 状态机的输入事件:
+/// `Created`/`Ready`/`Hidden`…)区分——两者都在 crate 根导出,同名会让 glob import 歧义。
+///
 /// 这些是宿主唯一"认识"的事件形状;业务命令回调(打开项目、刷新列表等)
 /// 由产品在自己的消息类型 `M` 里表达,不放进本 enum。
 #[derive(Debug, Clone, PartialEq)]
-pub enum SurfaceEvent {
+pub enum HostSurfaceEvent {
     /// 窗口或子视图尺寸变化,需重算 bounds。
     Resized {
         slot: SurfaceSlot,
@@ -36,16 +39,16 @@ pub enum SurfaceEvent {
     CreateFailed { slot: SurfaceSlot, error: String },
 }
 
-impl SurfaceEvent {
+impl HostSurfaceEvent {
     pub fn slot(&self) -> SurfaceSlot {
         match self {
-            SurfaceEvent::Resized { slot, .. }
-            | SurfaceEvent::Hidden { slot }
-            | SurfaceEvent::Resumed { slot }
-            | SurfaceEvent::Destroyed { slot }
-            | SurfaceEvent::Ipc { slot, .. }
-            | SurfaceEvent::Created { slot }
-            | SurfaceEvent::CreateFailed { slot, .. } => *slot,
+            HostSurfaceEvent::Resized { slot, .. }
+            | HostSurfaceEvent::Hidden { slot }
+            | HostSurfaceEvent::Resumed { slot }
+            | HostSurfaceEvent::Destroyed { slot }
+            | HostSurfaceEvent::Ipc { slot, .. }
+            | HostSurfaceEvent::Created { slot }
+            | HostSurfaceEvent::CreateFailed { slot, .. } => *slot,
         }
     }
 }
@@ -56,12 +59,12 @@ pub enum HostMessage<M> {
     /// 产品自己的消息。
     Product(M),
     /// 宿主通用事件。
-    Surface(SurfaceEvent),
+    Surface(HostSurfaceEvent),
 }
 
 impl<M> HostMessage<M> {
     /// 宿主层只关心 Surface 事件;产品消息交回产品。
-    pub fn surface(&self) -> Option<&SurfaceEvent> {
+    pub fn surface(&self) -> Option<&HostSurfaceEvent> {
         match self {
             HostMessage::Surface(e) => Some(e),
             HostMessage::Product(_) => None,
@@ -101,16 +104,16 @@ pub trait ProductTitle {
 
 /// 把宿主通用事件路由到产品的生命周期回调,其余交给 `update`。
 /// 产品不需要自己复制这段 match。
-pub fn route_lifecycle<M, P>(product: &mut P, event: SurfaceEvent) -> Task<M>
+pub fn route_lifecycle<M, P>(product: &mut P, event: HostSurfaceEvent) -> Task<M>
 where
     M: Clone + 'static,
     P: Product<M>,
 {
     match &event {
-        SurfaceEvent::Created { slot } | SurfaceEvent::Resumed { slot } => {
+        HostSurfaceEvent::Created { slot } | HostSurfaceEvent::Resumed { slot } => {
             product.on_activated(*slot)
         }
-        SurfaceEvent::Destroyed { slot } => product.on_closed(*slot),
+        HostSurfaceEvent::Destroyed { slot } => product.on_closed(*slot),
         _ => {}
     }
     product.update(HostMessage::Surface(event))
@@ -163,13 +166,13 @@ mod tests {
         let mut p = Fake::default();
         let _ = route_lifecycle(
             &mut p,
-            SurfaceEvent::Created {
+            HostSurfaceEvent::Created {
                 slot: SurfaceSlot(3),
             },
         );
         let _ = route_lifecycle(
             &mut p,
-            SurfaceEvent::Destroyed {
+            HostSurfaceEvent::Destroyed {
                 slot: SurfaceSlot(3),
             },
         );
@@ -179,7 +182,7 @@ mod tests {
 
     #[test]
     fn surface_and_product_are_distinguishable() {
-        let m: HostMessage<Msg> = HostMessage::Surface(SurfaceEvent::Hidden {
+        let m: HostMessage<Msg> = HostMessage::Surface(HostSurfaceEvent::Hidden {
             slot: SurfaceSlot(1),
         });
         assert!(m.surface().is_some());

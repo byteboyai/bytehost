@@ -69,7 +69,7 @@ pub use overlay_gpu::{
 pub use panes::{
     PaneDims, PaneDragInput, PaneDragOutcome, PaneSpec, PaneStore, RailItems, apply_pane_split_drag,
 };
-pub use shell::{HostMessage, Product, SurfaceEvent, route_lifecycle};
+pub use shell::{HostMessage, HostSurfaceEvent, Product, route_lifecycle};
 pub use surface::SurfaceExecutor;
 
 /// 复用 core 的几何与身份类型,产品无需再依赖 core 的路径。

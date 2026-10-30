@@ -13,7 +13,7 @@ use bytehost_core::{
     SurfaceSlot, host_rect,
 };
 use bytehost_desktop::dispatch::TokioExecutor;
-use bytehost_desktop::{HostMessage, Product, SurfaceEvent, panel};
+use bytehost_desktop::{HostMessage, HostSurfaceEvent, Product, panel};
 
 use iced::{Element, Size, Subscription, Task, window};
 
@@ -183,7 +183,7 @@ impl App {
                 self.note = "webview built".into();
                 self.on_activated(self.slot);
                 // 顺带演示宿主事件也能走 HostMessage::Surface。
-                let evt = SurfaceEvent::Created { slot: self.slot };
+                let evt = HostSurfaceEvent::Created { slot: self.slot };
                 let _ = bytehost_desktop::route_lifecycle(self, evt);
                 Task::none()
             }

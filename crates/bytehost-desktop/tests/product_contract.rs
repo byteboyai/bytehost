@@ -8,7 +8,7 @@ use bytehost_core::{
     BackgroundExecutor, Emitter, Generation, PanelInstanceId, RequestKey, RequestTracker,
     ResultEnvelope, ScopeId, SurfaceSlot, run_scoped,
 };
-use bytehost_desktop::{HostMessage, Product, SurfaceEvent, route_lifecycle};
+use bytehost_desktop::{HostMessage, HostSurfaceEvent, Product, route_lifecycle};
 
 use iced::{Element, Task};
 use std::sync::{Arc, Mutex};
@@ -81,7 +81,7 @@ fn two_products_instance_same_host_interface() {
     let mut notes = NotesProduct::default();
     let mut map = MapProduct::default();
 
-    let evt = SurfaceEvent::Created {
+    let evt = HostSurfaceEvent::Created {
         slot: SurfaceSlot(0),
     };
     let _: Task<NotesMsg> = route_lifecycle(&mut notes, evt.clone());
