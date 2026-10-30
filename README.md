@@ -2,9 +2,9 @@
 
 应用宿主平台库:把「装应用、跑应用、给应用一个隔离的 webview 站点」这套能力从具体产品里抽出来,供多个宿主共用。
 
-**agent 中立、界面框架中立、平台 webview 库中立。** 不依赖任何产品 crate、`iced`、`wry`、`tauri`、`objc2`——由 `scripts/check-deps.sh` 门禁保证。注意:这条只对下表前四个(应用宿主无界面部分)成立;`bytehost-desktop`、`bytehost-chrome` 是桌面宿主层,**允许**依赖 `iced`/`wry`/`byteui`,但仍不含任何产品业务 crate(`check-deps.sh` 按组分别校验)。
+**agent 中立、界面框架中立、平台 webview 库中立。** 不依赖任何产品 crate、`iced`、`wry`、`tauri`、`objc2`——由 `scripts/check-deps.sh` 门禁保证。注意:这条只对 `bytehost-apps`/`-client`/`-webview`/`-panel` 与纯契约层 `bytehost-core`/`bytehost-settings` 成立;`bytehost-desktop`、`bytehost-chrome`、`bytehost-settings-ui` 是桌面层,**允许**依赖 `iced`/`byteui`(`desktop` 还允许 `wry`),但仍不含任何产品业务 crate(`check-deps.sh` 按组分别校验)。
 
-## 七个 crate
+## 九个 crate
 
 | crate | 一句话 | 依赖 |
 |-------|--------|------|
@@ -15,6 +15,8 @@
 | `bytehost-core` | 桌面宿主的**纯契约层**:稳定身份(`PanelId` 等)、注册元数据、布局 DTO;产品组合根把它们映射到自己的业务枚举,Host 不解释业务含义。 | 仅 serde |
 | `bytehost-desktop` | 共享桌面宿主:iced 窗口壳 + wry 子视图执行 + 产品泛型回调(Surface 生命周期、几何、浮层)。 | `bytehost-core`、`bytehost-webview`;允许 iced/wry |
 | `bytehost-chrome` | 共享窗口骨架:顶栏、左右图标栏与面板区、分隔线、放大态、布局持久化;以 `PanelId` 为键,不理解具体面板。 | `bytehost-core`、`bytehost-desktop`、`byteui` |
+| `bytehost-settings` | 产品中立的**设置页身份与导航状态**:设置页注册表、当前页、通用选择保存状态;不建窗口、不读路径。 | 仅 serde |
+| `bytehost-settings-ui` | 共享设置窗口的 iced 视图:容器、主题页、语言页、应用管理页;不建窗口、不访问路径、不启动任务。 | `bytehost-settings`、`bytehost-apps`、`bytehost-panel`、`byteui`、`iced` |
 
 ## 谁是消费者
 

@@ -1,5 +1,5 @@
 //! 应用面板与日志查看器的状态机:与界面框架无关,以 [`AppKey`] 泛型标识应用,
-//! 供 wry 宿主(dozer)与 Tauri 宿主(Digger)共用。
+//! 供两个 iced + wry 宿主(Dozer 与 Digger)共用。
 //!
 //! - [`key`] 是 [`AppKey`] trait(dozer 用进程内槽号,Digger 可直接用 `AppId`)。
 //! - [`notice`] 是宿主无关的瞬时消息等级([`NoticeLevel`])。

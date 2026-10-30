@@ -1,5 +1,5 @@
 //! 应用 webview 的纯安全策略(bytehost A4b1 / A7 task 3):应用代码不可信(第三方或 agent 生成),
-//! 这里只放与界面框架无关、wry 宿主(dozer)与 Tauri 宿主(Digger)都必须照做的判断:
+//! 这里只放与界面框架无关、两个 iced + wry 宿主(Dozer 与 Digger)都必须照做的判断:
 //!
 //! - 这个 URL 是否仍在该应用自己的 origin 内([`AppOrigin::allows_navigation`],导航策略的唯一真相);
 //! - 每应用的 WKWebView 数据存储标识([`data_store_identifier`]);
