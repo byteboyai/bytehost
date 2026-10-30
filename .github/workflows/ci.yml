@@ -6,6 +6,28 @@ on:
   pull_request:
 
 jobs:
+  # 默认 feature 构建:apps 的 server/digest/manifest-toml 分层靠 feature 表达,
+  # `--all-features` 通过不代表默认构建能编过(缺少默认 feature 的 cfg 分支只有这里会暴露)。
+  default-features:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo check --no-default-features
+        run: cargo check --workspace --no-default-features
+
   test:
     runs-on: macos-latest
     steps:
