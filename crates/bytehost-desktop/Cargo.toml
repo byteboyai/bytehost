@@ -45,7 +45,7 @@ iced_renderer = { version = "0.14", optional = true }
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
-objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "WKWebView", "WKUIDelegate", "WKFrameInfo", "WKSecurityOrigin"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "WKWebView", "WKUIDelegate", "WKFrameInfo", "WKSecurityOrigin", "WKFindConfiguration", "WKFindResult"] }
 
 [features]
 default = []

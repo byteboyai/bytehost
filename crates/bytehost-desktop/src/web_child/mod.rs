@@ -12,7 +12,7 @@ pub mod plan;
 mod pool;
 
 #[cfg(target_os = "macos")]
-pub use apple::install_standard_edit_menu;
+pub use apple::{install_find_shortcut, install_standard_edit_menu};
 pub use edit_menu::{EditItem, standard_edit_menu_items};
 pub use plan::{
     ExistingTab, LoadVerdict, NavTracker, PoolAction, WebTabSpec, plan_pool, plan_sync, wry_target,

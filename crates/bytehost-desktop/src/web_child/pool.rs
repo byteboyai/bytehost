@@ -77,6 +77,13 @@ pub enum WebEvent {
         id: usize,
         url: String,
     },
+    /// 一次页内查找结束:`query` 是当时查的词(宿主用它丢弃慢的旧结果),`matched` 是有没有命中。
+    FindResult {
+        generation: u64,
+        id: usize,
+        query: String,
+        matched: bool,
+    },
 }
 
 struct Tab {
@@ -222,6 +229,77 @@ impl WebPool {
         })
     }
 
+    /// 在页签 `tab` 的页面里查找 `query`(命中就选中并滚动过去;`backwards` 往前找,恒回绕)。返回有没有这个页签。
+    /// 查找结束时经池的事件通道送出 [`WebEvent::FindResult`]。同一个 `query` 再调一次就是「下一个」。主线程。
+    pub fn find(
+        &self,
+        generation: u64,
+        tab: usize,
+        query: &str,
+        backwards: bool,
+        case_sensitive: bool,
+    ) -> bool {
+        let events = self.events.clone();
+        let asked = query.to_owned();
+        let done = move |matched: bool| {
+            let _ = events.send(WebEvent::FindResult {
+                generation,
+                id: tab,
+                query: asked.clone(),
+                matched,
+            });
+        };
+        self.with_view(generation, tab, |view| {
+            #[cfg(target_os = "macos")]
+            super::apple::find_string(view, query, backwards, case_sensitive, done);
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (view, query, backwards, case_sensitive);
+                done(false);
+            }
+        })
+        .is_some()
+    }
+
+    /// `Task` 版的 [`find`](Self::find)(iced 宿主,在 `window::run` 里跑)。
+    pub fn find_task<E: Send + 'static>(
+        &self,
+        id: window::Id,
+        generation: u64,
+        tab: usize,
+        query: String,
+        backwards: bool,
+        done: E,
+    ) -> Task<E> {
+        let pool = self.handle();
+        window::run(id, move |_| {
+            pool.find(generation, tab, &query, backwards, false);
+            done
+        })
+    }
+
+    /// `Task` 版的 [`clear_find`](Self::clear_find)。
+    pub fn clear_find_task<E: Send + 'static>(
+        &self,
+        id: window::Id,
+        generation: u64,
+        tab: usize,
+        done: E,
+    ) -> Task<E> {
+        let pool = self.handle();
+        window::run(id, move |_| {
+            pool.clear_find(generation, tab);
+            done
+        })
+    }
+
+    /// 关掉查找条时清掉页面里的命中选区(宿主侧 `evaluate_script`,不向页面注入任何持久脚本)。主线程。
+    pub fn clear_find(&self, generation: u64, tab: usize) {
+        self.with_view(generation, tab, |view| {
+            let _ = view.evaluate_script("window.getSelection().removeAllRanges()");
+        });
+    }
+
     /// 把全局界面缩放同步给池里已有的全部视图(新建的视图在 `sync` / `apply` 里已按当前缩放建好)。主线程。
     pub fn zoom_all(&self, generation: u64, scale: f64) {
         if self.epoch.load(Ordering::SeqCst) != generation {
@@ -311,6 +389,40 @@ impl WebPool {
             }))
         })
     }
+}
+
+/// 当前 key window 的 first responder 是不是**某个池里的** webview(任何一个 `WebPool` 的任何页签)。
+/// ⌘F 菜单项靠它决定启用与否:宿主自己的可信 webview(Dozer 的预览)也是 `WKWebView`,它们的 ⌘F 由页面脚本处理,
+/// 菜单项不能抢。主线程;池表正被修改(同步过程中)时保守地返回 `false`。
+#[cfg(target_os = "macos")]
+pub(crate) fn first_responder_is_pool_view() -> bool {
+    use objc2::MainThreadMarker;
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::NSApplication;
+    use wry::WebViewExtMacOS;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let Some(responder) = NSApplication::sharedApplication(mtm)
+        .keyWindow()
+        .and_then(|window| window.firstResponder())
+    else {
+        return false;
+    };
+    let target = Retained::as_ptr(&responder).cast::<AnyObject>();
+    POOLS.with(|pools| {
+        let Ok(pools) = pools.try_borrow() else {
+            return false;
+        };
+        pools.values().any(|state| {
+            state.tabs.values().any(|tab| {
+                let web_view = tab.view.webview();
+                std::ptr::eq(Retained::as_ptr(&web_view).cast::<AnyObject>(), target)
+            })
+        })
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -545,6 +657,9 @@ mod tests {
             "pool.apply(&window, generation, &desired, rect, scale)",
             "pool.navigate_now(generation, tab, nav)",
             "pool.destroy_all_now()",
+            "pool.find(generation, tab, &query, backwards, false)",
+            "pool.clear_find(generation, tab)",
+            "WebEvent::FindResult {",
             // 必须是**调用点**:非 macOS 的空实现定义里也有 `install_media_deny_proxy(`,只认函数名会漏掉"删掉调用"。
             "= install_media_deny_proxy(&view)",
             "build_as_child(",
