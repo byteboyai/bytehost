@@ -176,9 +176,10 @@ impl From<ManifestError> for ManagerError {
 /// `AppManager` 的共享状态:注册表、gateway、事件、单写者锁、关闭标志,以及解析器与在跑的监管线程登记表。
 /// 抽出来是为了让监管线程能持有 `Arc<Core>`(Task 5 的 `AppTransitions`),`AppManager` 本身经 `Deref` 直接用它。
 ///
-/// 因为 `AppManager: Deref<Target = Core>`,这个类型必须 `pub`;它的字段仍是私有的,
-/// 内部方法(`guard`/`try_guard`/`*_locked` 等)为 `pub(crate)`。
-pub struct Core {
+/// `AppManager` 不再 `Deref` 到它(Tier3 Task1):对外只有 `AppManager` 的显式方法,
+/// `Core` 由本 crate 私有,宿主层拿不到锁与字段。内部方法(`guard`/`try_guard`/`*_locked` 等)
+/// 为 `pub(crate)`。
+pub(crate) struct Core {
     registry: Registry,
     gateway: Arc<Gateway>,
     host_version: Version,
@@ -446,13 +447,6 @@ impl Transitions for AppTransitions {
 
 pub struct AppManager {
     core: Arc<Core>,
-}
-
-impl std::ops::Deref for AppManager {
-    type Target = Core;
-    fn deref(&self) -> &Core {
-        &self.core
-    }
 }
 
 /// 一个已读入并校验过的应用包。
@@ -800,17 +794,17 @@ impl AppManager {
     }
 
     pub fn events(&self) -> broadcast::Receiver<AppEvent> {
-        self.events.subscribe()
+        self.core.events.subscribe()
     }
 
     /// 首次导航用的地址(带一次性换 Cookie 的令牌)。**秘密,不要写日志、不要广播。**
     pub fn launch_url(&self, id: &AppId) -> String {
-        self.gateway.launch_url(id)
+        self.core.gateway.launch_url(id)
     }
 }
 
-/// 公开 API 的转发层:实现都在 `Core` 上(`AppManager` 经 `Deref` 也能直接调到它们),
-/// 这几个方法在 crate 外(dozerd)使用,必须有公有的接收者类型,故在 `AppManager` 上再暴露一层。
+/// 公开 API 的转发层:实现都在 `Core` 上。`AppManager` **不** `Deref` 到 `Core`(Tier3 Task1),
+/// 所有对外能力都必须在这里显式列出——新增公开方法时别只加在 `Core` 上。
 impl AppManager {
     pub fn install_plan(
         &self,
@@ -2342,7 +2336,7 @@ source = "web/"
 
     /// 安装失败之后,`apps/` 下不能留下 staging 目录,也不能凭空多出应用目录。
     fn assert_no_leftovers(rig: &Rig) {
-        let apps = rig.manager.registry.paths().apps_dir();
+        let apps = rig.manager.core.registry.paths().apps_dir();
         let names: Vec<String> = fs::read_dir(&apps)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -2616,6 +2610,7 @@ source = "web/"
         // 运行期损坏默认语言文件:list 不应失败,只把 display_i18n 回落为 None。
         let pkg = rig
             .manager
+            .core
             .registry
             .paths()
             .package_dir(&id("notes"), &Version::new(1, 0, 0));
@@ -3181,12 +3176,12 @@ source = "web/"
         assert!(
             matches!(&events[2], AppEvent::ManifestChanged { permission_changes, .. } if permission_changes.len() == 1)
         );
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 1, 0));
         assert_eq!(record.previous_version, Some(Version::new(1, 0, 0)));
         assert_eq!(record.versions.len(), 2);
         assert_eq!(record.grants.clipboard, Access::Read);
-        let pkg = rig.manager.registry.paths();
+        let pkg = rig.manager.core.registry.paths();
         assert!(
             pkg.package_dir(&app, &Version::new(1, 0, 0)).is_dir(),
             "旧版本目录保留"
@@ -3273,7 +3268,7 @@ source = "web/"
         ))
         .unwrap();
         rig.manager.start(&app).unwrap();
-        let data = rig.manager.registry.paths().data_dir(&app);
+        let data = rig.manager.core.registry.paths().data_dir(&app);
         fs::write(data.join("drawing.json"), "{}").unwrap();
         drain(&mut rx);
 
@@ -3291,7 +3286,7 @@ source = "web/"
         rig.manager
             .uninstall(&app, UninstallMode::ProgramAndData)
             .unwrap();
-        assert!(!rig.manager.registry.paths().app_dir(&app).exists());
+        assert!(!rig.manager.core.registry.paths().app_dir(&app).exists());
         rig.manager
             .uninstall(&id("never-installed"), UninstallMode::ProgramAndData)
             .unwrap();
@@ -3371,6 +3366,7 @@ source = "web/"
         rig.gateway.remove_site(&bad);
         let pkg = rig
             .manager
+            .core
             .registry
             .paths()
             .package_dir(&bad, &Version::new(1, 0, 0));
@@ -3399,6 +3395,7 @@ source = "web/"
         // 清单从**当前版本的包**里读(包里本来就拷着 manifest.toml),不再依赖一份共享的应用级文件
         fs::write(
             rig.manager
+                .core
                 .registry
                 .paths()
                 .package_dir(&app, &Version::new(1, 0, 0))
@@ -3420,6 +3417,7 @@ source = "web/"
         // 清单就在落位的包里(staging 副本被 verify 过的那份);不再另存一份应用级的 manifest.toml
         let saved = fs::read_to_string(
             rig.manager
+                .core
                 .registry
                 .paths()
                 .package_dir(&id("excalidraw"), &Version::new(1, 0, 0))
@@ -3428,6 +3426,7 @@ source = "web/"
         .unwrap();
         assert!(
             !rig.manager
+                .core
                 .registry
                 .paths()
                 .manifest_path(&id("excalidraw"))
@@ -3481,18 +3480,19 @@ source = "web/"
         let rig = rig().await;
         let app = id("excalidraw");
         let src = write_app(&rig.src_dir("a"), "excalidraw", "1.0.0", "", "hi");
-        let blocker = rig.manager.registry.paths().data_dir(&app);
+        let blocker = rig.manager.core.registry.paths().data_dir(&app);
         fs::create_dir_all(blocker.parent().unwrap()).unwrap();
         fs::write(&blocker, "i am a file, not a directory").unwrap();
 
         assert!(matches!(rig.install(&src), Err(ManagerError::Io(_))));
         let pkg = rig
             .manager
+            .core
             .registry
             .paths()
             .package_dir(&app, &Version::new(1, 0, 0));
         assert!(!pkg.exists(), "失败后包目录必须撤回");
-        assert!(!rig.manager.registry.paths().state_path(&app).exists());
+        assert!(!rig.manager.core.registry.paths().state_path(&app).exists());
         assert_no_leftovers(&rig);
 
         fs::remove_file(&blocker).unwrap();
@@ -3508,6 +3508,7 @@ source = "web/"
         // 全新安装:残骸目录已经在了
         let debris = rig
             .manager
+            .core
             .registry
             .paths()
             .package_dir(&app, &Version::new(1, 0, 0));
@@ -3526,6 +3527,7 @@ source = "web/"
         // 升级:新版本目录的残骸
         let debris2 = rig
             .manager
+            .core
             .registry
             .paths()
             .package_dir(&app, &Version::new(1, 1, 0));
@@ -3563,7 +3565,7 @@ source = "web/"
             "two",
         ))
         .unwrap();
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 1, 0));
         assert_eq!(record.previous_version, Some(Version::new(1, 0, 0)));
         assert!(!record.probation, "没在跑就没有试用期");
@@ -3585,12 +3587,12 @@ source = "web/"
             ))
             .unwrap();
         }
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 2, 0));
         assert_eq!(record.previous_version, Some(Version::new(1, 1, 0)));
         let versions: Vec<_> = record.versions.iter().map(|v| v.version).collect();
         assert_eq!(versions, vec![Version::new(1, 1, 0), Version::new(1, 2, 0)]);
-        let paths = rig.manager.registry.paths();
+        let paths = rig.manager.core.registry.paths();
         assert!(
             !paths.package_dir(&app, &Version::new(1, 0, 0)).exists(),
             "1.0.0 的包目录被清掉"
@@ -3668,7 +3670,7 @@ source = "web/"
             PY_SERVER,
         ))
         .unwrap();
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert!(record.probation, "升级后的首次启动尚未成功");
         assert_eq!(record.previous_version, Some(Version::new(1, 0, 0)));
     }
@@ -3687,7 +3689,7 @@ source = "web/"
         ))
         .unwrap();
         // 直接看现有残骸用例会覆盖这条;这里断言半写场景下记录仍是完整的旧记录
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 0, 0));
         assert_eq!(record.previous_version, None);
         assert!(!record.probation);
@@ -3754,7 +3756,7 @@ source = "web/"
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
-            let record = rig.manager.registry.load(&app).unwrap().unwrap();
+            let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
             if record.current_version == Version::new(1, 0, 0) && record.last_rollback.is_some() {
                 break;
             }
@@ -3766,7 +3768,7 @@ source = "web/"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 0, 0));
         assert_eq!(record.previous_version, None, "回滚消耗掉上一版");
         assert!(!record.probation);
@@ -3779,6 +3781,7 @@ source = "web/"
         // 轮询等它消失,不能立刻断言(否则并行负载下偶发失败)。
         let replaced = rig
             .manager
+            .core
             .registry
             .paths()
             .package_dir(&app, &Version::new(1, 1, 0));
@@ -3825,7 +3828,7 @@ source = "web/"
         fs::write(dir.join("manifest.toml"), manifest).unwrap();
 
         rig.install(&bad).unwrap();
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 0, 0), "已同步回滚");
         assert_eq!(record.previous_version, None);
         assert!(record.last_rollback.unwrap().automatic);
@@ -3858,7 +3861,7 @@ source = "web/"
         ))
         .unwrap();
         wait_for(&rig, &app, 15, is_running);
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 1, 0));
         assert_eq!(record.previous_version, Some(Version::new(1, 0, 0)));
         assert!(!record.probation, "健康后试用期结束");
@@ -3896,14 +3899,14 @@ source = "web/"
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
-            let record = rig.manager.registry.load(&app).unwrap().unwrap();
+            let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
             if record.last_rollback.is_some() {
                 break;
             }
             assert!(std::time::Instant::now() < deadline, "没记下跳过原因");
             std::thread::sleep(Duration::from_millis(50));
         }
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 1, 0), "没回滚");
         assert!(!record.probation);
         let note = record.last_rollback.unwrap();
@@ -3932,6 +3935,7 @@ source = "web/"
         rig.manager.start(&a).unwrap();
         let package_root = rig
             .manager
+            .core
             .registry
             .paths()
             .package_dir(&a, &Version::new(1, 0, 0))
@@ -3954,7 +3958,7 @@ source = "web/"
         let result = rig.install(&v2);
         restore(0o700);
         assert!(result.is_err(), "rename 进只读目录应当失败");
-        let record = rig.manager.registry.load(&a).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&a).unwrap().unwrap();
         assert_eq!(
             record.current_version,
             Version::new(1, 0, 0),
@@ -4061,13 +4065,13 @@ source = "web/"
             .unwrap();
             let failed_version = Version::new(1, 1, 0);
             // 构造"升级后试用期内、新版本已 Failed"。
-            let mut record = rig.manager.registry.load(&a).unwrap().unwrap();
+            let mut record = rig.manager.core.registry.load(&a).unwrap().unwrap();
             record.probation = true;
             record.observed = ObservedState::Failed {
                 reason: "起不来".into(),
                 retryable: false,
             };
-            rig.manager.registry.save(&record).unwrap();
+            rig.manager.core.registry.save(&record).unwrap();
 
             let guard = rig.manager.core.guard();
             rig.manager
@@ -4075,14 +4079,14 @@ source = "web/"
                 .spawn_auto_rollback(a.clone(), failed_version);
             std::thread::sleep(Duration::from_millis(300)); // 线程此刻阻塞在 guard() 上
             if user_acted_first {
-                let mut record = rig.manager.registry.load(&a).unwrap().unwrap();
+                let mut record = rig.manager.core.registry.load(&a).unwrap().unwrap();
                 record.observed = ObservedState::Stopped;
-                rig.manager.registry.save(&record).unwrap();
+                rig.manager.core.registry.save(&record).unwrap();
             }
             drop(guard);
             std::thread::sleep(Duration::from_millis(600));
 
-            let record = rig.manager.registry.load(&a).unwrap().unwrap();
+            let record = rig.manager.core.registry.load(&a).unwrap().unwrap();
             if user_acted_first {
                 assert_eq!(
                     record.current_version, failed_version,
@@ -4130,7 +4134,7 @@ source = "web/"
         rig.manager.stop(&app).unwrap();
         // 给线程充分的时间跑完(若它错误地执行了回滚,current_version 会变)
         std::thread::sleep(Duration::from_secs(2));
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 1, 0), "回滚被放弃");
         assert_eq!(record.last_rollback, None);
         assert!(matches!(record.observed, ObservedState::Stopped));
@@ -4167,10 +4171,10 @@ source = "web/"
         ))
         .unwrap();
         {
-            let mut record = rig.manager.registry.load(&app).unwrap().unwrap();
+            let mut record = rig.manager.core.registry.load(&app).unwrap().unwrap();
             record.probation = true;
             record.desired = DesiredState::Running;
-            rig.manager.registry.save(&record).unwrap();
+            rig.manager.core.registry.save(&record).unwrap();
         }
         // 新实例沿用同样的"快速放弃"策略(真实的 dozerd 重启会保留配置)。
         let manager = AppManager::with_resolver_and_policy_for_test(
@@ -4191,14 +4195,14 @@ source = "web/"
             gateway: rig.gateway,
             manager,
         };
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 1, 0));
         assert!(record.probation, "试用期随升级落盘");
 
         assert!(rig.manager.reconcile().is_clean() || true);
         let deadline = std::time::Instant::now() + Duration::from_secs(25);
         loop {
-            let record = rig.manager.registry.load(&app).unwrap().unwrap();
+            let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
             if record.current_version == Version::new(1, 0, 0) {
                 break;
             }
@@ -4210,7 +4214,7 @@ source = "web/"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 0, 0));
         assert!(!record.probation);
         assert!(record.last_rollback.unwrap().automatic);
@@ -4229,6 +4233,7 @@ source = "web/"
             .unwrap();
         assert!(
             rig.manager
+                .core
                 .registry
                 .paths()
                 .package_dir(&app, &Version::new(1, 1, 0))
@@ -4237,7 +4242,7 @@ source = "web/"
 
         rig.manager.rollback(&app).unwrap();
 
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 0, 0));
         assert_eq!(record.previous_version, None, "回滚消耗掉上一版");
         let note = record.last_rollback.unwrap();
@@ -4246,6 +4251,7 @@ source = "web/"
         assert!(!note.automatic);
         assert!(
             !rig.manager
+                .core
                 .registry
                 .paths()
                 .package_dir(&app, &Version::new(1, 1, 0))
@@ -4289,12 +4295,12 @@ source = "web/"
         rig.install(&write_app(&rig.src_dir("v2"), "site", "1.1.0", "", "V2"))
             .unwrap();
 
-        let before = rig.manager.registry.load(&app).unwrap().unwrap();
+        let before = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert!(matches!(
             rig.manager.rollback(&app),
             Err(ManagerError::RollbackEscalates)
         ));
-        let after = rig.manager.registry.load(&app).unwrap().unwrap();
+        let after = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(before, after, "被拒的回滚不得改动任何字段");
     }
 
@@ -4315,7 +4321,7 @@ source = "web/"
 
         wait_for(&rig, &app, 15, is_running);
         assert_eq!(rig.fetch(&app, "/").body, b"OLD");
-        let record = rig.manager.registry.load(&app).unwrap().unwrap();
+        let record = rig.manager.core.registry.load(&app).unwrap().unwrap();
         assert_eq!(record.current_version, Version::new(1, 0, 0));
         assert_eq!(record.previous_version, None);
     }
@@ -4431,8 +4437,8 @@ source = "web/"
         let rig = rig().await;
         let src = write_app(&rig.src_dir("a"), "alpha", "1.0.0", "", "A");
         let approved = rig.approve(&src);
-        let apps_dir = rig.manager.registry.paths().apps_dir();
-        let guard = rig.manager.lock.lock().unwrap();
+        let apps_dir = rig.manager.core.registry.paths().apps_dir();
+        let guard = rig.manager.core.lock.lock().unwrap();
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| rig.manager.install(&approved, &src, 1));
             let started = std::time::Instant::now();
@@ -4440,6 +4446,7 @@ source = "web/"
             while started.elapsed() < std::time::Duration::from_secs(5) {
                 if rig
                     .manager
+                    .core
                     .prepared
                     .load(std::sync::atomic::Ordering::SeqCst)
                     >= 1
@@ -4712,7 +4719,7 @@ source = "web/"
     }
 
     fn downloads_of(rig: &Rig) -> PathBuf {
-        rig.manager.registry.paths().downloads_dir()
+        rig.manager.core.registry.paths().downloads_dir()
     }
 
     fn downloads_is_empty(rig: &Rig) -> bool {
@@ -5098,7 +5105,7 @@ source = "web/"
             .unwrap();
         rig.manager.start(&good).unwrap();
         rig.gateway.remove_site(&good); // 模拟 supervisor 重启
-        let broken = rig.manager.registry.paths().apps_dir().join("broken");
+        let broken = rig.manager.core.registry.paths().apps_dir().join("broken");
         write_files(&broken, &[("state.json", "{not json")]);
 
         let report = rig.manager.reconcile();
@@ -5119,12 +5126,12 @@ source = "web/"
         let _ = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let _g = rig.manager.lock.lock().unwrap();
+                    let _g = rig.manager.core.lock.lock().unwrap();
                     panic!("故意毒化");
                 })
                 .join()
         });
-        assert!(rig.manager.lock.is_poisoned());
+        assert!(rig.manager.core.lock.is_poisoned());
         rig.manager.start(&a).unwrap();
         rig.manager.stop(&a).unwrap();
         assert!(rig.manager.reconcile().is_clean());
@@ -5613,7 +5620,7 @@ source = "web/"
             write_py_app_with_req,
             ">=3.12",
         );
-        let guard = rig.manager.lock.lock().unwrap();
+        let guard = rig.manager.core.lock.lock().unwrap();
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| rig.manager.start(&a));
             let started = std::time::Instant::now();
@@ -5635,7 +5642,14 @@ source = "web/"
             1,
             "预探的结果应被锁内检查取用,不重复探"
         );
-        assert!(rig.manager.prefetched_versions.lock().unwrap().is_empty());
+        assert!(
+            rig.manager
+                .core
+                .prefetched_versions
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -5941,9 +5955,10 @@ source = "web/"
 
         let stopped = ObservedState::Stopped;
         {
-            let _g = rig.manager.guard();
-            let mut record = rig.manager.load_record(&a).unwrap();
+            let _g = rig.manager.core.guard();
+            let mut record = rig.manager.core.load_record(&a).unwrap();
             rig.manager
+                .core
                 .set_observed(&mut record, stopped.clone())
                 .unwrap();
         }
@@ -5984,7 +5999,7 @@ source = "web/"
         let a = id("logger");
         let src = write_py_app(&rig.src_dir("a"), "logger", "1.0.0", PY_SERVER);
         rig.install(&src).unwrap();
-        let logs_dir = rig.manager.registry.paths().logs_dir(&a);
+        let logs_dir = rig.manager.core.registry.paths().logs_dir(&a);
         fs::create_dir_all(&logs_dir).unwrap();
         fs::write(
             logs_dir.join("app.log"),
@@ -6134,7 +6149,7 @@ source = "web/"
         let a = id("orphan");
         rig.install(&write_app(&rig.src_dir("a"), "orphan", "1.0.0", "", "x"))
             .unwrap();
-        let run_dir = rig.manager.registry.paths().run_dir(&a);
+        let run_dir = rig.manager.core.registry.paths().run_dir(&a);
         fs::create_dir_all(&run_dir).unwrap();
 
         let mut child = std::process::Command::new("sleep")
