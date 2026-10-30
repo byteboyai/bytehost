@@ -8,11 +8,12 @@
 //!
 //! 本模块只提供**机制**:产品决定何时创建哪个 slot 的子视图、加载什么内容。
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use bytehost_core::{LogicalRect, SurfaceSlot};
 use iced::{Size, Task, window};
+
+use crate::wry_common::HandleRegistry;
 
 /// 一个子视图的创建请求:slot + HTML 内容 + 逻辑矩形。
 #[derive(Clone, Debug)]
@@ -40,9 +41,10 @@ pub struct ChildBuilt {
 }
 
 thread_local! {
-    /// 非 Send 的 wry 句柄只在主线程持有;所有操作都必须经 `with_handle`。
-    static HANDLES: RefCell<HashMap<SurfaceSlot, wry::WebView>> =
-        RefCell::new(HashMap::new());
+    /// 非 Send 的 wry 句柄只在主线程持有;所有操作都必须经 `with_handles`。
+    /// 面板 surface 载入的是**可信内部 HTML**,builder 刻意保持 wry 默认
+    /// (不用 `wry_common::apply_restricted`),见该模块文档。
+    static HANDLES: HandleRegistry<SurfaceSlot, wry::WebView> = const { HandleRegistry::new() };
 }
 
 /// 在主线程用 `window::run` 创建一个 wry 子视图(HTML 内容)。
@@ -121,8 +123,8 @@ pub(crate) fn rect_to_wry(rect: LogicalRect) -> wry::Rect {
     }
 }
 
-fn with_handles<R>(f: impl FnOnce(&mut HashMap<SurfaceSlot, wry::WebView>) -> R) -> R {
-    HANDLES.with(|h| f(&mut h.borrow_mut()))
+fn with_handles<R>(f: impl FnOnce(&mut BTreeMap<SurfaceSlot, wry::WebView>) -> R) -> R {
+    HANDLES.with(|h| h.with(f))
 }
 
 /// 窗口当前逻辑尺寸(在 boot 里异步拿到;`None` 表示窗口尚未就绪)。

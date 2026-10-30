@@ -18,8 +18,7 @@
 //! 无法在 wry 层强制的项:**摄像头/麦克风** —— wry 0.55 会无条件批准权限请求,这里没有 hook
 //! 可拦;目前靠系统 TCC 挡着,且产品不声明用途(见规格 §6.4)。不虚报为已强制。
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use bytehost_core::{LogicalRect, SurfaceSlot};
 pub use bytehost_webview::i18n::{
@@ -31,6 +30,8 @@ use bytehost_webview::{
 };
 use iced::{Task, window};
 use wry::WebViewBuilderExtDarwin;
+
+use crate::wry_common::{HandleRegistry, apply_restricted};
 
 /// 创建一个应用子视图所需的**全部**产品输入:slot、加载地址、逻辑矩形、可见性。
 ///
@@ -75,8 +76,7 @@ impl From<AppIpc> for AppSurfaceIpc {
 
 thread_local! {
     /// 非 Send 的应用 wry 句柄只在主线程持有;与 `panel::HANDLES` 分表,避免与内置面板混用。
-    static APP_HANDLES: RefCell<HashMap<SurfaceSlot, wry::WebView>> =
-        RefCell::new(HashMap::new());
+    static APP_HANDLES: HandleRegistry<SurfaceSlot, wry::WebView> = const { HandleRegistry::new() };
 }
 
 /// 在主线程用 `window::run` 创建一个**受限**应用子视图。
@@ -111,7 +111,7 @@ where
         let slot = spec.slot;
         let nonce = new_ipc_nonce();
         let app_id = origin.app_id().to_owned();
-        let built = wry::WebViewBuilder::new()
+        let built = apply_restricted(wry::WebViewBuilder::new())
             .with_url(&spec.url)
             .with_bounds(crate::panel::rect_to_wry(spec.rect))
             .with_visible(spec.visible)
@@ -120,8 +120,6 @@ where
             // 但显式写 false 让"不做声明即不放行"这条在跨平台上一致,而不是依赖默认值(默认恰好也是 false)。
             .with_clipboard(false)
             .with_data_store_identifier(data_store_identifier(&app_id))
-            .with_download_started_handler(|_, _| false)
-            .with_devtools(false)
             .with_initialization_script(app_init_script(&nonce, install_i18n_bridge))
             .with_ipc_handler(move |req| {
                 if let Some(ipc) = AppIpc::parse(req.body().as_str(), &nonce) {
@@ -129,7 +127,6 @@ where
                 }
             })
             .with_navigation_handler(move |url: String| origin.allows_navigation(&url))
-            .with_new_window_req_handler(|_url, _features| wry::NewWindowResponse::Deny)
             .with_on_page_load_handler(move |event, _url| {
                 if matches!(event, wry::PageLoadEvent::Finished) {
                     on_ready(slot);
@@ -238,8 +235,8 @@ where
     })
 }
 
-fn with_app_handles<R>(f: impl FnOnce(&mut HashMap<SurfaceSlot, wry::WebView>) -> R) -> R {
-    APP_HANDLES.with(|h| f(&mut h.borrow_mut()))
+fn with_app_handles<R>(f: impl FnOnce(&mut BTreeMap<SurfaceSlot, wry::WebView>) -> R) -> R {
+    APP_HANDLES.with(|h| h.with(f))
 }
 
 #[cfg(test)]
@@ -257,11 +254,11 @@ mod tests {
         let prod = &src[..src.find("#[cfg(test)]").unwrap()];
         let start = prod.find("pub fn build_app_child<M>(").unwrap();
         let body = &prod[start..];
+        // wry 默认值反转(devtools/下载/新窗口)统一在 wry_common::apply_restricted,
+        // 由那里的参数化测试钉住;这里只钉应用 webview 特有的策略。
         for required in [
-            ".with_download_started_handler(|_, _| false)",
-            ".with_devtools(false)",
+            "apply_restricted(",
             ".with_clipboard(false)",
-            ".with_new_window_req_handler(",
             ".with_navigation_handler(",
             ".with_data_store_identifier(",
             ".with_initialization_script(app_init_script(",

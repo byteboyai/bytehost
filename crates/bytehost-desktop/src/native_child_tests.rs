@@ -177,12 +177,11 @@ fn native_child_pins_the_restrictive_wry_settings() {
     let src = include_str!("native_child.rs");
     // 只看生产代码:测试模块自身含这些字面量(在断言里),扫进去会自我命中。
     let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+    // wry 默认值反转(devtools/下载/新窗口)统一在 wry_common::apply_restricted,
+    // 由那里的参数化测试钉住;这里只钉可信原生子视图特有的导航策略。
     for required in [
-        ".with_devtools(false)",
-        ".with_download_started_handler(|_, _| allows_download())",
-        ".with_new_window_req_handler(|_, _| new_window_response())",
+        "apply_restricted(",
         ".with_navigation_handler(move |url| allows_navigation(scheme, host, &url))",
-        "wry::NewWindowResponse::Deny",
         "build_as_child(",
     ] {
         assert!(prod.contains(required), "缺少 {required}");

@@ -12,10 +12,10 @@ use super::plan::{
     ExistingTab, LoadVerdict, NavTracker, PoolAction, WebTabSpec, plan_sync, wry_target,
 };
 use crate::native_child::{Probe, inspect, restore_focus};
+use crate::wry_common::{HandleRegistry, apply_restricted};
 use bytehost_core::LogicalRect;
 use bytehost_webview::browse::{allows_browse_navigation, allows_new_tab};
 use iced::{Task, window};
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -103,9 +103,22 @@ struct PoolState {
 }
 
 thread_local! {
-    static POOLS: RefCell<BTreeMap<u64, PoolState>> = const { RefCell::new(BTreeMap::new()) };
+    static POOLS: HandleRegistry<u64, PoolState> = const { HandleRegistry::new() };
 }
 static NEXT_POOL: AtomicU64 = AtomicU64::new(1);
+
+fn with_pools<R>(f: impl FnOnce(&mut BTreeMap<u64, PoolState>) -> R) -> R {
+    POOLS.with(|pools| pools.with(f))
+}
+fn with_pools_ref<R>(f: impl FnOnce(&BTreeMap<u64, PoolState>) -> R) -> R {
+    POOLS.with(|pools| pools.with_ref(f))
+}
+fn try_with_pools<R>(f: impl FnOnce(&mut BTreeMap<u64, PoolState>) -> R) -> Option<R> {
+    POOLS.with(|pools| pools.try_with(f))
+}
+fn try_with_pools_ref<R>(f: impl FnOnce(&BTreeMap<u64, PoolState>) -> R) -> Option<R> {
+    POOLS.with(|pools| pools.try_with_ref(f))
+}
 
 /// 一个产品槽位对应一个池(Digger 的浏览器面板一个)。方法只在主线程的 `window::run` 里碰 wry。
 pub struct WebPool {
@@ -220,8 +233,7 @@ impl WebPool {
         if self.epoch.load(Ordering::SeqCst) != generation {
             return None;
         }
-        POOLS.with(|pools| {
-            let pools = pools.borrow();
+        with_pools_ref(|pools| {
             let state = pools
                 .get(&self.slot)
                 .filter(|s| s.generation == generation)?;
@@ -305,9 +317,8 @@ impl WebPool {
         if self.epoch.load(Ordering::SeqCst) != generation {
             return;
         }
-        POOLS.with(|pools| {
+        with_pools(|pools| {
             if let Some(state) = pools
-                .borrow_mut()
                 .get_mut(&self.slot)
                 .filter(|s| s.generation == generation)
             {
@@ -333,8 +344,8 @@ impl WebPool {
         if let Ok(mut tracker) = self.tracker.lock() {
             *tracker = NavTracker::new(NAV_STALL_TIMEOUT);
         }
-        POOLS.with(|pools| {
-            if let Some(state) = pools.borrow_mut().remove(&self.slot) {
+        with_pools(|pools| {
+            if let Some(state) = pools.remove(&self.slot) {
                 for tab in state.tabs.values() {
                     restore_focus(&tab.view);
                 }
@@ -370,8 +381,7 @@ impl WebPool {
     ) -> Task<E> {
         let slot = self.slot;
         window::run(id, move |_| {
-            map(POOLS.with(|pools| {
-                let pools = pools.borrow();
+            map(with_pools_ref(|pools| {
                 let state = pools.get(&slot);
                 let entry = state
                     .filter(|s| s.generation == generation)
@@ -412,10 +422,7 @@ pub(crate) fn first_responder_is_pool_view() -> bool {
         return false;
     };
     let target = Retained::as_ptr(&responder).cast::<AnyObject>();
-    POOLS.with(|pools| {
-        let Ok(pools) = pools.try_borrow() else {
-            return false;
-        };
+    try_with_pools_ref(|pools| {
         pools.values().any(|state| {
             state.tabs.values().any(|tab| {
                 let web_view = tab.view.webview();
@@ -423,6 +430,7 @@ pub(crate) fn first_responder_is_pool_view() -> bool {
             })
         })
     })
+    .unwrap_or(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -436,8 +444,7 @@ fn apply_sync(
     events: &Sender<WebEvent>,
     tracker: &Arc<Mutex<NavTracker>>,
 ) -> Result<(), String> {
-    POOLS.with(|pools| {
-        let mut pools = pools.borrow_mut();
+    with_pools(|pools| {
         let state = pools.entry(slot).or_insert_with(|| PoolState {
             generation,
             rect,
@@ -543,10 +550,7 @@ fn target_or_block(events: &Sender<WebEvent>, generation: u64, id: usize, url: &
 /// 页签网址改成页面实际所在的地址再回灌,如果池还记着旧地址,下一次同步会把**同一页**再导航一遍(白刷新)。
 /// 回调可能在持有池表的同步过程中被触发,拿不到借用就跳过(那一轮同步本来就在对齐网址)。
 fn remember_page_url(slot: u64, generation: u64, id: usize, url: &str) {
-    POOLS.with(|pools| {
-        let Ok(mut pools) = pools.try_borrow_mut() else {
-            return;
-        };
+    try_with_pools(|pools| {
         if let Some(tab) = pools
             .get_mut(&slot)
             .filter(|s| s.generation == generation)
@@ -587,14 +591,12 @@ fn build_tab(
 ) -> Result<(WebView, Guard), String> {
     let (title_tx, load_tx, window_tx) = (events.clone(), events.clone(), events.clone());
     let load_tracker = tracker.clone();
-    let view = WebViewBuilder::new()
+    let view = apply_restricted(WebViewBuilder::new())
         .with_url(target)
         .with_bounds(crate::panel::rect_to_wry(rect))
         .with_visible(visible)
-        .with_devtools(false)
         .with_allow_link_preview(false)
         .with_data_store_identifier(BROWSER_DATA_STORE_ID)
-        .with_download_started_handler(|_, _| false)
         .with_navigation_handler(|url| allows_browse_navigation(&url))
         .with_new_window_req_handler(move |url, _features| {
             if allows_new_tab(&url) {
@@ -641,8 +643,9 @@ mod tests {
         // 只看生产代码:测试模块自身含这些字面量(在断言里),扫进去会自我命中。
         let prod = &src[..src.find("#[cfg(test)]").unwrap()];
         for required in [
-            ".with_devtools(false)",
-            ".with_download_started_handler(|_, _| false)",
+            // wry 默认值反转(devtools/下载/新窗口)统一在 wry_common::apply_restricted,
+            // 由那里的参数化测试钉住;池在这里只钉"不可信内容"特有的策略与覆盖。
+            "apply_restricted(",
             ".with_allow_link_preview(false)",
             ".with_data_store_identifier(BROWSER_DATA_STORE_ID)",
             ".with_navigation_handler(",

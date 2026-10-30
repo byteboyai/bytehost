@@ -11,13 +11,14 @@
 use bytehost_core::LogicalRect;
 use iced::{Task, window};
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+use crate::wry_common::{HandleRegistry, apply_restricted};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Desired {
@@ -134,7 +135,12 @@ struct Entry {
     view: wry::WebView,
 }
 thread_local! {
-    static VIEWS: RefCell<BTreeMap<u64, Entry>> = const { RefCell::new(BTreeMap::new()) };
+    static VIEWS: HandleRegistry<u64, Entry> = const { HandleRegistry::new() };
+}
+
+/// 在主线程借出句柄表(所有 wry 调用都必须在 `window::run` 里)。
+fn with_views<R>(f: impl FnOnce(&mut BTreeMap<u64, Entry>) -> R) -> R {
+    VIEWS.with(|views| views.with(f))
 }
 static NEXT_HOST: AtomicU64 = AtomicU64::new(1);
 pub struct Host {
@@ -159,8 +165,7 @@ impl Host {
         self.scheduled = None;
         let slot = self.slot;
         window::run(id, move |_| {
-            VIEWS.with(|views| {
-                let mut views = views.borrow_mut();
+            with_views(|views| {
                 if views.get(&slot).is_some_and(|e| e.generation == generation)
                     && let Some(entry) = views.remove(&slot)
                 {
@@ -195,12 +200,13 @@ impl Host {
             if epoch.load(Ordering::SeqCst) != generation {
                 return done;
             }
-            let result = VIEWS.with(|views| {
-                let mut views = views.borrow_mut();
+            let result = with_views(|views| {
                 if let Some(old) = views.remove(&slot) {
                     restore_focus(&old.view);
                 }
-                let builder = configure(wry::WebViewBuilder::new())
+                // 宿主策略在 `configure` **之后**应用:产品只能追加,不能把 devtools/
+                // 下载/新窗口放开。
+                let builder = apply_restricted(configure(wry::WebViewBuilder::new()))
                     .with_url(&desired.url)
                     .with_bounds(if desired.loaded {
                         bounds(desired.rect)
@@ -208,9 +214,6 @@ impl Host {
                         parked_bounds(desired.rect)
                     })
                     .with_visible(desired.visible)
-                    .with_devtools(false)
-                    .with_download_started_handler(|_, _| allows_download())
-                    .with_new_window_req_handler(|_, _| new_window_response())
                     .with_navigation_handler(move |url| allows_navigation(scheme, host, &url));
                 let view = builder.build_as_child(&window).map_err(|e| e.to_string())?;
                 view.zoom(desired.scale).map_err(|e| e.to_string())?;
@@ -254,8 +257,7 @@ impl Host {
             if epoch.load(Ordering::SeqCst) != generation {
                 return done;
             }
-            let result = VIEWS.with(|views| {
-                let mut views = views.borrow_mut();
+            let result = with_views(|views| {
                 let e = views
                     .get_mut(&slot)
                     .filter(|e| e.generation == generation)
@@ -298,8 +300,7 @@ impl Host {
     ) -> Task<E> {
         let slot = self.slot;
         window::run(id, move |_| {
-            map(VIEWS.with(|views| {
-                let views = views.borrow();
+            map(with_views(|views| {
                 let entry = views.get(&slot).filter(|e| e.generation == generation);
                 let mut probe = Probe {
                     exists: entry.is_some(),
