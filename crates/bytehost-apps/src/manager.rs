@@ -279,6 +279,13 @@ impl AppTransitions {
     /// 拿单写者锁(尝试循环),拿到后核对取消标志。返回 `None` = 已取消,调用方必须放弃写入。
     fn acquire(&self) -> Option<AppWriteGuard<'_>> {
         use std::sync::atomic::Ordering;
+        // 在同一个通知 mutex 下检查条件并进入等待。释放者先释放业务锁,
+        // 再持通知 mutex 发信号,因此检查与 wait 之间不会丢失释放/取消通知。
+        let mut waiting = self
+            .core
+            .lock_released_mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let g = loop {
             if self.cancel.load(Ordering::SeqCst) {
                 return None;
@@ -286,10 +293,14 @@ impl AppTransitions {
             if let Some(g) = self.core.try_lock_app(&self.id) {
                 break g;
             }
-            // 等"锁已释放 / 已被取消"的通知(取消时 `stop`/`suspend_all` 会主动唤醒)。
-            // 超时只是丢通知的兜底:通知不是粘性的,刚好在 try_lock 与 wait 之间释放会错过一次。
-            self.core.wait_for_lock_release(LOCK_WAIT_FALLBACK);
+            waiting = self
+                .core
+                .lock_released
+                .wait(waiting)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         };
+        // 已取消时 g 的 Drop 会重新拿通知 mutex,必须先释放 waiting。
+        drop(waiting);
         if self.cancel.load(Ordering::SeqCst) {
             return None;
         }
@@ -865,10 +876,6 @@ impl AppManager {
     }
 }
 
-/// 等锁通知的兜底间隔。正常路径由 guard 的 Drop 或取消时主动唤醒(微秒级);
-/// 这个超时只兜"通知刚好错过"的竞态(通知不是粘性的)。
-const LOCK_WAIT_FALLBACK: std::time::Duration = std::time::Duration::from_millis(5);
-
 /// per-app 锁的分片数。远大于并发改状态的应用数;碰撞只降低并行度。
 const APP_LOCK_SHARDS: usize = 64;
 
@@ -880,12 +887,17 @@ struct AppWriteGuard<'a> {
     app: Option<std::sync::MutexGuard<'a, ()>>,
     lifecycle: Option<std::sync::RwLockReadGuard<'a, ()>>,
     released: &'a std::sync::Condvar,
+    released_mutex: &'a Mutex<()>,
 }
 
 impl Drop for AppWriteGuard<'_> {
     fn drop(&mut self) {
         drop(self.app.take());
         drop(self.lifecycle.take());
+        let _signal = self
+            .released_mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.released.notify_all();
     }
 }
@@ -894,11 +906,16 @@ impl Drop for AppWriteGuard<'_> {
 struct AllWriteGuard<'a> {
     lifecycle: Option<std::sync::RwLockWriteGuard<'a, ()>>,
     released: &'a std::sync::Condvar,
+    released_mutex: &'a Mutex<()>,
 }
 
 impl Drop for AllWriteGuard<'_> {
     fn drop(&mut self) {
         drop(self.lifecycle.take());
+        let _signal = self
+            .released_mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.released.notify_all();
     }
 }
@@ -930,6 +947,7 @@ impl Core {
             app: Some(guard),
             lifecycle: Some(lifecycle),
             released: &self.lock_released,
+            released_mutex: &self.lock_released_mutex,
         }
     }
 
@@ -952,6 +970,7 @@ impl Core {
             app: Some(guard),
             lifecycle: Some(lifecycle),
             released: &self.lock_released,
+            released_mutex: &self.lock_released_mutex,
         })
     }
 
@@ -964,21 +983,16 @@ impl Core {
         AllWriteGuard {
             lifecycle: Some(lifecycle),
             released: &self.lock_released,
+            released_mutex: &self.lock_released_mutex,
         }
-    }
-
-    /// 等一次等锁通知(超时返回)。调用方在 `try_lock_app` 失败后用它代替 sleep 轮询。
-    fn wait_for_lock_release(&self, timeout: std::time::Duration) {
-        let mutex = self
-            .lock_released_mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // 毒化只有"等锁线程 panic 时正持着这个小锁"才会发生;它保护的是 `()`,取回继续。
-        drop(self.lock_released.wait_timeout(mutex, timeout));
     }
 
     /// 唤醒所有正在等锁的监管线程(取消时调用,让它们立刻看到 `cancel`)。
     fn wake_lock_waiters(&self) {
+        let _signal = self
+            .lock_released_mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.lock_released.notify_all();
     }
 
@@ -2298,6 +2312,7 @@ mod tests {
     use crate::permissions::{Access, Enforcement, PermissionKey};
     use crate::plan::Approval;
     use crate::testutil::{Req, Resp, write_files};
+    use std::sync::atomic::Ordering;
 
     const HOST: Version = Version::new(0, 1, 0);
 
@@ -4056,6 +4071,84 @@ source = "web/"
             waited < Duration::from_millis(1),
             "释放后等待方应在 <1ms 内拿到锁,实际 {waited:?}"
         );
+    }
+
+    /// 确定性覆盖 try_lock 失败之后、真正 wait 之前释放的窗口。
+    /// 释放者必须等等待方原子地释放通知 mutex 后再发信号,不能靠轮询兜底。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_between_check_and_wait_is_not_lost() {
+        let rig = rig().await;
+        for global in [false, true] {
+            let core = rig.manager.core.clone();
+            let app = id("excalidraw");
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let owner = core.clone();
+            let owner_app = app.clone();
+            let releaser = std::thread::spawn(move || {
+                let app_guard = (!global).then(|| owner.lock_app(&owner_app));
+                let all_guard = global.then(|| owner.lock_all());
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(app_guard);
+                drop(all_guard);
+                done_tx.send(()).unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let waiting = core.lock_released_mutex.lock().unwrap();
+            assert!(core.try_lock_app(&app).is_none());
+            release_tx.send(()).unwrap();
+            // 只探测原始锁,避免构造的通知 guard 在本线程 Drop 时重新拿 mutex。
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let unlocked = if global {
+                    core.lifecycle.try_read().is_ok()
+                } else {
+                    core.app_lock(&app).try_lock().is_ok()
+                };
+                if unlocked {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let (waiting, timed) = core
+                .lock_released
+                .wait_timeout(waiting, Duration::from_secs(2))
+                .unwrap();
+            drop(waiting);
+            assert!(!timed.timed_out(), "释放通知不得落在检查与等待之间而丢失");
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            releaser.join().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_between_check_and_wait_is_not_lost() {
+        let rig = rig().await;
+        let core = rig.manager.core.clone();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = core.lock_released_mutex.lock().unwrap();
+        assert!(!cancel.load(Ordering::SeqCst));
+        let notifier_core = core.clone();
+        let notifier_cancel = cancel.clone();
+        let notifier = std::thread::spawn(move || {
+            notifier_cancel.store(true, Ordering::SeqCst);
+            notifier_core.wake_lock_waiters();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !cancel.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let (waiting, timed) = core
+            .lock_released
+            .wait_timeout(waiting, Duration::from_secs(2))
+            .unwrap();
+        drop(waiting);
+        assert!(!timed.timed_out(), "取消通知不得在进入等待前丢失");
+        notifier.join().unwrap();
     }
 
     /// Tier3 Task1 的核心目标:锁粒度从"全局单写者"降到"每应用一把"。
