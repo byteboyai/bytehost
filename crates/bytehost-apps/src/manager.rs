@@ -185,6 +185,11 @@ pub struct Core {
     events: broadcast::Sender<AppEvent>,
     /// 单写者锁:所有改状态的方法都先拿它。
     lock: Mutex<()>,
+    /// 等锁通知(与 `lock` 分开的独立小锁):`WriteGuard` 释放锁、或 `stop`/`suspend_all`
+    /// 取消监管线程时 `notify_all`。等待者**不能**阻塞在 `lock` 上——持锁方 join 监管线程,
+    /// 那样必死锁;这里等的是"锁可能已释放 / 已取消"的通知。
+    lock_released_mutex: Mutex<()>,
+    lock_released: std::sync::Condvar,
     /// `suspend_all` 之后置位、`reconcile` 清除:置位期间 `install`/`start` 在**拿到锁之后**被拒绝——
     /// 一个恰好排在锁后面的 `Start` 不能在撤站点之后又把站点注册回已停止的 gateway。
     closed: std::sync::atomic::AtomicBool,
@@ -269,7 +274,7 @@ struct AppTransitions {
 
 impl AppTransitions {
     /// 拿单写者锁(尝试循环),拿到后核对取消标志。返回 `None` = 已取消,调用方必须放弃写入。
-    fn acquire(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+    fn acquire(&self) -> Option<WriteGuard<'_>> {
         use std::sync::atomic::Ordering;
         let g = loop {
             if self.cancel.load(Ordering::SeqCst) {
@@ -278,7 +283,9 @@ impl AppTransitions {
             if let Some(g) = self.core.try_guard() {
                 break g;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            // 等"锁已释放 / 已被取消"的通知(取消时 `stop`/`suspend_all` 会主动唤醒)。
+            // 超时只是丢通知的兜底:通知不是粘性的,刚好在 try_lock 与 wait 之间释放会错过一次。
+            self.core.wait_for_lock_release(LOCK_WAIT_FALLBACK);
         };
         if self.cancel.load(Ordering::SeqCst) {
             return None;
@@ -700,6 +707,8 @@ impl AppManager {
                 host_version,
                 events,
                 lock: Mutex::new(()),
+                lock_released_mutex: Mutex::new(()),
+                lock_released: std::sync::Condvar::new(),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 resolver,
                 version_probe,
@@ -859,24 +868,70 @@ impl AppManager {
     }
 }
 
+/// 等锁通知的兜底间隔。正常路径由 [`WriteGuard`] 的 Drop 或取消时主动唤醒(微秒级);
+/// 这个超时只兜"通知刚好错过"的竞态(通知不是粘性的)。
+const LOCK_WAIT_FALLBACK: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// 单写者锁的 guard:Drop 时唤醒正在等锁的监管线程。
+///
+/// 返回这个(而不是裸 `MutexGuard`)是为了让"释放锁"自动带一次通知——等待者不能轮询
+/// (见 [`Core::lock_released`] 的注释),只能靠通知;漏掉任何一条释放路径都会让监管线程
+/// 白等到兜底超时。
+struct WriteGuard<'a> {
+    inner: Option<std::sync::MutexGuard<'a, ()>>,
+    released: &'a std::sync::Condvar,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        // 先放锁再通知:等待者被唤醒后会立刻 `try_lock`,此时锁必须已经可用。
+        drop(self.inner.take());
+        self.released.notify_all();
+    }
+}
+
 impl Core {
     /// 单写者锁。持锁线程 panic 会毒化它,但它保护的是 `()`(锁住的是"同一时刻只有一个改状态的操作",
     /// 没有需要保持的数据不变量),所以取回内部数据继续用,不能让此后每个加锁的调用都跟着 panic。
-    fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.lock
+    fn guard(&self) -> WriteGuard<'_> {
+        let inner = self
+            .lock
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        WriteGuard {
+            inner: Some(inner),
+            released: &self.lock_released,
+        }
+    }
+
+    /// 等一次等锁通知(超时返回)。调用方在 `try_guard` 失败后用它代替 sleep 轮询。
+    fn wait_for_lock_release(&self, timeout: std::time::Duration) {
+        let mutex = self
+            .lock_released_mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 毒化只有"等锁线程 panic 时正持着这个小锁"才会发生;它保护的是 `()`,取回继续。
+        drop(self.lock_released.wait_timeout(mutex, timeout));
+    }
+
+    /// 唤醒所有正在等单写者锁的监管线程(取消时调用,让它们立刻看到 `cancel`)。
+    fn wake_lock_waiters(&self) {
+        self.lock_released.notify_all();
     }
 
     /// 非阻塞取锁(毒化时同样取回内部数据)。监管线程用它"拿锁 + 查取消"循环,绝不阻塞在锁上——
     /// `stop_locked`/`suspend_all` 会持着锁 `join` 监管线程,线程若阻塞等锁就是死锁。
     #[allow(dead_code)]
-    fn try_guard(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
-        match self.lock.try_lock() {
-            Ok(g) => Some(g),
-            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-        }
+    fn try_guard(&self) -> Option<WriteGuard<'_>> {
+        let inner = match self.lock.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(WriteGuard {
+            inner: Some(inner),
+            released: &self.lock_released,
+        })
     }
 
     fn emit(&self, event: AppEvent) {
@@ -1752,6 +1807,8 @@ impl Core {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.remove(id).map(|mut s| {
             s.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            // 线程可能正等单写者锁(我们此刻持着它):唤醒后它会看到 cancel 并退出。
+            self.wake_lock_waiters();
             s.thread.take().expect("登记时必有句柄")
         })
     }
@@ -2048,6 +2105,7 @@ impl Core {
             map.drain()
                 .map(|(_, mut s)| {
                     s.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.wake_lock_waiters();
                     s.thread.take().expect("登记时必有句柄")
                 })
                 .collect()
@@ -3905,6 +3963,76 @@ source = "web/"
         assert_eq!(record.desired, DesiredState::Running);
         assert_eq!(record.observed, ObservedState::Running, "旧版本被拉回来了");
         assert_eq!(record.previous_version, None);
+    }
+
+    /// acquire() 不再 sleep 轮询(Tier3 Task4):持锁方一释放,等待方应立刻拿到锁
+    /// (旧实现固定 5ms 一拍,平均等 2.5ms)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_the_writer_lock_wakes_immediately_on_release() {
+        let rig = rig().await;
+        let core = rig.manager.core.clone();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = core.guard();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let transitions = AppTransitions {
+            core: core.clone(),
+            id: id("excalidraw"),
+            cancel: cancel.clone(),
+        };
+        let waiter = std::thread::spawn(move || {
+            let acquired = transitions.acquire().is_some();
+            let _ = tx.send(acquired);
+        });
+        // 让等待方进入等待(此刻锁被主线程持有)。
+        std::thread::sleep(Duration::from_millis(50));
+        let released_at = std::time::Instant::now();
+        drop(guard);
+        let acquired = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("释放锁后等待方必须被唤醒");
+        let waited = released_at.elapsed();
+        waiter.join().unwrap();
+        assert!(acquired, "未取消时必须拿到锁");
+        assert!(
+            waited < Duration::from_millis(1),
+            "释放后等待方应在 <1ms 内拿到锁,实际 {waited:?}"
+        );
+    }
+
+    /// 取消必须能唤醒**正在等锁**的监管线程——`stop`/`suspend_all` 持着锁 join 线程,
+    /// 线程若只等释放通知就永远看不到 cancel(旧实现的 5ms 轮询会迟到但最终退出)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_wakes_a_waiter_for_the_writer_lock() {
+        let rig = rig().await;
+        let core = rig.manager.core.clone();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = core.guard();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let transitions = AppTransitions {
+            core: core.clone(),
+            id: id("excalidraw"),
+            cancel: cancel.clone(),
+        };
+        let waiter = std::thread::spawn(move || {
+            let acquired = transitions.acquire().is_some();
+            let _ = tx.send(acquired);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let cancelled_at = std::time::Instant::now();
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        core.wake_lock_waiters();
+        let acquired = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("取消后等待方必须被唤醒");
+        let waited = cancelled_at.elapsed();
+        waiter.join().unwrap();
+        // 锁仍被主线程握着:线程只能因 cancel 退出。
+        assert!(!acquired, "已取消的线程不得再拿锁写状态");
+        assert!(
+            waited < Duration::from_millis(50),
+            "取消后等待方应立刻放弃,实际 {waited:?}"
+        );
+        drop(guard);
     }
 
     /// 自动回滚线程拿到锁之后必须**重新核对**再动手(Review Focus 2)。确定性地制造"线程已阻塞在 `guard()`、
