@@ -1,0 +1,20 @@
+[package]
+name = "bytehost-settings-ui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "共享设置窗口的 iced 视图:容器、主题页、语言页与应用管理页。可依赖 byteui / iced 与 bytehost 应用类型,不依赖任何产品 crate,不创建窗口、不访问路径、不启动任务。"
+
+[dependencies]
+bytehost-settings = { path = "../bytehost-settings" }
+bytehost-apps = { path = "../bytehost-apps" }
+bytehost-panel = { path = "../bytehost-panel" }
+byteui = { git = "https://github.com/byteboyai/byteui", tag = "v0.5.0" }
+# 只消费 iced 的核心契约;不打开任何渲染器后端——消费方(dozer / digger)决定后端,
+# feature 合并后 `iced_renderer::Renderer` 是同一个类型。
+iced = { version = "0.14", default-features = false, features = ["tokio"] }
+
+[[example]]
+name = "composition"
+path = "examples/composition.rs"

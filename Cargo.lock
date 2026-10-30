@@ -320,6 +320,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytehost-settings"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bytehost-settings-ui"
+version = "0.1.0"
+dependencies = [
+ "bytehost-apps",
+ "bytehost-panel",
+ "bytehost-settings",
+ "byteui",
+ "iced",
+]
+
+[[package]]
 name = "bytehost-webview"
 version = "0.1.0"
 dependencies = [

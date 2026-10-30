@@ -1,0 +1,13 @@
+[package]
+name = "bytehost-settings"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "产品中立的设置页身份、注册表、窗口导航状态与通用选择保存状态。仅标准库与 serde,不依赖任何界面框架或产品 crate。"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
