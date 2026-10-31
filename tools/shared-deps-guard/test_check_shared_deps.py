@@ -235,6 +235,45 @@ class OfflineRuleTests(unittest.TestCase):
         ]
         self.assertEqual(g.check_lock_duplicates(packages), [])
 
+    def test_lock_ref_mismatch_flags_stale_tag(self):
+        deps = [dep("byteui", "byteui", "tag", "v0.5.0")]
+        packages = [{"name": "byteui", "version": "0.5.0",
+                     "source": "git+https://github.com/byteboyai/byteui?tag=v0.4.4#aaaa"}]
+        issues = g.check_lock_matches_manifest(deps, packages)
+        self.assertEqual([(i.level, i.rule) for i in issues], [("block", "lock-ref-mismatch")])
+        self.assertIn("v0.5.0", issues[0].message)
+        self.assertIn("v0.4.4", issues[0].message)
+
+    def test_lock_ref_mismatch_accepts_matching_tag(self):
+        deps = [dep("byteui", "byteui", "tag", "v0.5.0")]
+        packages = [{"name": "byteui", "version": "0.5.0",
+                     "source": "git+https://github.com/byteboyai/byteui?tag=v0.5.0#aaaa"}]
+        self.assertEqual(g.check_lock_matches_manifest(deps, packages), [])
+
+    def test_lock_ref_mismatch_ignores_local_or_scratch_graphs(self):
+        deps = [dep("byteui", "byteui", "tag", "v0.5.0"),
+                dep("byteui", "byteui", "tag", "v0.5.0", manifest="spike/x/Cargo.toml")]
+        packages = [{"name": "byteui", "version": "0.5.0"}]
+        self.assertEqual(g.check_lock_matches_manifest(deps, packages), [])
+
+    def test_iced_alignment_blocks_duplicates_and_wrong_series(self):
+        packages = [
+            {"name": "iced_widget", "version": "0.14.2"},
+            {"name": "iced_widget", "version": "0.13.0"},
+            {"name": "iced_renderer", "version": "0.12.0"},
+        ]
+        rules = sorted(i.rule for i in g.check_iced_alignment(packages))
+        self.assertIn("iced-duplicate", rules)
+        self.assertIn("iced-version", rules)
+
+    def test_iced_alignment_accepts_one_0_14_series(self):
+        packages = [
+            {"name": "iced_widget", "version": "0.14.2"},
+            {"name": "iced_tiny_skia", "version": "0.14.1"},
+            {"name": "serde", "version": "1.0.0"},
+        ]
+        self.assertEqual(g.check_iced_alignment(packages), [])
+
     def test_mismatch_blocks_when_one_repo_has_two_refs(self):
         deps = [dep("dozer-model", "dozer", "rev", "aaa"), dep("dozer-services", "dozer", "rev", "bbb"),
                 dep("bytehost-core")]

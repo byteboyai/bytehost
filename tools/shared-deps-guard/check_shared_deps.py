@@ -239,6 +239,79 @@ def check_lock_duplicates(packages: list[dict], lock_path: str = "Cargo.lock") -
     return issues
 
 
+def _ref_fragment(kind: str, ref: str) -> str:
+    """Cargo.lock 的 git source 里表示"解析到哪个引用"的片段。"""
+    if kind in ("tag", "rev", "branch"):
+        return f"?{kind}={ref}#"
+    return ""
+
+
+def check_lock_matches_manifest(deps: list[Dep], packages: list[dict],
+                                lock_path: str = "Cargo.lock") -> list[Issue]:
+    """清单声明的 git 引用必须和 Cargo.lock 里实际解析到的一致。
+
+    只比较清单字符串不够:改 tag 后忘记 `cargo update -p` 时,锁文件会继续
+    钉在旧提交,发布组合和本地看到的是两套源码。
+    """
+    by_name: dict[str, list[str]] = {}
+    for pkg in packages:
+        by_name.setdefault(pkg["name"], []).append(str(pkg.get("source", "")))
+
+    issues: list[Issue] = []
+    seen: set[tuple[str, str, str]] = set()
+    for d in deps:
+        # spike/ 与 .worktrees/ 是刻意排除的临时工作区,不参与发布组合检查。
+        if d.manifest.startswith(("spike/", ".worktrees/")):
+            continue
+        sources = [s for s in by_name.get(d.crate, []) if s]
+        if not sources:
+            continue  # 缺失/本地覆盖由 check_lock 报告
+        want = _ref_fragment(d.ref_kind, d.ref)
+        if any(repo_name(s) == d.repo and want in s for s in sources):
+            continue
+        found = ", ".join(_short_source(s) for s in sources)
+        key = (d.crate, f"{d.ref_kind}={d.ref}", found)
+        if key in seen:
+            continue
+        seen.add(key)
+        issues.append(Issue(BLOCK, "lock-ref-mismatch",
+                            f"{d.manifest} 声明 {d.crate} 用 {d.repo} {d.ref_kind}={d.ref or '(无)'},"
+                            f"但 {lock_path} 实际解析到 {found};先执行 cargo update -p {d.crate}"))
+    return issues
+
+
+# iced 全家桶:byteui 与两产品必须解析到同一个 0.14 系列,否则会出现两套
+# 同名 UI 类型,编译期或运行期都会以难懂的方式失败。
+_ICED_CRATES = {
+    "iced", "iced_core", "iced_debug", "iced_futures", "iced_graphics",
+    "iced_highlighter", "iced_program", "iced_renderer", "iced_runtime",
+    "iced_tiny_skia", "iced_wgpu", "iced_widget", "iced_winit",
+}
+_ICED_MAJOR_MINOR = "0.14."
+
+
+def check_iced_alignment(packages: list[dict], lock_path: str = "Cargo.lock") -> list[Issue]:
+    """从实际锁文件核对 iced 版本:每个 crate 只能有一份,且必须是 0.14.x。"""
+    versions: dict[str, set[str]] = {}
+    for pkg in packages:
+        name = pkg.get("name", "")
+        if name in _ICED_CRATES:
+            versions.setdefault(name, set()).add(str(pkg.get("version", "")))
+
+    issues: list[Issue] = []
+    for name, found in sorted(versions.items()):
+        if len(found) > 1:
+            issues.append(Issue(BLOCK, "iced-duplicate",
+                                f"{name} 在 {lock_path} 里有多个版本:{', '.join(sorted(found))};"
+                                "byteui 与消费方必须对齐到同一个 iced 0.14"))
+        for version in sorted(found):
+            if not version.startswith(_ICED_MAJOR_MINOR):
+                issues.append(Issue(BLOCK, "iced-version",
+                                    f"{name} 在 {lock_path} 里是 {version},要求 {_ICED_MAJOR_MINOR}x;"
+                                    "升级 iced 必须先升级 byteui"))
+    return issues
+
+
 def _short_source(source: str) -> str:
     """git+https://github.com/byteboyai/bytehost?tag=v0.4.1#79212c08... -> bytehost?tag=v0.4.1#79212c0"""
     body = source.split("github.com/byteboyai/", 1)[-1]
@@ -509,8 +582,12 @@ def run(root: Path, remote: Remote | None, today: datetime.date,
     for graph in sorted({d.graph for d in deps}):
         lock_path = "Cargo.lock" if graph == "." else f"{graph}/Cargo.lock"
         packages = load_lock(root / graph)
-        issues += check_lock([d for d in deps if d.graph == graph], packages, lock_path, local_names)
+        graph_deps = [d for d in deps if d.graph == graph]
+        issues += check_lock(graph_deps, packages, lock_path, local_names)
         issues += check_lock_duplicates(packages, lock_path)
+        issues += check_lock_matches_manifest(graph_deps, packages, lock_path)
+        if not graph.startswith(("spike/", ".worktrees/")):
+            issues += check_iced_alignment(packages, lock_path)
     if remote is not None:
         issues += check_remote(deps, pins, remote)
         issues += check_guard_source(remote)
