@@ -2,9 +2,9 @@
 //!
 //! 一期实现 `static_web` 与进程型(`node`/`python`,A6c);容器在 `install_plan` 就被明确拒绝
 //! (`UnsupportedRuntime`)。
-//! 所有会改状态的方法都在同一把锁里执行(**单写者**:规格里 supervisor 是唯一写者),
-//! 每次状态变化都先落盘(`AppRecord.observed`)再发事件。耗时任务句柄/进度(规格 §4.3)留到
-//! 有真正耗时的 runtime 时再加:静态应用的安装是瞬时的。
+//! 同应用写操作通过锁分片串行化，全局生命周期 gate 协调 reconcile/suspend；
+//! 每次状态变化都先落盘(`AppRecord.observed`)再发事件。
+//! 进程型应用及受管运行时的耗时任务按各自所有者管理。
 //!
 //! 防 TOCTOU 的安装顺序(见 `digest` 模块文档):**先把包拷进 staging,对 staging 副本重新算摘要并
 //! `verify`,再改名落位**;`current_version` 在最后才写。
@@ -6262,11 +6262,12 @@ source = "web/"
         let run_dir = rig.manager.core.registry.paths().run_dir(&a);
         fs::create_dir_all(&run_dir).unwrap();
 
-        let mut child = std::process::Command::new("sleep")
+        let child = std::process::Command::new("sleep")
             .arg("306")
             .process_group(0)
             .spawn()
             .unwrap();
+        let mut child = crate::testutil::TestChild(child);
         write_record(
             &run_dir,
             &record_for(child.id(), vec!["sleep".into(), "306".into()]),
@@ -6274,7 +6275,7 @@ source = "web/"
         .unwrap();
 
         assert!(rig.manager.reconcile().is_clean());
-        let status = child.wait().unwrap();
+        let status = child.wait_with_timeout(Duration::from_secs(2)).unwrap();
         assert!(!status.success(), "孤儿进程应被信号终止:{status:?}");
         assert!(!run_dir.join("process.json").exists(), "记录应被清掉");
     }

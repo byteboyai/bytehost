@@ -59,3 +59,6 @@ jobs:
 
       - name: 依赖门禁变异测试(注入产品依赖/界面框架必须失败)
         run: bash scripts/check-deps.sh --self-test
+
+      - name: 联合构建脚本故障自检
+        run: python3 scripts/tests/test_joint_build.py

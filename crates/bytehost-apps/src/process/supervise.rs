@@ -516,6 +516,7 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
+        let child = crate::testutil::TestChild(child);
         let pid = child.id();
         write_record(
             dir.path(),
@@ -531,7 +532,7 @@ mod tests {
             reap_orphan(dir.path(), Duration::from_secs(1)).unwrap(),
             Reaped::Killed(pid)
         );
-        let _ = child.wait();
+        let _ = child.wait_with_timeout(Duration::from_secs(2));
         assert!(!alive(pid as i32));
         assert!(!record_path(dir.path()).exists(), "记录被清掉");
     }
@@ -676,11 +677,12 @@ mod tests {
     fn orphans_are_matched_by_start_time_and_never_by_a_bogus_or_non_leader_pid() {
         let dir = tempfile::tempdir().unwrap();
         // 1) 命令行对、启动时间对不上
-        let mut other = Command::new("sleep")
+        let other = Command::new("sleep")
             .arg("303")
             .process_group(0)
             .spawn()
             .unwrap();
+        let mut other = crate::testutil::TestChild(other);
         let mut rec = record_for(other.id(), vec!["sleep".into(), "303".into()]);
         rec.lstart = Some("Thu Jan  1 00:00:00 1970".into());
         write_record(dir.path(), &rec).unwrap();
@@ -699,7 +701,7 @@ mod tests {
             reap_orphan(dir.path(), Duration::from_secs(1)).unwrap(),
             Reaped::Killed(other.id())
         );
-        let _ = other.wait();
+        let _ = other.wait_with_timeout(Duration::from_secs(2));
         // 3) pid ≤ 1 / 超出 i32:绝不能走到 kill(-pid)
         for bad in [0u32, 1, u32::MAX] {
             write_record(

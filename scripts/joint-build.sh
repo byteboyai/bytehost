@@ -13,9 +13,8 @@
 # (与人工联调同一手法),不写任何 `.cargo/config.toml`、不覆盖用户已有的本地 patch。
 # 被这次解析改动的消费方 `Cargo.lock` 会在结束时还原。
 #
-# 为什么不是 GitHub Actions:dozer 与 digger 目前都没有任何 workflow;跨仓联合 CI
-# 需要它们先有可复用 workflow 与一个跨仓 token。等这两件事具备后,本脚本的检查项
-# 可以直接搬进 bytehost 的发版 workflow(见 docs/superpowers/plans/2026-10-30-bytehost-opt-tier5-cross-repo-governance.md)。
+# PR/tag/手动联合检查由 .github/workflows/joint-build.yml 调用。
+# 此脚本仅做候选组合；消费方发行检查必须另用不带 patch 的锁文件。
 
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,26 +45,32 @@ for crate in "${crates[@]}"; do
   )
 done
 
-build_one() {
+build_one() (
   local name="$1" dir="$2" pkg="$3"
   if [ ! -f "$dir/Cargo.toml" ]; then
-    echo "note: 没有 $name($dir),跳过联合构建" >&2
-    return 0
+    echo "error: 缺少 $name($dir),联合构建失败" >&2
+    return 1
   fi
-  local lock_bak rc=0
+  local lock_bak
   lock_bak="$(mktemp)"
   cp "$dir/Cargo.lock" "$lock_bak"
-  echo "联合构建:$name($pkg)…" >&2
-  (cd "$dir" && cargo check -q -p "$pkg" "${patch_args[@]}") || rc=$?
-  # 这次解析会把消费方的 Cargo.lock 改成本地 path;还原成它原来的内容。
-  cp "$lock_bak" "$dir/Cargo.lock"
-  rm -f "$lock_bak"
-  if [ "$rc" -ne 0 ]; then
+  cleanup() {
+    local rc=$?
+    trap - EXIT
+    cp "$lock_bak" "$dir/Cargo.lock" || rc=1
+    rm -f "$lock_bak"
+    exit "$rc"
+  }
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  echo "联合构建:$name($pkg 与 workspace 全目标)…" >&2
+  if ! (cd "$dir" && cargo check --workspace --all-targets "${patch_args[@]}"); then
     echo "联合构建失败:$name 在 bytehost 当前工作树下编译不过" >&2
     return 1
   fi
   echo "联合构建通过:$name" >&2
-}
+)
 
 status=0
 case "$which" in

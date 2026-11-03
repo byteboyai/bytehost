@@ -120,3 +120,59 @@ pub(crate) fn send_raw(port: u16, raw: &str) -> Resp {
     stream.read_to_end(&mut buf).expect("读响应");
     parse(&buf)
 }
+
+/// Own only a test-created child. Panic paths must reap it too.
+pub(crate) struct TestChild(pub std::process::Child);
+impl std::ops::Deref for TestChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for TestChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl TestChild {
+    pub fn wait_with_timeout(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "test child was not reaped within its deadline",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+#[cfg(unix)]
+#[test]
+fn test_child_is_reaped_even_when_an_assertion_panics() {
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let result = std::panic::catch_unwind(move || {
+        let _child = TestChild(child);
+        panic!("fixture assertion failed");
+    });
+    assert!(result.is_err());
+    // SAFETY: signal 0 checks only the child created by this test.
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+}

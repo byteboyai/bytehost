@@ -7,12 +7,11 @@ name: Joint build
 # bytehost 工作树,跑 `cargo check -p dozer-app`。这样"bytehost 的改动会破坏
 # 消费方"在打 tag 时就能发现,不必等人工同日升级。
 #
-# 注意:digger **没有 GitHub 远端**(本地仓库),暂时无法纳入;它有远端后
-# 在下面加一个 checkout + `scripts/joint-build.sh digger` 即可。
-#
-# 该 job 只在 tag 与手动触发时跑:PR/日常 push 由各仓库自己的 CI 负责。
+# 两消费方都必须存在并参与检查；候选构建不能替代消费方的无 patch locked 发行检查。
+# PR 在发版前验证；tag/手动触发保留发布组合回归。
 
 on:
+  pull_request:
   push:
     tags: ["v*"]
   workflow_dispatch:
@@ -32,6 +31,12 @@ jobs:
           repository: byteboyai/dozer
           path: dozer
 
+      - name: Checkout digger
+        uses: actions/checkout@v4
+        with:
+          repository: byteboyai/digger
+          path: digger
+
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
 
@@ -42,9 +47,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             dozer/target
+            digger/target
           key: ${{ runner.os }}-joint-${{ hashFiles('dozer/Cargo.lock') }}
 
-      - name: 用当前 bytehost 构建 dozer
+      - name: 用当前 bytehost 构建两个消费方
         env:
           CONSUMERS_ROOT: ${{ github.workspace }}
-        run: bytehost/scripts/joint-build.sh dozer
+        run: bytehost/scripts/joint-build.sh all
