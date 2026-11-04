@@ -8,6 +8,7 @@ description = "共享设置窗口的 iced 视图:容器、主题页、语言页�
 
 [dependencies]
 bytehost-settings = { path = "../bytehost-settings" }
+bytehost-git-accounts = { path = "../bytehost-git-accounts" }
 bytehost-apps = { path = "../bytehost-apps" }
 bytehost-panel = { path = "../bytehost-panel" }
 byteui = { git = "https://github.com/byteboyai/byteui", tag = "v0.5.2" }
@@ -15,6 +16,13 @@ byteui = { git = "https://github.com/byteboyai/byteui", tag = "v0.5.2" }
 # feature 合并后 `iced_renderer::Renderer` 是同一个类型。
 iced = { version = "0.14", default-features = false, features = ["tokio"] }
 
+[dev-dependencies]
+tokio.workspace = true
+
 [[example]]
 name = "composition"
 path = "examples/composition.rs"
+
+[[example]]
+name = "settings_product"
+path = "examples/settings_product.rs"

@@ -4,13 +4,13 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{APPS_ID, LANGUAGE_ID, THEME_ID};
+use crate::{APPS_ID, GIT_ID, LANGUAGE_ID, THEME_ID};
 
 /// `bytehost.*` 保留给共享模块;产品只能用其他命名空间。
 pub const BUILTIN_NAMESPACE: &str = "bytehost.";
 
 /// 内置页固定 ID。
-pub const BUILTIN_IDS: [&str; 3] = [THEME_ID, LANGUAGE_ID, APPS_ID];
+pub const BUILTIN_IDS: [&str; 4] = [THEME_ID, LANGUAGE_ID, APPS_ID, GIT_ID];
 
 /// 页面 ID 校验失败的原因。
 #[derive(Debug, Clone, PartialEq, Eq)]

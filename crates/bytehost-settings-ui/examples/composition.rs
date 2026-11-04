@@ -3,6 +3,8 @@
 //! 运行 `cargo run --example composition -p bytehost-settings-ui` 只构造元素并打印注册结果,
 //! 不需要窗口 / GPU——用于冻结公共签名与验证两种扩展方式。
 
+use bytehost_git_accounts::GitProvider;
+use bytehost_settings::git::{GitIntent, GitPageState};
 use bytehost_settings::{PageDescriptor, PageId, PageRegistry, SelectionState, SettingsState};
 use bytehost_settings_ui::language::LanguageOption;
 use bytehost_settings_ui::text::{Text, identity_resolver};
@@ -19,6 +21,8 @@ enum Message {
     LanguageSelected(&'static str),
     Apps(bytehost_panel::install::Message),
     EditorToggled(bool),
+    Git(GitIntent),
+    GitToken(GitProvider, String),
 }
 
 fn custom_page(raw: &str, fallback: &str) -> PageDescriptor {
@@ -29,9 +33,16 @@ fn main() {
     // 1) 产品注册:共享主题页 + 产品自己的 `digger.editor` 页。
     let registry = PageRegistry::new(vec![
         PageDescriptor::built_in(PageId::new(bytehost_settings::THEME_ID).unwrap(), "Theme"),
+        // 共享 Git 页;旧 `dozer.git` 入口通过 alias 指向同一页,不重复注册。
+        PageDescriptor::built_in(PageId::new(bytehost_settings::GIT_ID).unwrap(), "Git"),
         custom_page("digger.editor", "Editor"),
     ])
-    .expect("valid registry");
+    .expect("valid registry")
+    .with_alias(
+        PageId::new("dozer.git").unwrap(),
+        PageId::new(bytehost_settings::GIT_ID).unwrap(),
+    )
+    .expect("legacy alias resolves to the shared Git page");
 
     let mut settings = SettingsState::new();
     settings.open(&registry, Some(&PageId::new("digger.editor").unwrap()));
@@ -95,7 +106,18 @@ fn main() {
         width: iced::Length::Fill,
     });
 
-    // 5) 应用页只借用共享安装状态,消息映射到产品自己的路由。
+    // 5) Git 页:同一份状态机 + 视图,服务调用留给产品。
+    let mut git = GitPageState::new(1);
+    assert!(git.begin_edit(GitProvider::GitHub));
+    let _git_page: Element<'_, Message> =
+        bytehost_settings_ui::git_accounts_page(bytehost_settings_ui::GitAccountsPage {
+            state: &git,
+            on_token: &Message::GitToken,
+            on_intent: &Message::Git,
+            text,
+        });
+
+    // 6) 应用页只借用共享安装状态,消息映射到产品自己的路由。
     let apps = bytehost_panel::install::InstallFlowState::default();
     let _apps_page: Element<'_, Message> =
         bytehost_settings_ui::apps::view(AppsView::new(&apps, text, &map_apps, &|id| {

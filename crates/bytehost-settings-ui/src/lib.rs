@@ -11,6 +11,7 @@
 //! 2. **内置页附加区块**:每个内置页接受 `extra: Vec<Element<M>>`,追加在共享内容之后。
 
 pub mod apps;
+pub mod git_accounts;
 pub mod language;
 pub mod section;
 pub mod shell;
@@ -18,6 +19,7 @@ pub mod text;
 pub mod theme;
 
 pub use apps::{View as AppsPage, View as AppsView};
+pub use git_accounts::{View as GitAccountsPage, view as git_accounts_page};
 pub use language::{LanguageOption, view as language_page};
 pub use section::{actions_row, dim, heading, scrollable_body, separator};
 pub use shell::{Shell, view as settings_shell};

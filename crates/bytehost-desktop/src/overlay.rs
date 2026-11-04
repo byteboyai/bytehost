@@ -118,11 +118,37 @@ fn build_child_window(
     el: &ActiveEventLoop,
     active: bool,
 ) -> Arc<Window> {
+    try_build_child_window(main_window, pos, size, title, el, active)
+        .expect("create overlay window")
+}
+
+/// Recoverable variant for dialog drivers. A failed create never leaves a window behind.
+pub fn try_open_child_window(
+    main_window: &Window,
+    pos: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+    title: &str,
+    el: &ActiveEventLoop,
+) -> Result<Arc<Window>, String> {
+    let window = try_build_child_window(main_window, pos, size, title, el, true)?;
+    enable_overlay_mouse_moved_events(&window);
+    window.focus_window();
+    Ok(window)
+}
+
+fn try_build_child_window(
+    main_window: &Window,
+    pos: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+    title: &str,
+    el: &ActiveEventLoop,
+    active: bool,
+) -> Result<Arc<Window>, String> {
     use winit::raw_window_handle::HasWindowHandle;
 
     let parent_handle = main_window
         .window_handle()
-        .expect("main window handle")
+        .map_err(|error| format!("main window handle: {error}"))?
         .as_raw();
     let attrs = Window::default_attributes()
         .with_title(title)
@@ -134,7 +160,9 @@ fn build_child_window(
     // Safety: `parent_handle` 取自仍存活的主窗口(`Ready` 持有的 `Arc<Window>`),
     // 本函数返回前主窗口不会被 drop。
     let attrs = unsafe { attrs.with_parent_window(Some(parent_handle)) };
-    Arc::new(el.create_window(attrs).expect("create overlay window"))
+    el.create_window(attrs)
+        .map(Arc::new)
+        .map_err(|error| format!("create overlay window: {error}"))
 }
 
 /// 非模态提示窗口(Toast)用:建窗**不聚焦**(winit macOS 上 `with_active(false)`

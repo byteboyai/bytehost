@@ -24,6 +24,7 @@
 //!   遮罩外壳(C10 方案 C),仅在开启 `overlay` 时编译。
 
 pub mod app_webview;
+pub mod dialog;
 pub mod dispatch;
 pub mod focus;
 pub mod native_child;

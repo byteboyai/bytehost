@@ -1,0 +1,25 @@
+[package]
+name = "bytehost-git-accounts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "产品中立的 Git 账户契约、provider 行为与可注入的凭据 / 元数据 / HTTP 服务。默认 feature 不含网络与平台服务。"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+zeroize = { version = "1", features = ["derive"] }
+# 真实 HTTP 实现由 `http` feature 显式打开;默认契约消费不加载网络栈。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+# 真实 Keychain 实现由 `keyring` feature 显式打开;bytehost-settings 默认关闭。
+keyring = { version = "4.1.6", optional = true }
+
+[features]
+default = []
+http = ["dep:reqwest"]
+keyring = ["dep:keyring"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true

@@ -135,8 +135,9 @@ check_direct_allowed bytehost-chrome "$chrome_direct" "骨架只依赖 bytehost-
 
 # ---- group: settings ----
 # 设置页身份 / 注册表 / 导航状态(bytehost-settings):与 core 同级的纯数据层,
-# 依赖闭包只允许 serde 家族,不得出现界面框架或平台库。
-settings_allowed='^(bytehost-settings|serde|serde_core|serde_derive|serde_json|proc-macro2|quote|syn|unicode-ident|itoa|memchr|zmij)$'
+# 依赖闭包只允许 serde 家族 + 无网络 / 无平台的 Git 账户契约(默认 feature)。
+# `bytehost-git-accounts` 的 http/keyring 实现由 feature 显式打开,这里同时禁止。
+settings_allowed='^(bytehost-settings|bytehost-git-accounts|serde|serde_core|serde_derive|serde_json|proc-macro2|quote|syn|unicode-ident|itoa|memchr|zmij|zeroize|zeroize_derive)$'
 check_forbidden bytehost-settings "$product_banned" "产品 crate,纯设置状态层不得依赖"
 check_forbidden bytehost-settings "$framework_banned" "界面框架/平台 webview,纯设置状态层不得依赖"
 settings_tree=$(tree_of bytehost-settings --all-features)
@@ -151,7 +152,7 @@ fi
 # 共享设置窗口的 iced 视图(bytehost-settings-ui):允许 byteui/iced 与 bytehost 应用类型,
 # 但不得依赖产品 crate、wry(它不创建 webview)或 tauri。
 settings_ui_banned='^(bytehost-(desktop|chrome|webview)|wry|tauri.*)$'
-settings_ui_direct='^(bytehost-apps|bytehost-panel|bytehost-settings|byteui|iced)$'
+settings_ui_direct='^(bytehost-apps|bytehost-panel|bytehost-settings|bytehost-git-accounts|byteui|iced)$'
 check_forbidden bytehost-settings-ui "$product_banned" "产品 crate,共享设置视图不得依赖"
 check_forbidden bytehost-settings-ui "$settings_ui_banned" "webview 宿主/tauri,共享设置视图不得依赖"
 check_direct_allowed bytehost-settings-ui "$settings_ui_direct" "设置视图只依赖应用类型、byteui 与 iced"

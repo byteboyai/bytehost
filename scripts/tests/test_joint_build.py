@@ -19,7 +19,7 @@ class JointBuildTests(unittest.TestCase):
         binary = self.root / "bin"
         binary.mkdir()
         cargo = binary / "cargo"
-        cargo.write_text('#!/bin/sh\nprintf "candidate lock\\n" > Cargo.lock\nexit "${CARGO_RESULT:-0}"\n')
+        cargo.write_text('#!/bin/sh\nprintf "candidate lock\\n" > Cargo.lock\nprintf "%s\\n" "$@" > cargo-args.txt\nexit "${CARGO_RESULT:-0}"\n')
         cargo.chmod(0o755)
         self.env = dict(os.environ, CONSUMERS_ROOT=str(self.root), PATH=str(binary)+os.pathsep+os.environ["PATH"])
 
@@ -35,6 +35,13 @@ class JointBuildTests(unittest.TestCase):
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.consumer / "Cargo.lock").read_text(), "original lock\n")
+
+    def test_new_git_accounts_crate_is_part_of_the_candidate(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = (self.consumer / "cargo-args.txt").read_text()
+        self.assertIn('bytehost-git-accounts.path=', arguments)
+        self.assertIn('--all-targets', arguments)
 
     def test_failure_restores_the_original_lock(self):
         self.env["CARGO_RESULT"] = "42"

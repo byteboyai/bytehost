@@ -9,7 +9,7 @@
 #   scripts/joint-build.sh digger
 #   CONSUMERS_ROOT=/path/to/byteboy scripts/joint-build.sh
 #
-# 原理:用 `cargo --config` 把 9 个 bytehost crate 临时 patch 到**本工作树**
+# 原理:用 `cargo --config` 把 10 个 bytehost crate 临时 patch 到**本工作树**
 # (与人工联调同一手法),不写任何 `.cargo/config.toml`、不覆盖用户已有的本地 patch。
 # 被这次解析改动的消费方 `Cargo.lock` 会在结束时还原。
 #
@@ -31,6 +31,7 @@ crates=(
   bytehost-client
   bytehost-core
   bytehost-desktop
+  bytehost-git-accounts
   bytehost-panel
   bytehost-settings
   bytehost-settings-ui

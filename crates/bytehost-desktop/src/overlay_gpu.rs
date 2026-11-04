@@ -87,6 +87,7 @@ pub struct OverlayGpu {
     pub cache: user_interface::Cache,
     pub viewport: Viewport,
     pub clipboard: Clipboard,
+    ime_composing: std::cell::Cell<bool>,
 }
 
 impl OverlayGpu {
@@ -101,9 +102,22 @@ impl OverlayGpu {
         size: winit::dpi::PhysicalSize<u32>,
         scale: f64,
     ) -> OverlayGpu {
+        Self::try_open(window, instance, adapter, device, queue, size, scale)
+            .expect("create overlay GPU")
+    }
+
+    pub fn try_open(
+        window: &Arc<Window>,
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: winit::dpi::PhysicalSize<u32>,
+        scale: f64,
+    ) -> Result<OverlayGpu, String> {
         let surface = instance
             .create_surface(window.clone())
-            .expect("create overlay surface");
+            .map_err(|error| format!("create overlay surface: {error}"))?;
         let capabilities = surface.get_capabilities(adapter);
         let format = capabilities
             .formats
@@ -111,7 +125,13 @@ impl OverlayGpu {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .or_else(|| capabilities.formats.first().copied())
-            .expect("get overlay surface format");
+            .ok_or_else(|| "no compatible overlay surface format".to_owned())?;
+        if !capabilities
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+        {
+            return Err("overlay surface does not support transparent composition".into());
+        }
         surface.configure(
             device,
             &wgpu::SurfaceConfiguration {
@@ -144,14 +164,15 @@ impl OverlayGpu {
             Viewport::with_physical_size(Size::new(size.width, size.height), scale as f32);
         let clipboard = Clipboard::connect(window.clone());
 
-        OverlayGpu {
+        Ok(OverlayGpu {
             surface,
             format,
             renderer,
             cache: user_interface::Cache::new(),
             viewport,
             clipboard,
-        }
+            ime_composing: std::cell::Cell::new(false),
+        })
     }
 
     /// resize 后重配置 surface + viewport(不重建 `Engine`/`Renderer`)。
@@ -255,6 +276,21 @@ impl OverlayGpu {
         content: Element<'_, Message, iced_widget::Theme, iced_renderer::Renderer>,
         iced_event: Event,
     ) -> Vec<Message> {
+        self.dispatch_with_status(window, cursor, content, iced_event)
+            .0
+    }
+
+    pub fn is_composing(&self) -> bool {
+        self.ime_composing.get()
+    }
+
+    pub fn dispatch_with_status<Message>(
+        &mut self,
+        window: &Window,
+        cursor: mouse::Cursor,
+        content: Element<'_, Message, iced_widget::Theme, iced_renderer::Renderer>,
+        iced_event: Event,
+    ) -> (Vec<Message>, iced_winit::core::event::Status) {
         let events: [Event; 1] = [iced_event];
         let mut interface = UserInterface::build(
             content,
@@ -263,7 +299,7 @@ impl OverlayGpu {
             &mut self.renderer,
         );
         let mut messages = Vec::new();
-        let (state, _) = interface.update(
+        let (state, statuses) = interface.update(
             &events,
             cursor,
             &mut self.renderer,
@@ -281,7 +317,11 @@ impl OverlayGpu {
         }
         self.cache = interface.into_cache();
         window.request_redraw();
-        messages
+        let status = statuses
+            .first()
+            .copied()
+            .unwrap_or(iced_winit::core::event::Status::Ignored);
+        (messages, status)
     }
 
     /// `handle_input` 开头"追踪 modifiers/cursor、把 winit 事件转换成 iced 事件"
@@ -294,6 +334,15 @@ impl OverlayGpu {
         modifiers: &mut ModifiersState,
         event: &WindowEvent,
     ) -> Option<Event> {
+        match event {
+            WindowEvent::Ime(winit::event::Ime::Preedit(text, _)) => {
+                self.ime_composing.set(!text.is_empty())
+            }
+            WindowEvent::Ime(winit::event::Ime::Commit(_) | winit::event::Ime::Disabled) => {
+                self.ime_composing.set(false)
+            }
+            _ => {}
+        }
         if let WindowEvent::ModifiersChanged(new_modifiers) = event {
             *modifiers = new_modifiers.state();
         }

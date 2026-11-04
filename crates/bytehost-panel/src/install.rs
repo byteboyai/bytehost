@@ -255,6 +255,19 @@ pub struct InstallFlowState {
 }
 
 impl InstallFlowState {
+    /// An inner confirmation consumes Escape before its owning settings dialog.
+    pub fn escape_message(&self) -> Option<Message> {
+        match self.flow {
+            Flow::Reviewing { .. }
+            | Flow::Failed { .. }
+            | Flow::ConfirmUninstall { .. }
+            | Flow::ConfirmRollback { .. }
+            | Flow::RuntimeReviewing { .. }
+            | Flow::ConfirmRuntimeUninstall { .. } => Some(Message::FlowDismissed),
+            _ => None,
+        }
+    }
+
     pub fn update(&mut self, msg: Message, now_ms: u64) -> Vec<Effect> {
         match msg {
             Message::Opened => {
@@ -2475,5 +2488,21 @@ mod tests {
             s.update(Message::UrlPlanClicked, NOW).is_empty(),
             "在途不重发"
         );
+    }
+    #[test]
+    fn escape_dismisses_an_inner_confirmation_without_triggering_its_action() {
+        let mut state = InstallFlowState {
+            flow: Flow::ConfirmUninstall {
+                id: "demo".into(),
+                name: "Demo".into(),
+            },
+            ..Default::default()
+        };
+        let message = state
+            .escape_message()
+            .expect("confirmation consumes Escape");
+        assert!(state.update(message, 0).is_empty());
+        assert!(matches!(state.flow, Flow::Idle));
+        assert!(state.escape_message().is_none());
     }
 }

@@ -19,6 +19,8 @@ pub enum RegistryError {
     EmptyTitle(PageId),
     /// 重复 ID;不静默覆盖。
     Duplicate(PageId),
+    /// 别名的目标页未注册。
+    UnknownAliasTarget(PageId),
 }
 
 impl fmt::Display for RegistryError {
@@ -38,17 +40,47 @@ impl fmt::Display for RegistryError {
                 write!(f, "page must provide an English fallback title: {id}")
             }
             RegistryError::Duplicate(id) => write!(f, "duplicate page id: {id}"),
+            RegistryError::UnknownAliasTarget(id) => {
+                write!(f, "alias target is not a registered page: {id}")
+            }
         }
     }
 }
 
 impl std::error::Error for RegistryError {}
 
+/// 旧入口别名:把历史页面 ID 映射到当前注册的真实页面。
+///
+/// 别名只影响 [`PageRegistry::resolve`] / [`PageRegistry::alias_target`],不会在
+/// 导航里多出一页。产品的旧直达入口(如 `dozer.git`)因此可以继续使用。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageAliases {
+    entries: Vec<(PageId, PageId)>,
+}
+
+impl PageAliases {
+    pub fn new(entries: Vec<(PageId, PageId)>) -> Self {
+        Self { entries }
+    }
+
+    pub fn get(&self, alias: &PageId) -> Option<&PageId> {
+        self.entries
+            .iter()
+            .find(|(from, _)| from == alias)
+            .map(|(_, to)| to)
+    }
+
+    pub fn entries(&self) -> &[(PageId, PageId)] {
+        &self.entries
+    }
+}
+
 /// 有序页面集合。注册顺序即导航顺序。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRegistry {
     pages: Vec<PageDescriptor>,
     index: HashMap<PageId, usize>,
+    aliases: PageAliases,
 }
 
 impl PageRegistry {
@@ -60,14 +92,43 @@ impl PageRegistry {
                 return Err(RegistryError::Duplicate(page.id.clone()));
             }
         }
-        Ok(Self { pages, index })
+        Ok(Self {
+            pages,
+            index,
+            aliases: PageAliases::default(),
+        })
+    }
+
+    /// 注册旧入口别名。目标必须是已注册页;别名不能与真实页 ID 冲突。
+    pub fn with_alias(mut self, alias: PageId, target: PageId) -> Result<Self, RegistryError> {
+        if self.contains(&alias) {
+            return Err(RegistryError::Duplicate(alias));
+        }
+        if !self.contains(&target) {
+            return Err(RegistryError::UnknownAliasTarget(target));
+        }
+        if self.aliases.get(&alias).is_some() {
+            return Err(RegistryError::Duplicate(alias));
+        }
+        self.aliases.entries.push((alias, target));
+        Ok(self)
     }
 
     pub fn empty() -> Self {
         Self {
             pages: Vec::new(),
             index: HashMap::new(),
+            aliases: PageAliases::default(),
         }
+    }
+
+    /// 解析别名;不是别名时原样返回。
+    pub fn alias_target(&self, id: &PageId) -> Option<&PageId> {
+        self.aliases.get(id).filter(|target| self.contains(target))
+    }
+
+    pub fn aliases(&self) -> &PageAliases {
+        &self.aliases
     }
 
     pub fn pages(&self) -> &[PageDescriptor] {
@@ -99,11 +160,13 @@ impl PageRegistry {
         self.pages.first().map(|p| &p.id)
     }
 
-    /// 请求页可用则返回它;否则按 "主题 → 首个" 回退。
+    /// 请求页可用则返回它;旧入口先经别名解析,否则按 "主题 → 首个" 回退。
     pub fn resolve(&self, requested: Option<&PageId>) -> Option<&PageId> {
         requested
-            .and_then(|id| self.get(id))
-            .map(|page| &page.id)
+            .and_then(|id| {
+                self.alias_target(id)
+                    .or_else(|| self.get(id).map(|page| &page.id))
+            })
             .or_else(|| self.default_page())
     }
 }
@@ -176,10 +239,10 @@ mod tests {
 
     #[test]
     fn products_cannot_use_the_reserved_namespace() {
-        let err = PageRegistry::new(vec![custom("bytehost.git", "Not allowed")]).unwrap_err();
+        let err = PageRegistry::new(vec![custom("bytehost.custom", "Not allowed")]).unwrap_err();
         assert_eq!(
             err,
-            RegistryError::ReservedNamespace(PageId::new("bytehost.git").unwrap())
+            RegistryError::ReservedNamespace(PageId::new("bytehost.custom").unwrap())
         );
     }
 
@@ -229,5 +292,57 @@ mod tests {
         assert_eq!(without_theme.default_page(), Some(&git));
         assert_eq!(without_theme.resolve(None), Some(&git));
         assert_eq!(PageRegistry::empty().resolve(None), None);
+    }
+
+    #[test]
+    fn alias_maps_a_legacy_entry_to_the_real_page_without_adding_nav_entries() {
+        let builtin_git = PageId::new(crate::GIT_ID).unwrap();
+        let legacy = PageId::new("dozer.git").unwrap();
+        let registry = PageRegistry::new(vec![
+            builtin(crate::THEME_ID, "Theme"),
+            builtin(crate::GIT_ID, "Git"),
+        ])
+        .unwrap()
+        .with_alias(legacy.clone(), builtin_git.clone())
+        .unwrap();
+
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.alias_target(&legacy), Some(&builtin_git));
+        assert_eq!(registry.resolve(Some(&legacy)), Some(&builtin_git));
+        assert_eq!(
+            registry
+                .get(&builtin_git)
+                .expect("real page remains addressable")
+                .fallback,
+            "Git"
+        );
+    }
+
+    #[test]
+    fn aliases_reject_collisions_and_missing_targets() {
+        let builtin_git = PageId::new(crate::GIT_ID).unwrap();
+        let registry = PageRegistry::new(vec![builtin(crate::GIT_ID, "Git")]).unwrap();
+        assert_eq!(
+            registry
+                .clone()
+                .with_alias(builtin_git.clone(), builtin_git.clone())
+                .unwrap_err(),
+            RegistryError::Duplicate(builtin_git.clone())
+        );
+        let missing = PageId::new("dozer.missing").unwrap();
+        assert_eq!(
+            registry
+                .with_alias(missing.clone(), missing.clone())
+                .unwrap_err(),
+            RegistryError::UnknownAliasTarget(missing)
+        );
+    }
+
+    #[test]
+    fn git_is_a_known_builtin_page() {
+        let id = PageId::new(crate::GIT_ID).unwrap();
+        assert!(id.is_known_builtin());
+        let registry = PageRegistry::new(vec![builtin(crate::GIT_ID, "Git")]).unwrap();
+        assert!(registry.contains(&id));
     }
 }

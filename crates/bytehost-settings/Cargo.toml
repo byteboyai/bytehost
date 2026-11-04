@@ -8,6 +8,8 @@ description = "产品中立的设置页身份、注册表、窗口导航状态�
 
 [dependencies]
 serde.workspace = true
+# Git 页只依赖账户契约与 provider 纯解析(默认 feature 不含网络 / Keychain)。
+bytehost-git-accounts = { path = "../bytehost-git-accounts" }
 
 [dev-dependencies]
 serde_json.workspace = true
