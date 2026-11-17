@@ -79,6 +79,8 @@ struct TargetEntry {
     identity: TargetIdentity,
     tab: TabId,
     browser: Browser,
+    browser_id: i32,
+    hidden: bool,
     url: String,
     title: String,
     loading: bool,
@@ -99,6 +101,7 @@ struct RuntimeState {
     next_devtools_id: i32,
     next_sequence: u64,
     targets: HashMap<TargetId, TargetEntry>,
+    browser_targets: HashMap<i32, TargetId>,
     profiles: HashMap<String, RequestContext>,
     pending_create: Option<PendingCreate>,
     clients: Vec<Client>,
@@ -202,6 +205,7 @@ wrap_browser_process_handler! {
 wrap_client! {
     struct RuntimeClient {
         shared: Rc<RefCell<RuntimeState>>,
+        allow: NavigationPolicy,
     }
 
     impl Client {
@@ -215,7 +219,7 @@ wrap_client! {
             Some(RuntimeDisplayHandler::new(self.shared.clone()))
         }
         fn request_handler(&self) -> Option<RequestHandler> {
-            Some(RuntimeRequestHandler::new(self.shared.borrow().allow.clone()))
+            Some(RuntimeRequestHandler::new(self.allow.clone()))
         }
     }
 }
@@ -235,7 +239,10 @@ wrap_request_handler! {
             _is_redirect: i32,
         ) -> i32 {
             let url = request.map(|request| CefString::from(&request.url()).to_string());
-            (!url.is_some_and(|url| (self.allow)(&url))) as i32
+            match url {
+                Some(url) if !url.is_empty() => (!(self.allow)(&url)) as i32,
+                _ => 0,
+            }
         }
 
         fn on_open_urlfrom_tab(
@@ -246,7 +253,17 @@ wrap_request_handler! {
             _target_disposition: WindowOpenDisposition,
             _user_gesture: i32,
         ) -> i32 {
-            (!target_url.is_some_and(|url| (self.allow)(&url.to_string()))) as i32
+            match target_url {
+                Some(url) => {
+                    let url = url.to_string();
+                    if url.is_empty() {
+                        0
+                    } else {
+                        (!(self.allow)(&url)) as i32
+                    }
+                }
+                None => 0,
+            }
         }
     }
 }
@@ -255,6 +272,16 @@ fn frame_url(frame: Option<&mut Frame>) -> String {
     frame
         .map(|frame| CefString::from(&frame.url()).to_string())
         .unwrap_or_default()
+}
+
+fn browser_identity(state: &RuntimeState, browser: Option<&mut Browser>) -> Option<TargetIdentity> {
+    let mut browser = browser?.clone();
+    let id = browser.identifier();
+    state
+        .browser_targets
+        .get(&id)
+        .and_then(|target| state.targets.get(target))
+        .map(|entry| entry.identity.clone())
 }
 
 wrap_life_span_handler! {
@@ -289,6 +316,7 @@ wrap_life_span_handler! {
             let Some(pending) = state.pending_create.take() else {
                 return;
             };
+            let browser_id = browser.identifier();
             let host = browser.host();
             if let Some(host) = host {
                 let mut observer = RuntimeDevToolsObserver::new(self.shared.clone());
@@ -304,12 +332,18 @@ wrap_life_span_handler! {
                     tab: pending.tab.clone(),
                 },
             );
+            state.browser_targets.insert(
+                browser_id,
+                pending.identity.target.clone(),
+            );
             state.targets.insert(
                 pending.identity.target.clone(),
                 TargetEntry {
                     identity: pending.identity,
                     tab: pending.tab,
                     browser,
+                    browser_id,
+                    hidden: false,
                     url: String::new(),
                     title: String::new(),
                     loading: true,
@@ -322,18 +356,16 @@ wrap_life_span_handler! {
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             let Some(browser) = browser.cloned() else { return };
             let mut state = self.shared.borrow_mut();
-            let target = state
-                .targets
-                .values()
-                .find(|entry| {
-                    let mut candidate = browser.clone();
-                    entry.browser.is_same(Some(&mut candidate)) != 0
-                })
-                .map(|entry| (entry.identity.clone(), entry.tab.clone()));
-            if let Some((identity, tab)) = target {
-                state.targets.remove(&identity.target);
-                state.closing.remove(&identity.target);
-                state.emit(Some(identity), BrowserEvent::TargetClosed { tab });
+            let id = browser.identifier();
+            let Some(target) = state.browser_targets.remove(&id) else {
+                return;
+            };
+            if let Some(entry) = state.targets.remove(&target) {
+                state.closing.remove(&target);
+                state.emit(
+                    Some(entry.identity),
+                    BrowserEvent::TargetClosed { tab: entry.tab },
+                );
             }
         }
 
@@ -583,6 +615,7 @@ impl CefRuntime {
             next_devtools_id: 0,
             next_sequence: 0,
             targets: HashMap::new(),
+            browser_targets: HashMap::new(),
             profiles: HashMap::new(),
             pending_create: None,
             clients: Vec::new(),
@@ -724,7 +757,7 @@ impl CefRuntime {
     }
 
     pub fn create_target(
-        &mut self,
+        &self,
         parent_view: usize,
         scope: ProfileScope,
         tab: TabId,
@@ -783,7 +816,7 @@ impl CefRuntime {
     }
 
     fn finish_create_target(
-        &mut self,
+        &self,
         parent_view: usize,
         identity: TargetIdentity,
         tab: TabId,
@@ -797,7 +830,8 @@ impl CefRuntime {
             height: 800,
         };
         let window_info = WindowInfo::default().set_as_child(parent_view as *mut _, &rect);
-        let mut client = RuntimeClient::new(self.shared.clone());
+        let allow = self.shared.borrow().allow.clone();
+        let mut client = RuntimeClient::new(self.shared.clone(), allow);
         {
             let mut state = self.shared.borrow_mut();
             state.clients.push(client.clone());
@@ -831,6 +865,10 @@ impl CefRuntime {
             active: true,
             retained: true,
         })
+    }
+
+    pub fn pending_creation(&self) -> bool {
+        self.shared.borrow().pending_create.is_some()
     }
 
     pub fn targets(&self) -> Vec<TargetInfo> {
@@ -907,6 +945,94 @@ impl CefRuntime {
         } else {
             Err(target_unavailable())
         }
+    }
+
+    pub fn set_hidden(&self, target: &TargetIdentity, hidden: bool) -> Result<(), BrowserError> {
+        let mut state = self.shared.borrow_mut();
+        let entry = state
+            .targets
+            .get_mut(&target.target)
+            .ok_or_else(target_unavailable)?;
+        if let Some(host) = entry.browser.host() {
+            host.was_hidden(hidden as _);
+        }
+        entry.hidden = hidden;
+        entry.active = !hidden;
+        Ok(())
+    }
+
+    pub fn set_focus(&self, target: &TargetIdentity, focus: bool) -> Result<(), BrowserError> {
+        self.with_browser(target, |browser| {
+            if let Some(host) = browser.host() {
+                host.set_focus(focus as _);
+            }
+        })
+    }
+
+    pub fn view_handle(&self, target: &TargetId) -> Result<usize, BrowserError> {
+        let state = self.shared.borrow();
+        let entry = state.targets.get(target).ok_or_else(target_unavailable)?;
+        entry
+            .browser
+            .host()
+            .map(|host| host.window_handle() as usize)
+            .ok_or_else(target_unavailable)
+    }
+
+    pub fn can_go_back(&self, target: &TargetIdentity) -> Result<bool, BrowserError> {
+        let state = self.shared.borrow();
+        let entry = state
+            .target(&target.target)
+            .ok_or_else(target_unavailable)?;
+        Ok(entry.browser.can_go_back() != 0)
+    }
+
+    pub fn can_go_forward(&self, target: &TargetIdentity) -> Result<bool, BrowserError> {
+        let state = self.shared.borrow();
+        let entry = state
+            .target(&target.target)
+            .ok_or_else(target_unavailable)?;
+        Ok(entry.browser.can_go_forward() != 0)
+    }
+
+    pub fn find(
+        &self,
+        target: &TargetIdentity,
+        text: &str,
+        forward: bool,
+        match_case: bool,
+        find_next: bool,
+    ) -> Result<(), BrowserError> {
+        self.with_browser(target, |browser| {
+            if let Some(host) = browser.host() {
+                host.find(
+                    Some(&CefString::from(text)),
+                    forward as _,
+                    match_case as _,
+                    find_next as _,
+                );
+            }
+        })
+    }
+
+    pub fn stop_finding(
+        &self,
+        target: &TargetIdentity,
+        clear_selection: bool,
+    ) -> Result<(), BrowserError> {
+        self.with_browser(target, |browser| {
+            if let Some(host) = browser.host() {
+                host.stop_finding(clear_selection as _);
+            }
+        })
+    }
+
+    pub fn set_zoom(&self, target: &TargetIdentity, level: f64) -> Result<(), BrowserError> {
+        self.with_browser(target, |browser| {
+            if let Some(host) = browser.host() {
+                host.set_zoom_level(level);
+            }
+        })
     }
 
     /// Send a bounded in-process DevTools command. Results/events are delivered
