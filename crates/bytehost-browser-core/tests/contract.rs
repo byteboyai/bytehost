@@ -331,7 +331,9 @@ fn expired_request_ids_are_not_replayed() {
 #[test]
 fn scope_is_opaque_and_path_safe() {
     assert_eq!(ProfileScope::Global.storage_segment(), "global");
-    assert_eq!(scope_project("p7").storage_segment(), "projects/p7");
+    assert_eq!(scope_project("p7").storage_segment(), "project-p7");
+    // CEF requires profile dirs to be direct children of the user-data root.
+    assert!(!scope_project("p7").storage_segment().contains('/'));
     assert!(ProfileScope::project("../escape").is_err());
     assert!(ProfileScope::project("a/b").is_err());
     assert!(ProfileScope::project("").is_err());

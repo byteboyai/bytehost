@@ -93,10 +93,16 @@ impl ProfileScope {
 
     /// Relative segment under the browser data root. Always a descendant; no
     /// absolute path, no `..`, no user-provided separators.
+    ///
+    /// Project scopes stay on a single level (`project-<key>`) because CEF only
+    /// accepts a request-context profile directory that is the user-data root
+    /// itself or a direct child of it. A nested `projects/<key>` is rejected by
+    /// Chromium (`Cannot create profile at path ...`) and silently falls back to
+    /// an off-the-record profile, i.e. nothing persists.
     pub fn storage_segment(&self) -> String {
         match self {
             Self::Global => "global".to_owned(),
-            Self::Project { project } => format!("projects/{project}"),
+            Self::Project { project } => format!("project-{project}"),
         }
     }
 
