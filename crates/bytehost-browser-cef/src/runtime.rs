@@ -585,6 +585,7 @@ pub struct CefRuntime {
     library: library_loader::LibraryLoader,
     _args: args::Args,
     config: CefRuntimeConfig,
+    scheduler: PumpScheduler,
 }
 
 impl CefRuntime {
@@ -678,11 +679,13 @@ impl CefRuntime {
             ));
         }
 
+        let scheduler = config.scheduler.clone();
         let runtime = Self {
             shared,
             library,
             _args: args,
             config,
+            scheduler,
         };
         // CEF fires OnContextInitialized during initialize in practice; pump a
         // bounded amount so callers can create targets immediately.
@@ -856,6 +859,9 @@ impl CefRuntime {
                 "CreateBrowser was rejected",
             ));
         }
+        // Creation may not schedule any network work (about:blank). Wake the host
+        // once so it can pump OnAfterCreated and update the target map.
+        (self.scheduler)(0);
         Ok(TargetInfo {
             identity,
             tab,
