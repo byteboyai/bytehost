@@ -1,0 +1,18 @@
+[package]
+name = "bytehost-browser-cef"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "CEF 后端：可选 runtime（cef-rs）、profile 路径与显式产品依赖边界。不得进入 workspace 默认依赖。"
+
+[features]
+default = []
+# 显式打开才会构建 CEF SDK/C++ wrapper；默认 `cargo test -p bytehost-browser-cef` 不下载 CEF。
+cef-runtime = ["dep:cef"]
+
+[dependencies]
+bytehost-browser-core = { path = "../bytehost-browser-core" }
+serde.workspace = true
+serde_json.workspace = true
+cef = { version = "156.6", optional = true, default-features = false, features = ["sandbox"] }

@@ -1,0 +1,13 @@
+[package]
+name = "bytehost-browser-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "引擎无关的浏览器契约:身份、能力、动作、观察、事件、操作与错误。不得依赖 CEF/wry/iced/Dozer/MCP。"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
