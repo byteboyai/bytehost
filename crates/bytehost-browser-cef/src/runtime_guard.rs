@@ -15,11 +15,11 @@ pub(crate) fn validate_identity(
     Ok(())
 }
 
-pub(crate) fn require_single_target(live: usize, pending: bool) -> Result<(), BrowserError> {
-    if live != 0 || pending {
+pub(crate) fn require_creation_slot(pending: bool) -> Result<(), BrowserError> {
+    if pending {
         return Err(BrowserError::new(
-            ErrorClass::UnsupportedCapability,
-            "this runtime supports one live target; close it before creating another",
+            ErrorClass::ProviderUnavailable,
+            "browser creation is pending; retry after OnAfterCreated",
         ));
     }
     Ok(())
@@ -69,16 +69,14 @@ mod tests {
     }
 
     #[test]
-    fn second_target_is_rejected_during_and_after_creation() {
-        assert!(require_single_target(0, false).is_ok());
-        for (live, pending) in [(0, true), (1, false), (1, true), (2, false)] {
-            assert_eq!(
-                require_single_target(live, pending).unwrap_err().class,
-                ErrorClass::UnsupportedCapability
-            );
-        }
-        // After OnBeforeClose removed the old target, creation is available.
-        assert!(require_single_target(0, false).is_ok());
+    fn only_pending_creation_reserves_the_creation_slot() {
+        // Existing targets do not consume the asynchronous creation slot.
+        assert!(require_creation_slot(false).is_ok());
+        assert_eq!(
+            require_creation_slot(true).unwrap_err().class,
+            ErrorClass::ProviderUnavailable
+        );
+        assert!(require_creation_slot(false).is_ok());
     }
 
     #[test]

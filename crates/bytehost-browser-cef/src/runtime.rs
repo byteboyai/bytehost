@@ -21,7 +21,7 @@ use bytehost_browser_core::*;
 use cef::*;
 
 use crate::profile::{instance_lock_path, profile_paths};
-use crate::runtime_guard::{require_closed, require_single_target, validate_identity};
+use crate::runtime_guard::{require_closed, require_creation_slot, validate_identity};
 
 pub type PumpScheduler = Arc<dyn Fn(i64) + Send + Sync>;
 pub type NavigationPolicy = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -306,7 +306,7 @@ wrap_life_span_handler! {
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
-            // T4 single-surface slice: never create an untracked popup.
+            // Popups still need an explicit tracked target/opener policy (T6).
             1
         }
 
@@ -317,15 +317,7 @@ wrap_life_span_handler! {
                 return;
             };
             let browser_id = browser.identifier();
-            let host = browser.host();
-            if let Some(host) = host {
-                let mut observer = RuntimeDevToolsObserver::new(self.shared.clone());
-                let registration = host.add_dev_tools_message_observer(Some(&mut observer));
-                state.observers.push(observer);
-                if let Some(registration) = registration {
-                    state.registrations.push(registration);
-                }
-            }
+            let pending_target = pending.identity.target.clone();
             state.emit(
                 Some(pending.identity.clone()),
                 BrowserEvent::TargetCreated {
@@ -351,6 +343,18 @@ wrap_life_span_handler! {
                     document_serial: 0,
                 },
             );
+            drop(state);
+            // Observer registration can deliver a callback synchronously.
+            // Publish this browser's identity first, with no RefCell borrow
+            // across the CEF call (including when other targets are alive).
+            let browser = self.shared.borrow().targets.get(&pending_target).unwrap().browser.clone();
+            if let Some(host) = browser.host() {
+                let mut observer = RuntimeDevToolsObserver::new(self.shared.clone());
+                let registration = host.add_dev_tools_message_observer(Some(&mut observer));
+                let mut state = self.shared.borrow_mut();
+                state.observers.push(observer);
+                if let Some(registration) = registration { state.registrations.push(registration); }
+            }
         }
 
         fn on_before_close(&self, browser: Option<&mut Browser>) {
@@ -769,7 +773,7 @@ impl CefRuntime {
         self.check_navigation(url)?;
         let (identity, context) = {
             let mut state = self.shared.borrow_mut();
-            require_single_target(state.targets.len(), state.pending_create.is_some())?;
+            require_creation_slot(state.pending_create.is_some())?;
             state.next_target_serial += 1;
             let target = TargetId::new(format!("target-{}", state.next_target_serial))
                 .map_err(schema_error)?;
@@ -898,18 +902,19 @@ impl CefRuntime {
 
     pub fn navigate(&self, target: &TargetIdentity, url: &str) -> Result<(), BrowserError> {
         self.check_navigation(url)?;
-        let state = self.shared.borrow();
+        let mut state = self.shared.borrow_mut();
         let entry = state
-            .target(&target.target)
+            .targets
+            .get_mut(&target.target)
             .ok_or_else(target_unavailable)?;
         validate_identity(&entry.identity, target)?;
         let browser = entry.browser.clone();
+        let frame = browser.main_frame().ok_or_else(target_unavailable)?;
+        entry.loading = true;
         drop(state);
-        if let Some(frame) = browser.main_frame() {
+        {
             frame.load_url(Some(&CefString::from(url)));
             Ok(())
-        } else {
-            Err(target_unavailable())
         }
     }
 
@@ -959,11 +964,14 @@ impl CefRuntime {
             .targets
             .get_mut(&target.target)
             .ok_or_else(target_unavailable)?;
-        if let Some(host) = entry.browser.host() {
-            host.was_hidden(hidden as _);
-        }
+        validate_identity(&entry.identity, target)?;
+        let browser = entry.browser.clone();
         entry.hidden = hidden;
         entry.active = !hidden;
+        drop(state); // CEF calls may re-enter callbacks for another target.
+        if let Some(host) = browser.host() {
+            host.was_hidden(hidden as _);
+        }
         Ok(())
     }
 
@@ -1075,6 +1083,12 @@ impl CefRuntime {
             ));
         }
         Ok(id)
+    }
+
+    /// Forget a timed-out read; a late response has no associated method and
+    /// must not complete a newer operation. Does not interrupt page execution.
+    pub fn cancel_devtools(&self, id: i32) {
+        self.shared.borrow_mut().pending_devtools.remove(&id);
     }
 
     pub fn drain_events(&self) -> Vec<EventEnvelope> {
